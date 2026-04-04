@@ -4698,7 +4698,7 @@ export default function ForwardPage() {
         }}
         isOpen={modalOpen}
         placement="center"
-        scrollBehavior="outside"
+        scrollBehavior="inside"
         size="2xl"
         onOpenChange={setModalOpen}
       >
@@ -4913,7 +4913,7 @@ export default function ForwardPage() {
         }}
         isOpen={deleteModalOpen}
         placement="center"
-        scrollBehavior="outside"
+        scrollBehavior="inside"
         size="2xl"
         onOpenChange={setDeleteModalOpen}
       >
@@ -4958,7 +4958,7 @@ export default function ForwardPage() {
           base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
         }}
         isOpen={addressModalOpen}
-        scrollBehavior="outside"
+        scrollBehavior="inside"
         size="lg"
         onClose={() => setAddressModalOpen(false)}
       >
@@ -5003,7 +5003,7 @@ export default function ForwardPage() {
         }}
         isOpen={exportModalOpen}
         placement="center"
-        scrollBehavior="outside"
+        scrollBehavior="inside"
         size="2xl"
         onClose={() => {
           setExportModalOpen(false);
@@ -5162,7 +5162,7 @@ export default function ForwardPage() {
         }}
         isOpen={importModalOpen}
         placement="center"
-        scrollBehavior="outside"
+        scrollBehavior="inside"
         size="2xl"
         onClose={() => setImportModalOpen(false)}
       >
