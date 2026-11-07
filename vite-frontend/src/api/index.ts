@@ -375,13 +375,17 @@ export interface BackupTypes {
   configs?: boolean;
 }
 
-export const exportBackup = async (types: string[] = []) => {
+// format: full（增强版完整格式）| upstream（兼容原版 FLVX 3.x）| alpha4（兼容原版 2.2.0-alpha4）
+export const exportBackup = async (
+  types: string[] = [],
+  format: "full" | "upstream" | "alpha4" = "full",
+) => {
   const token = window.localStorage.getItem("token");
   const baseURL = axios.defaults.baseURL || "/api/v1/";
 
   const response = await axios.post(
     `${baseURL}/backup/export`,
-    { types },
+    format === "full" ? { types } : { types, format },
     {
       headers: {
         Authorization: token,

@@ -32,7 +32,7 @@
         if (!cachedFavicon.trim()) {
           try {
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/api/v1/config/get', false);
+            xhr.open('POST', '/api/v1/public/config/get', false);
             xhr.setRequestHeader('Content-Type', 'application/json');
             xhr.send(JSON.stringify({ name: 'app_favicon' }));
 

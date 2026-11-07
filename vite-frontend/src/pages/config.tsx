@@ -183,7 +183,63 @@ const BACKUP_TYPE_OPTIONS = [
   { value: "userGroups", label: "用户分组" },
   { value: "permissions", label: "分组权限" },
   { value: "configs", label: "系统配置" },
+  // myflvx 增强版数据（只有勾选时才写入备份文件）
+  { value: "proxyNodes", label: "代理节点（增强版）" },
+  { value: "subscriptions", label: "订阅（增强版）" },
+  { value: "proxyDeploys", label: "部署记录（增强版）" },
 ] as const;
+
+const ENHANCED_BACKUP_TYPES = ["proxyNodes", "subscriptions", "proxyDeploys"];
+
+type BackupExportFormat = "full" | "upstream" | "alpha4";
+
+const BACKUP_FORMAT_OPTIONS: {
+  value: BackupExportFormat;
+  label: string;
+  description: string;
+}[] = [
+  {
+    value: "full",
+    label: "增强版完整格式",
+    description:
+      "包含所选的全部数据。勾选了增强版数据时，原版 FLVX 无法导入该文件。",
+  },
+  {
+    value: "upstream",
+    label: "兼容原版 FLVX 3.x",
+    description: "不包含增强版数据，可以导入原版 FLVX 最新版本。",
+  },
+  {
+    value: "alpha4",
+    label: "兼容原版 FLVX 2.2.0-alpha4",
+    description:
+      "不包含增强版数据，并去掉 alpha4 不认识的字段（每 IP 限制、Proxy Protocol 等），可以导入原版 2.2.0-alpha4。",
+  },
+];
+
+const summarizeImportResult = (data: unknown) => {
+  if (!data || typeof data !== "object") return "";
+  const labels: Record<string, string> = {
+    usersImported: "用户",
+    nodesImported: "节点",
+    tunnelsImported: "隧道",
+    forwardsImported: "规则",
+    userTunnelsImported: "用户隧道权限",
+    speedLimitsImported: "限速规则",
+    tunnelGroupsImported: "隧道分组",
+    userGroupsImported: "用户分组",
+    permissionsImported: "分组权限",
+    configsImported: "系统配置",
+    proxyNodesImported: "代理节点",
+    subscriptionsImported: "订阅",
+    proxyDeploysImported: "部署记录",
+  };
+
+  return Object.entries(data as Record<string, unknown>)
+    .filter(([key, value]) => labels[key] && typeof value === "number" && value > 0)
+    .map(([key, value]) => `${labels[key]} ${value}`)
+    .join("，");
+};
 
 const BACKUP_TYPE_VALUES = BACKUP_TYPE_OPTIONS.map((option) => option.value);
 
@@ -234,6 +290,7 @@ export default function ConfigPage() {
     useState<Record<string, string>>(initialConfigs);
 
   const [exportTypes, setExportTypes] = useState<string[]>([]);
+  const [exportFormat, setExportFormat] = useState<BackupExportFormat>("full");
   const [importTypes, setImportTypes] = useState<string[]>([]);
   const [exporting, setExporting] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -737,7 +794,7 @@ export default function ConfigPage() {
     }
     setExporting(true);
     try {
-      await exportBackup(exportTypes);
+      await exportBackup(exportTypes, exportFormat);
       toast.success("导出成功");
       setExportSelectorOpen(false);
     } catch {
@@ -782,7 +839,9 @@ export default function ConfigPage() {
       });
 
       if (response.code === 0) {
-        toast.success(`导入成功: ${JSON.stringify(response.data)}`);
+        const summary = summarizeImportResult(response.data);
+
+        toast.success(summary ? `导入成功：${summary}` : "导入成功");
         setImportTypes([]);
         setImportFileName("");
       } else {
@@ -1189,6 +1248,37 @@ export default function ConfigPage() {
               <ModalHeader>选择导出内容</ModalHeader>
               <ModalBody>
                 {renderTypeSelection("导出内容", exportTypes, setExportTypes)}
+                <div className="space-y-2 pt-2">
+                  <span className="text-sm font-medium text-default-700 dark:text-default-300">
+                    导出格式
+                  </span>
+                  <div className="grid grid-cols-1 gap-2">
+                    {BACKUP_FORMAT_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        aria-pressed={exportFormat === option.value}
+                        className={`w-full px-4 py-3 rounded-lg border text-left transition-all duration-200 ${
+                          exportFormat === option.value
+                            ? "bg-primary-50 dark:bg-primary-900/20 border-primary-300 dark:border-primary-500/50"
+                            : "bg-white dark:bg-default-50 border-default-200 dark:border-default-100/30 hover:border-primary-200"
+                        }`}
+                        type="button"
+                        onClick={() => setExportFormat(option.value)}
+                      >
+                        <div className="font-medium text-sm">{option.label}</div>
+                        <div className="text-xs text-default-500 mt-0.5">
+                          {option.description}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  {exportFormat !== "full" &&
+                    exportTypes.some((t) => ENHANCED_BACKUP_TYPES.includes(t)) && (
+                      <p className="text-xs text-warning-600">
+                        所选格式不包含增强版数据，代理节点 / 订阅 / 部署记录不会被导出。
+                      </p>
+                    )}
+                </div>
               </ModalBody>
               <ModalFooter>
                 <Button variant="light" onPress={onClose}>

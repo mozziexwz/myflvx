@@ -31,6 +31,9 @@ func TestParseMihomoScriptLinks(t *testing.T) {
 	if Port(p) != 20002 && GetString(p, "port-range") == "" {
 		t.Fatalf("mieru port missing: %#v", p)
 	}
+	if GetString(p, "transport") != "TCP" || !GetBool(p, "udp") {
+		t.Fatalf("TCP+UDP mieru links should use TCP transport with UDP relay: %#v", p)
+	}
 
 	payload := `{"n":"node-sudoku","h":"1.2.3.4","p":20003,"k":"8f0c7c55-8d4f-4c5f-9f53-1a2b3c4d5e6f","a":"entropy","e":"chacha20-poly1305","m":1080,"x":true,"hd":true}`
 	sudoku := "sudoku://" + base64.RawURLEncoding.EncodeToString([]byte(payload))

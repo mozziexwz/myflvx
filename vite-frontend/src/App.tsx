@@ -15,6 +15,11 @@ import LimitPage from "@/pages/limit";
 import ConfigPage from "@/pages/config";
 import PanelSharingPage from "@/pages/panel-sharing";
 import { SettingsPage } from "@/pages/settings";
+import ProxyNodePage from "@/pages/proxy-node";
+import SubscriptionPage from "@/pages/subscription";
+import SubGeneratorPage from "@/pages/sub-generator";
+import SubDownloadPage from "@/pages/sub-download";
+import DeployPage from "@/pages/deploy";
 import AdminLayout from "@/layouts/admin";
 import H5Layout from "@/layouts/h5";
 import H5SimpleLayout from "@/layouts/h5-simple";
@@ -207,6 +212,47 @@ function App() {
           </ProtectedRoute>
         }
         path="/panel-sharing"
+      />
+      {/* myflvx: 节点管理 / 部署节点 / 订阅 */}
+      <Route
+        element={
+          <ProtectedRoute>
+            <ProxyNodePage />
+          </ProtectedRoute>
+        }
+        path="/proxy-node"
+      />
+      <Route
+        element={
+          <ProtectedRoute>
+            <DeployPage />
+          </ProtectedRoute>
+        }
+        path="/deploy"
+      />
+      <Route
+        element={
+          <ProtectedRoute>
+            <SubscriptionPage />
+          </ProtectedRoute>
+        }
+        path="/subscription"
+      />
+      <Route
+        element={
+          <ProtectedRoute>
+            <SubGeneratorPage />
+          </ProtectedRoute>
+        }
+        path="/sub-generator"
+      />
+      <Route
+        element={
+          <ProtectedRoute>
+            <SubDownloadPage />
+          </ProtectedRoute>
+        }
+        path="/sub-download"
       />
       <Route element={<SettingsPage />} path="/settings" />
     </Routes>

@@ -26,13 +26,17 @@ func ParseShareLink(link string) (Proxy, error) {
 		p   Proxy
 		err error
 	)
-	if strings.HasPrefix(strings.ToLower(link), "sudoku://") {
+	lower := strings.ToLower(link)
+	if strings.HasPrefix(lower, "sudoku://") {
 		p, err = parseSudokuLink(link)
 	} else {
 		p, err = proxyparser.Parse(link)
 	}
 	if err != nil {
 		return nil, err
+	}
+	if strings.HasPrefix(lower, "mierus://") || strings.HasPrefix(lower, "mieru://") {
+		applyMieruProtocols(p, link)
 	}
 	if Name(p) == "" {
 		p["name"] = fmt.Sprintf("%s %s", strings.ToUpper(Type(p)), HostPort(Server(p), Port(p)))
@@ -94,6 +98,39 @@ func ParseContent(content []byte) ParseResult {
 		result.Format = "unknown"
 	}
 	return result
+}
+
+// applyMieruProtocols follows mihomo_script's client config for links that
+// advertise both protocols on one port: TCP transport with UDP relay enabled
+// (the parser otherwise keeps the last protocol, UDP).
+func applyMieruProtocols(p Proxy, link string) {
+	parts := strings.SplitN(link, "?", 2)
+	if len(parts) != 2 {
+		return
+	}
+	query := parts[1]
+	if i := strings.Index(query, "#"); i >= 0 {
+		query = query[:i]
+	}
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return
+	}
+	hasTCP, hasUDP := false, false
+	for _, v := range values["protocol"] {
+		switch strings.ToUpper(strings.TrimSpace(v)) {
+		case "TCP":
+			hasTCP = true
+		case "UDP":
+			hasUDP = true
+		}
+	}
+	if hasTCP {
+		p["transport"] = "TCP"
+	}
+	if hasUDP {
+		p["udp"] = true
+	}
 }
 
 func looksLikeClashYAML(text string) bool {

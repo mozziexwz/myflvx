@@ -3,8 +3,11 @@ package proxykit
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -184,7 +187,7 @@ func Render(cfg GeneratorConfig, nodes []Proxy) (RenderResult, error) {
 		return result, err
 	}
 	_ = enc.Close()
-	result.Content = buf.String()
+	result.Content = prettifyYAMLUnicode(buf.String())
 	return result, nil
 }
 
@@ -449,7 +452,7 @@ func RenderProxiesOnly(nodes []Proxy) (string, error) {
 		return "", err
 	}
 	_ = enc.Close()
-	return buf.String(), nil
+	return prettifyYAMLUnicode(buf.String()), nil
 }
 
 // ValidateClashDocument checks that uploaded content is a YAML mapping with
@@ -469,4 +472,52 @@ func ValidateClashDocument(content []byte) (int, error) {
 		count = len(proxies.Content)
 	}
 	return count, nil
+}
+
+// prettifyYAMLUnicode turns the \UXXXXXXXX escapes yaml.v3 emits for
+// characters outside the BMP (emoji such as 🚀 in group names) back into the
+// characters themselves. The result is re-parsed and compared with the input;
+// if anything differs the original text is returned, so the data never changes.
+const backslash = byte(0x5c)
+
+func prettifyYAMLUnicode(text string) string {
+	if !strings.Contains(text, string(backslash)+"U") {
+		return text
+	}
+	var b strings.Builder
+	b.Grow(len(text))
+	changed := false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c != backslash {
+			b.WriteByte(c)
+			continue
+		}
+		// Count the run of backslashes; only an odd run starts an escape.
+		j := i
+		for j < len(text) && text[j] == backslash {
+			j++
+		}
+		run := j - i
+		b.WriteString(text[i : j-1])
+		i = j - 1
+		if run%2 == 1 && j+9 <= len(text) && text[j] == 'U' {
+			if r, err := strconv.ParseUint(text[j+1:j+9], 16, 32); err == nil && r >= 0x10000 && r <= unicode.MaxRune && unicode.IsGraphic(rune(r)) {
+				b.WriteRune(rune(r))
+				i = j + 8
+				changed = true
+				continue
+			}
+		}
+		b.WriteByte(backslash)
+	}
+	if !changed {
+		return text
+	}
+	out := b.String()
+	var before, after interface{}
+	if yaml.Unmarshal([]byte(text), &before) != nil || yaml.Unmarshal([]byte(out), &after) != nil || !reflect.DeepEqual(before, after) {
+		return text
+	}
+	return out
 }

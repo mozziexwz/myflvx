@@ -229,15 +229,21 @@ func (h *Handler) applySubscriptionMutation(ctx context.Context, s *model.SubFil
 		if newURL == "" && creating {
 			return fmt.Errorf("请填写订阅地址")
 		}
-		changed := creating || req.Refetch || (newURL != "" && newURL != s.SourceURL) || strings.TrimSpace(req.UserAgent) != s.UserAgent
+		refetch := creating || req.Refetch
+		// The URL and User-Agent are only touched by a full edit (one that
+		// sends the URL); partial updates such as the enable toggle keep them.
 		if newURL != "" {
 			if _, err := proxykit.ValidateSubscriptionURL(newURL); err != nil {
 				return err
 			}
+			newUA := strings.TrimSpace(req.UserAgent)
+			if newURL != s.SourceURL || newUA != s.UserAgent {
+				refetch = true
+			}
 			s.SourceURL = newURL
+			s.UserAgent = newUA
 		}
-		s.UserAgent = strings.TrimSpace(req.UserAgent)
-		if changed {
+		if refetch {
 			if err := h.fetchImportedSubscription(ctx, s); err != nil {
 				return err
 			}
