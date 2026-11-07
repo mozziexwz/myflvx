@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -56,7 +57,11 @@ func (h *Handler) userCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := asInt(req["status"], 1)
-	flow := asInt64(req["flow"], 100)
+	flow, flowMiB, flowErr := parseTrafficLimit(req, 100)
+	if flowErr != nil {
+		response.WriteJSON(w, response.ErrDefault(flowErr.Error()))
+		return
+	}
 	num := asInt(req["num"], 10)
 	expTime := asInt64(req["expTime"], time.Now().Add(365*24*time.Hour).UnixMilli())
 	flowResetTime := asInt64(req["flowResetTime"], 1)
@@ -68,8 +73,14 @@ func (h *Handler) userCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	roleID := 1
 	now := time.Now().UnixMilli()
+	maxConn := asInt(req["maxConn"], 0)
 
-	userID, err := h.repo.CreateUser(username, security.MD5(pwd), roleID, expTime, flow, flowResetTime, num, status, now)
+	hashedPassword, err := security.HashPassword(pwd)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	userID, err := h.repo.CreateUser(username, hashedPassword, roleID, expTime, flow, flowResetTime, num, status, maxConn, now, flowMiB)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -137,6 +148,15 @@ func (h *Handler) userUpdate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("请不要作死"))
 		return
 	}
+	oldUser, err := h.repo.GetUserByID(id)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if oldUser == nil {
+		response.WriteJSON(w, response.ErrDefault("用户不存在"))
+		return
+	}
 
 	dup, err := h.repo.UserExistsExcluding(username, id)
 	if err != nil {
@@ -148,7 +168,16 @@ func (h *Handler) userUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	flow := asInt64(req["flow"], 100)
+	flow, flowMiB, flowErr := parseTrafficLimit(req, 100)
+	if flowErr != nil {
+		response.WriteJSON(w, response.ErrDefault(flowErr.Error()))
+		return
+	}
+	if _, supplied := req["flowMiB"]; !supplied {
+		if current, err := h.repo.GetUserByID(id); err == nil && current != nil && current.Flow == flow {
+			flowMiB = current.FlowMiB
+		}
+	}
 	num := asInt(req["num"], 10)
 	expTime := asInt64(req["expTime"], time.Now().Add(365*24*time.Hour).UnixMilli())
 	flowResetTime := asInt64(req["flowResetTime"], 1)
@@ -156,21 +185,36 @@ func (h *Handler) userUpdate(w http.ResponseWriter, r *http.Request) {
 	_, hasDailyQuota := req["dailyQuotaGB"]
 	_, hasMonthlyQuota := req["monthlyQuotaGB"]
 	now := time.Now().UnixMilli()
+	maxConn := asInt(req["maxConn"], 0)
 
 	pwd := asString(req["pwd"])
 	if strings.TrimSpace(pwd) == "" {
-		if err := h.repo.UpdateUserWithoutPassword(id, username, flow, num, expTime, flowResetTime, status, now); err != nil {
+		if err := h.repo.UpdateUserWithoutPassword(id, username, flow, num, expTime, flowResetTime, status, maxConn, now, flowMiB); err != nil {
 			response.WriteJSON(w, response.Err(-2, err.Error()))
 			return
 		}
 	} else {
-		if err := h.repo.UpdateUserWithPassword(id, username, security.MD5(pwd), flow, num, expTime, flowResetTime, status, now); err != nil {
+		hashedPassword, err := security.HashPassword(pwd)
+		if err != nil {
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
+		if err := h.repo.UpdateUserWithPassword(id, username, hashedPassword, flow, num, expTime, flowResetTime, status, maxConn, now, flowMiB); err != nil {
 			response.WriteJSON(w, response.Err(-2, err.Error()))
 			return
 		}
 	}
 
-	h.repo.PropagateUserFlowToTunnels(id, flow, num, expTime, flowResetTime)
+	if status != 1 {
+		// Revoke access before optional quota/group updates can fail or return.
+		if err := h.disableUserAccess(id, now); err != nil {
+			result := response.Err(-2, fmt.Sprintf("账号已禁用，以下权限或节点暂停未确认；其他转发已继续处理，请排查后重试禁用：\n%v", err))
+			result.Data = map[string]interface{}{"userDisabled": true}
+			response.WriteJSON(w, result)
+			return
+		}
+	}
+	h.repo.PropagateUserFlowToTunnels(id, flow, num, expTime, flowResetTime, flowMiB)
 	if hasDailyQuota || hasMonthlyQuota {
 		dailyQuotaGB := asInt64(req["dailyQuotaGB"], 0)
 		monthlyQuotaGB := asInt64(req["monthlyQuotaGB"], 0)
@@ -206,6 +250,24 @@ func (h *Handler) userUpdate(w http.ResponseWriter, r *http.Request) {
 			for _, gid := range affected {
 				_ = h.syncPermissionsByUserGroup(gid)
 			}
+		}
+	}
+	if status != 1 {
+		// Group changes may have created additional tunnel grants.
+		if err := h.repo.DisableUserTunnels(id); err != nil {
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
+	}
+	if oldUser.MaxConn != maxConn {
+		warnings, syncErr := h.syncUserMaxConnForwards(id)
+		if syncErr != nil {
+			response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("最大连接数下发失败: %v", syncErr)))
+			return
+		}
+		if len(warnings) > 0 {
+			response.WriteJSON(w, response.OK(map[string]interface{}{"warnings": warnings}))
+			return
 		}
 	}
 
@@ -301,9 +363,18 @@ func (h *Handler) nodeCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("节点名称和地址不能为空"))
 		return
 	}
+	if err := IsValidNodeAddress(serverIP); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
 
 	now := time.Now().UnixMilli()
 	inx := h.repo.NextIndex("node")
+	forwardMode := defaultNodeForwardMode(asString(req["forwardMode"]))
+	status := 0
+	if forwardMode == "nftables" {
+		status = 1
+	}
 	if err := h.repo.CreateNode(
 		name,
 		randomToken(16),
@@ -320,7 +391,7 @@ func (h *Handler) nodeCreate(w http.ResponseWriter, r *http.Request) {
 		asInt(req["tls"], 0),
 		asInt(req["socks"], 0),
 		now,
-		0,
+		status,
 		defaultString(asString(req["tcpListenAddr"]), "[::]"),
 		defaultString(asString(req["udpListenAddr"]), "[::]"),
 		inx,
@@ -329,7 +400,17 @@ func (h *Handler) nodeCreate(w http.ResponseWriter, r *http.Request) {
 		nullableText(asString(req["remoteToken"])),
 		nullableText(asString(req["remoteConfig"])),
 		nullableText(asString(req["extraIPs"])),
+		forwardMode,
 	); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	nodeID, err := h.findCreatedNodeID(name, serverIP)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.persistNodeSSHConfig(nodeID, req, forwardMode, now, false); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -365,7 +446,21 @@ func (h *Handler) nodeUpdate(w http.ResponseWriter, r *http.Request) {
 	newHTTP := asInt(req["http"], currentHTTP)
 	newTLS := asInt(req["tls"], currentTLS)
 	newSocks := asInt(req["socks"], currentSocks)
-	if currentStatus == 1 && (newHTTP != currentHTTP || newTLS != currentTLS || newSocks != currentSocks) {
+	forwardMode := defaultNodeForwardMode(strings.TrimSpace(asString(req["forwardMode"])))
+	currentForwardMode, err := h.repo.GetNodeForwardMode(id)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	serverIP := asString(req["serverIp"])
+	if serverIP != "" {
+		if err := IsValidNodeAddress(serverIP); err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+	}
+	usesNftablesRuntime := forwardMode == "nftables" || defaultNodeForwardMode(currentForwardMode) == "nftables"
+	if currentStatus == 1 && !usesNftablesRuntime && (newHTTP != currentHTTP || newTLS != currentTLS || newSocks != currentSocks) {
 		if err := h.applyNodeProtocolChange(id, newHTTP, newTLS, newSocks); err != nil {
 			response.WriteJSON(w, response.ErrDefault(err.Error()))
 			return
@@ -375,7 +470,7 @@ func (h *Handler) nodeUpdate(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UnixMilli()
 	if err := h.repo.UpdateNode(id,
 		asString(req["name"]),
-		asString(req["serverIp"]),
+		serverIP,
 		nullableText(asString(req["serverIpV4"])),
 		nullableText(asString(req["serverIpV6"])),
 		defaultString(asString(req["port"]), "1000-65535"),
@@ -384,6 +479,7 @@ func (h *Handler) nodeUpdate(w http.ResponseWriter, r *http.Request) {
 		nullableText(strings.TrimSpace(asString(req["remark"]))),
 		nullableUnixMilli(asInt64(req["expiryTime"], 0)),
 		nullableText(normalizeNodeRenewalCycle(asString(req["renewalCycle"]))),
+		forwardMode,
 		newHTTP,
 		newTLS,
 		newSocks,
@@ -394,7 +490,140 @@ func (h *Handler) nodeUpdate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	if err := h.persistNodeSSHConfig(id, req, forwardMode, now, true); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if forwardMode == "nftables" && currentStatus != 1 {
+		if err := h.repo.UpdateNodeStatus(id, 1); err != nil {
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
+	}
 	response.WriteJSON(w, response.OKEmpty())
+}
+
+func (h *Handler) findCreatedNodeID(name, serverIP string) (int64, error) {
+	if h == nil || h.repo == nil {
+		return 0, errors.New("handler not initialized")
+	}
+	nodes, err := h.repo.ListNodes()
+	if err != nil {
+		return 0, err
+	}
+	for i := len(nodes) - 1; i >= 0; i-- {
+		item := nodes[i]
+		if asString(item["name"]) != name {
+			continue
+		}
+		if asString(item["serverIp"]) != serverIP {
+			continue
+		}
+		if nodeID := asInt64(item["id"], 0); nodeID > 0 {
+			return nodeID, nil
+		}
+	}
+	return 0, errors.New("节点创建成功，但未能查询到节点记录")
+}
+
+func (h *Handler) persistNodeSSHConfig(nodeID int64, req map[string]interface{}, forwardMode string, now int64, preserveSecrets bool) error {
+	if h == nil || h.repo == nil {
+		return errors.New("handler not initialized")
+	}
+	if nodeID <= 0 {
+		return errors.New("节点ID不能为空")
+	}
+	if forwardMode != "nftables" {
+		return h.repo.DeleteNodeSSHConfig(nodeID)
+	}
+	cfgMap := asMap(req["sshConfig"])
+	host := strings.TrimSpace(asString(cfgMap["host"]))
+	if host == "" {
+		host = strings.TrimSpace(asString(req["serverIp"]))
+	}
+	port := asInt(cfgMap["port"], 22)
+	username := strings.TrimSpace(asString(cfgMap["username"]))
+	authType := strings.TrimSpace(asString(cfgMap["authType"]))
+	password := asString(cfgMap["password"])
+	privateKey := asString(cfgMap["privateKey"])
+	passphrase := asString(cfgMap["passphrase"])
+	sudoMode := strings.TrimSpace(asString(cfgMap["sudoMode"]))
+
+	if preserveSecrets {
+		existing, err := h.repo.GetNodeSSHConfig(nodeID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if existing != nil {
+			if host == "" {
+				host = strings.TrimSpace(existing.Host)
+			}
+			if port <= 0 {
+				port = existing.Port
+			}
+			if username == "" {
+				username = strings.TrimSpace(existing.Username)
+			}
+			if authType == "" {
+				authType = strings.TrimSpace(existing.AuthType)
+			}
+			if strings.TrimSpace(password) == "" && existing.Password.Valid {
+				password = existing.Password.String
+			}
+			if strings.TrimSpace(privateKey) == "" && existing.PrivateKey.Valid {
+				privateKey = existing.PrivateKey.String
+			}
+			if strings.TrimSpace(passphrase) == "" && existing.Passphrase.Valid {
+				passphrase = existing.Passphrase.String
+			}
+			if sudoMode == "" {
+				sudoMode = strings.TrimSpace(existing.SudoMode)
+			}
+		}
+	}
+
+	if host == "" || username == "" {
+		return errors.New("nftables 节点 SSH 配置不完整")
+	}
+	if port <= 0 || port > 65535 {
+		return errors.New("nftables 节点 SSH 端口无效")
+	}
+
+	authType = strings.ToLower(authType)
+	switch authType {
+	case "password":
+		if strings.TrimSpace(password) == "" {
+			return errors.New("nftables 节点 SSH 密码不能为空")
+		}
+		privateKey = ""
+	case "private_key", "":
+		authType = "private_key"
+		if strings.TrimSpace(privateKey) == "" {
+			return errors.New("nftables 节点 SSH 私钥不能为空")
+		}
+		password = ""
+	default:
+		return errors.New("nftables 节点 SSH 认证方式无效")
+	}
+
+	switch strings.ToLower(sudoMode) {
+	case "", "none":
+		sudoMode = "none"
+	case "sudo", "sudo_su":
+	default:
+		return errors.New("nftables 节点 sudo 模式无效")
+	}
+
+	return h.repo.UpsertNodeSSHConfig(nodeID, repo.NftSSHConfigInput{
+		Host:       host,
+		Port:       port,
+		Username:   username,
+		AuthType:   authType,
+		Password:   password,
+		PrivateKey: privateKey,
+		Passphrase: passphrase,
+		SudoMode:   sudoMode,
+	}, now)
 }
 
 func (h *Handler) nodeDelete(w http.ResponseWriter, r *http.Request) {
@@ -573,6 +802,17 @@ func (h *Handler) tunnelCreate(w http.ResponseWriter, r *http.Request) {
 	trafficRatio := asFloat(req["trafficRatio"], 1.0)
 	inIP := asString(req["inIp"])
 	ipPreference := asString(req["ipPreference"])
+	probeTarget, probeTargetConfigured, err := parseTunnelProbeTargetFromRequest(req)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	probeTargetHost := ""
+	probeTargetPort := 0
+	if probeTargetConfigured {
+		probeTargetHost = probeTarget.Host
+		probeTargetPort = probeTarget.Port
+	}
 	now := time.Now().UnixMilli()
 	inx := h.repo.NextIndex("tunnel")
 	localDomain := h.federationLocalDomain()
@@ -592,6 +832,20 @@ func (h *Handler) tunnelCreate(w http.ResponseWriter, r *http.Request) {
 	runtimeState.IPPreference = ipPreference
 	if strings.TrimSpace(inIP) == "" {
 		inIP = buildTunnelInIP(runtimeState.InNodes, runtimeState.Nodes, ipPreference)
+	}
+	entryNodeIDs := make([]int64, 0, len(runtimeState.InNodes))
+	for _, inNode := range runtimeState.InNodes {
+		if inNode.NodeID > 0 {
+			entryNodeIDs = append(entryNodeIDs, inNode.NodeID)
+		}
+	}
+	if err := h.validateNftablesTunnelStateTx(tx, entryNodeIDs); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	if err := validateTunnelRuntimeBeforeApply(runtimeState); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
 	}
 
 	if len(runtimeState.InNodes) > 0 {
@@ -646,18 +900,24 @@ func (h *Handler) tunnelCreate(w http.ResponseWriter, r *http.Request) {
 	if trimmed := strings.TrimSpace(inIP); trimmed != "" {
 		tunnelInIP = sql.NullString{String: trimmed, Valid: true}
 	}
+	tunnelProtocol := "tls"
+	if len(runtimeState.InNodes) > 0 && strings.TrimSpace(runtimeState.InNodes[0].Protocol) != "" {
+		tunnelProtocol = strings.TrimSpace(runtimeState.InNodes[0].Protocol)
+	}
 	tunnel := model.Tunnel{
-		Name:         name,
-		TrafficRatio: trafficRatio,
-		Type:         typeVal,
-		Protocol:     "tls",
-		Flow:         flow,
-		CreatedTime:  now,
-		UpdatedTime:  now,
-		Status:       status,
-		InIP:         tunnelInIP,
-		Inx:          inx,
-		IPPreference: ipPreference,
+		Name:            name,
+		TrafficRatio:    trafficRatio,
+		Type:            typeVal,
+		Protocol:        tunnelProtocol,
+		Flow:            flow,
+		CreatedTime:     now,
+		UpdatedTime:     now,
+		Status:          status,
+		InIP:            tunnelInIP,
+		Inx:             inx,
+		IPPreference:    ipPreference,
+		ProbeTargetHost: probeTargetHost,
+		ProbeTargetPort: probeTargetPort,
 	}
 	if err := tx.Create(&tunnel).Error; err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
@@ -669,31 +929,39 @@ func (h *Handler) tunnelCreate(w http.ResponseWriter, r *http.Request) {
 	var federationReleaseRefs []federationRuntimeReleaseRef
 	federationBindings, federationReleaseRefs, err = h.applyFederationRuntime(runtimeState, localDomain)
 	if err != nil {
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
 	applyTunnelPortsToRequest(req, runtimeState)
 	if err := h.replaceTunnelChainsTx(tx, tunnelID, req); err != nil {
-		h.releaseFederationRuntimeRefs(federationReleaseRefs)
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	if err := h.repo.ReplaceFederationTunnelBindingsTx(tx, tunnelID, federationBindings); err != nil {
-		h.releaseFederationRuntimeRefs(federationReleaseRefs)
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	if err := tx.Commit().Error; err != nil {
-		h.releaseFederationRuntimeRefs(federationReleaseRefs)
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	if typeVal == 2 {
 		createdChains, createdServices, applyErr := h.applyTunnelRuntime(runtimeState)
 		if applyErr != nil {
-			h.rollbackTunnelRuntime(createdChains, createdServices, tunnelID)
-			h.releaseFederationRuntimeRefs(federationReleaseRefs)
-			_ = h.deleteTunnelByID(tunnelID)
+			h.rollbackTunnelRuntime(createdChains, createdServices, tunnelID, tunnelProtocol)
+			if cleanupErr := h.cleanupFederationRuntime(tunnelID); cleanupErr != nil {
+				applyErr = errors.Join(applyErr, cleanupErr)
+			} else {
+				_ = h.deleteTunnelByID(tunnelID)
+			}
 			response.WriteJSON(w, response.ErrDefault(applyErr.Error()))
 			return
 		}
@@ -711,18 +979,82 @@ func (h *Handler) cleanupTunnelRuntime(tunnelID int64) {
 		return
 	}
 
-	serviceName := fmt.Sprintf("%d_tls", tunnelID)
 	chainName := fmt.Sprintf("chains_%d", tunnelID)
+	serviceNames := tunnelRuntimeServiceNames(tunnelID)
 
 	for _, row := range chainRows {
 		if row.ChainType == 1 {
 			_, _ = h.sendNodeCommand(row.NodeID, "DeleteChains", map[string]interface{}{"chain": chainName}, false, true)
 		} else if row.ChainType == 2 {
 			_, _ = h.sendNodeCommand(row.NodeID, "DeleteChains", map[string]interface{}{"chain": chainName}, false, true)
-			_, _ = h.sendNodeCommand(row.NodeID, "DeleteService", map[string]interface{}{"services": []string{serviceName}}, false, true)
+			_, _ = h.sendNodeCommand(row.NodeID, "DeleteService", map[string]interface{}{"services": serviceNames}, false, true)
 		} else if row.ChainType == 3 {
-			_, _ = h.sendNodeCommand(row.NodeID, "DeleteService", map[string]interface{}{"services": []string{serviceName}}, false, true)
+			_, _ = h.sendNodeCommand(row.NodeID, "DeleteService", map[string]interface{}{"services": serviceNames}, false, true)
 		}
+	}
+}
+
+func tunnelRuntimeServiceNames(tunnelID int64) []string {
+	return []string{
+		fmt.Sprintf("tunnel_%d", tunnelID),
+		fmt.Sprintf("%d_tls", tunnelID),
+		fmt.Sprintf("%d_kcp", tunnelID),
+		fmt.Sprintf("%d_wss", tunnelID),
+		fmt.Sprintf("%d_mtls", tunnelID),
+		fmt.Sprintf("%d_mwss", tunnelID),
+		fmt.Sprintf("%d_tcp", tunnelID),
+		fmt.Sprintf("%d_mtcp", tunnelID),
+	}
+}
+
+func tunnelRuntimeNeedsChain(row chainNodeRecord) bool {
+	return row.ChainType == 1 || row.ChainType == 2
+}
+
+func tunnelRuntimeNeedsService(row chainNodeRecord) bool {
+	return row.ChainType == 2 || row.ChainType == 3
+}
+
+func removedTunnelRuntimeNodeIDs(oldRows, newRows []chainNodeRecord, needsRuntime func(chainNodeRecord) bool) []int64 {
+	if len(oldRows) == 0 || needsRuntime == nil {
+		return nil
+	}
+	newRuntimeNodes := make(map[int64]struct{}, len(newRows))
+	for _, row := range newRows {
+		if row.NodeID <= 0 || !needsRuntime(row) {
+			continue
+		}
+		newRuntimeNodes[row.NodeID] = struct{}{}
+	}
+	seen := make(map[int64]struct{}, len(oldRows))
+	removed := make([]int64, 0)
+	for _, row := range oldRows {
+		if row.NodeID <= 0 || !needsRuntime(row) {
+			continue
+		}
+		if _, ok := seen[row.NodeID]; ok {
+			continue
+		}
+		seen[row.NodeID] = struct{}{}
+		if _, stillNeeded := newRuntimeNodes[row.NodeID]; stillNeeded {
+			continue
+		}
+		removed = append(removed, row.NodeID)
+	}
+	return removed
+}
+
+func (h *Handler) cleanupObsoleteTunnelRuntime(tunnelID int64, oldRows, newRows []chainNodeRecord) {
+	if h == nil || tunnelID <= 0 || len(oldRows) == 0 {
+		return
+	}
+	chainName := fmt.Sprintf("chains_%d", tunnelID)
+	for _, nodeID := range removedTunnelRuntimeNodeIDs(oldRows, newRows, tunnelRuntimeNeedsChain) {
+		_, _ = h.sendNodeCommand(nodeID, "DeleteChains", map[string]interface{}{"chain": chainName}, false, true)
+	}
+	serviceNames := tunnelRuntimeServiceNames(tunnelID)
+	for _, nodeID := range removedTunnelRuntimeNodeIDs(oldRows, newRows, tunnelRuntimeNeedsService) {
+		_, _ = h.sendNodeCommand(nodeID, "DeleteService", map[string]interface{}{"services": serviceNames}, false, true)
 	}
 }
 
@@ -740,6 +1072,7 @@ func (h *Handler) tunnelGet(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	h.attachBestExitStates(items)
 	for _, it := range items {
 		if asInt64(it["id"], 0) == id {
 			response.WriteJSON(w, response.OK(it))
@@ -768,41 +1101,130 @@ func (h *Handler) tunnelUpdate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("隧道ID不能为空"))
 		return
 	}
-	oldEntryNodeIDs, _ := h.tunnelEntryNodeIDs(id)
-
-	h.cleanupTunnelRuntime(id)
-	h.cleanupFederationRuntime(id)
-
-	now := time.Now().UnixMilli()
 	typeVal := asInt(req["type"], 1)
 	ipPreference := asString(req["ipPreference"])
-	localDomain := h.federationLocalDomain()
-
-	tx := h.repo.BeginTx()
-	if tx.Error != nil {
-		response.WriteJSON(w, response.Err(-2, tx.Error.Error()))
+	_, hasProbeTargetHost := req["probeTargetHost"]
+	_, hasProbeTargetPort := req["probeTargetPort"]
+	probeTargetFieldsPresent := hasProbeTargetHost || hasProbeTargetPort
+	probeTargetHost := ""
+	probeTargetPort := 0
+	if probeTargetFieldsPresent {
+		probeTarget, probeTargetConfigured, err := parseTunnelProbeTargetFromRequest(req)
+		if err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+		if probeTargetConfigured {
+			probeTargetHost = probeTarget.Host
+			probeTargetPort = probeTarget.Port
+		}
+	}
+	oldEntryNodeIDs, err := h.tunnelEntryNodeIDs(id)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
-	defer func() { tx.Rollback() }()
+	oldTunnel, err := h.getTunnelRecord(id)
+	if err != nil || oldTunnel == nil {
+		response.WriteJSON(w, response.ErrDefault("隧道不存在"))
+		return
+	}
+	if !probeTargetFieldsPresent && oldTunnel != nil {
+		probeTargetHost = oldTunnel.ProbeTargetHost
+		probeTargetPort = oldTunnel.ProbeTargetPort
+	}
+	oldChainRows, err := h.listChainNodesForTunnel(id)
+	if err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
 
-	runtimeState, err := h.prepareTunnelCreateState(tx, req, typeVal, id)
+	now := time.Now().UnixMilli()
+	localDomain := h.federationLocalDomain()
+
+	// Check the complete request and known database constraints before changing
+	// any existing listener or remote binding.
+	validationTx := h.repo.BeginTx()
+	if validationTx.Error != nil {
+		response.WriteJSON(w, response.Err(-2, validationTx.Error.Error()))
+		return
+	}
+	defer validationTx.Rollback()
+	runtimeState, err := h.prepareTunnelCreateState(validationTx, req, typeVal, id)
 	if err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
 	runtimeState.TunnelID = id
 	runtimeState.IPPreference = ipPreference
+	entryNodeIDs := make([]int64, 0, len(runtimeState.InNodes))
+	for _, inNode := range runtimeState.InNodes {
+		if inNode.NodeID > 0 {
+			entryNodeIDs = append(entryNodeIDs, inNode.NodeID)
+		}
+	}
+	if err := h.validateNftablesTunnelStateTx(validationTx, entryNodeIDs); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+
+	if err := h.validateTunnelEntryPortConflictsForNewEntriesTx(validationTx, id, oldEntryNodeIDs, entryNodeIDs); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	if err := validateTunnelRuntimeBeforeApply(runtimeState); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
 
 	inIp := buildTunnelInIP(runtimeState.InNodes, runtimeState.Nodes, ipPreference)
+
+	updateProtocol := "tls"
+	if len(runtimeState.OutNodes) > 0 && strings.TrimSpace(runtimeState.OutNodes[0].Protocol) != "" {
+		updateProtocol = strings.TrimSpace(runtimeState.OutNodes[0].Protocol)
+	} else if len(runtimeState.InNodes) > 0 && strings.TrimSpace(runtimeState.InNodes[0].Protocol) != "" {
+		updateProtocol = strings.TrimSpace(runtimeState.InNodes[0].Protocol)
+	}
+	if err := h.repo.UpdateTunnelTx(validationTx, id, asString(req["name"]), typeVal,
+		asInt64(req["flow"], 1), asFloat(req["trafficRatio"], 1.0), asInt(req["status"], 1),
+		inIp, ipPreference, updateProtocol, probeTargetHost, probeTargetPort, now); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.validateTunnelChainReplacementTx(validationTx, runtimeState); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := validationTx.Rollback().Error; err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.cleanupFederationRuntime(id); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	if oldTunnel.Type == 2 && typeVal != 2 {
+		h.cleanupTunnelRuntime(id)
+	}
 
 	var federationBindings []repo.FederationTunnelBinding
 	var federationReleaseRefs []federationRuntimeReleaseRef
 	federationBindings, federationReleaseRefs, err = h.applyFederationRuntime(runtimeState, localDomain)
 	if err != nil {
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
 	applyTunnelPortsToRequest(req, runtimeState)
+
+	tx := h.repo.BeginTx()
+	if tx.Error != nil {
+		tx.Rollback()
+		err := errors.Join(tx.Error, h.releaseFederationRuntimeRefs(federationReleaseRefs))
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	defer func() { tx.Rollback() }()
 
 	if err := h.repo.UpdateTunnelTx(
 		tx,
@@ -814,23 +1236,32 @@ func (h *Handler) tunnelUpdate(w http.ResponseWriter, r *http.Request) {
 		asInt(req["status"], 1),
 		inIp,
 		ipPreference,
+		updateProtocol,
+		probeTargetHost,
+		probeTargetPort,
 		now,
 	); err != nil {
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 
 	if err := h.repo.DeleteChainTunnelsByTunnelTx(tx, id); err != nil {
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	if err := h.replaceTunnelChainsTx(tx, id, req); err != nil {
-		h.releaseFederationRuntimeRefs(federationReleaseRefs)
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	if err := h.repo.ReplaceFederationTunnelBindingsTx(tx, id, federationBindings); err != nil {
-		h.releaseFederationRuntimeRefs(federationReleaseRefs)
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -842,12 +1273,15 @@ func (h *Handler) tunnelUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := h.validateTunnelEntryPortConflictsForNewEntriesTx(tx, id, oldEntryNodeIDs, newEntryNodeIDs); err != nil {
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
 
 	if err := tx.Commit().Error; err != nil {
-		h.releaseFederationRuntimeRefs(federationReleaseRefs)
+		tx.Rollback()
+		err = errors.Join(err, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -859,11 +1293,20 @@ func (h *Handler) tunnelUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if typeVal == 2 {
-		createdChains, createdServices, applyErr := h.applyTunnelRuntime(runtimeState)
+		applyRuntime := h.applyTunnelRuntime
+		if oldTunnel != nil && oldTunnel.Type == 2 {
+			applyRuntime = h.applyTunnelRuntimeUpsert
+		}
+		createdChains, createdServices, applyErr := applyRuntime(runtimeState)
 		if applyErr != nil {
-			h.rollbackTunnelRuntime(createdChains, createdServices, id)
-			h.releaseFederationRuntimeRefs(federationReleaseRefs)
-			_ = h.repo.DeleteFederationTunnelBindingsByTunnel(id)
+			updateProtocol := "tls"
+			if len(runtimeState.InNodes) > 0 && strings.TrimSpace(runtimeState.InNodes[0].Protocol) != "" {
+				updateProtocol = strings.TrimSpace(runtimeState.InNodes[0].Protocol)
+			}
+			if oldTunnel == nil || oldTunnel.Type != 2 {
+				h.rollbackTunnelRuntime(createdChains, createdServices, id, updateProtocol)
+			}
+			applyErr = errors.Join(applyErr, h.cleanupFederationRuntime(id))
 			if len(federationReleaseRefs) == 0 && shouldDeferTunnelRuntimeApplyError(applyErr) {
 				response.WriteJSON(w, response.OKEmpty())
 				return
@@ -871,15 +1314,33 @@ func (h *Handler) tunnelUpdate(w http.ResponseWriter, r *http.Request) {
 			response.WriteJSON(w, response.ErrDefault(applyErr.Error()))
 			return
 		}
+		newChainRows, _ := h.listChainNodesForTunnel(id)
+		h.cleanupObsoleteTunnelRuntime(id, oldChainRows, newChainRows)
 	}
 
-	if forwards, fwdErr := h.listForwardsByTunnel(id); fwdErr == nil {
+	oldType := 0
+	if oldTunnel != nil {
+		oldType = oldTunnel.Type
+	}
+	if tunnelForwardRuntimeNeedsSync(oldType, typeVal, oldEntryNodeIDs, newEntryNodeIDs) {
+		forwards, fwdErr := h.listForwardsByTunnel(id)
+		if fwdErr != nil {
+			response.WriteJSON(w, response.OKEmpty())
+			return
+		}
 		for i := range forwards {
 			_ = h.syncForwardServices(&forwards[i], "UpdateService", true)
 		}
 	}
 
 	response.WriteJSON(w, response.OKEmpty())
+}
+
+func tunnelForwardRuntimeNeedsSync(oldType, newType int, oldEntryNodeIDs, newEntryNodeIDs []int64) bool {
+	if oldType != newType {
+		return true
+	}
+	return !sameInt64Set(oldEntryNodeIDs, newEntryNodeIDs)
 }
 
 func sameInt64Set(a, b []int64) bool {
@@ -1054,7 +1515,10 @@ func (h *Handler) validateTunnelEntryPortConflictsForNewEntriesTx(tx *gorm.DB, t
 	}
 
 	forwards, err := h.repo.ListForwardsByTunnelTx(tx, tunnelID)
-	if err != nil || len(forwards) == 0 {
+	if err != nil {
+		return err
+	}
+	if len(forwards) == 0 {
 		return nil
 	}
 
@@ -1065,7 +1529,7 @@ func (h *Handler) validateTunnelEntryPortConflictsForNewEntriesTx(tx *gorm.DB, t
 		}
 		oldPorts, portsErr := h.repo.ListForwardPortsTx(tx, f.ID)
 		if portsErr != nil {
-			continue
+			return portsErr
 		}
 		port := pickForwardPortFromRecords(oldPorts)
 		if port <= 0 {
@@ -1075,7 +1539,7 @@ func (h *Handler) validateTunnelEntryPortConflictsForNewEntriesTx(tx *gorm.DB, t
 		for _, nodeID := range addedNodeIDs {
 			node, nodeErr := h.repo.GetNodeRecordTx(tx, nodeID)
 			if nodeErr != nil {
-				continue
+				return nodeErr
 			}
 
 			if err := h.validateForwardPortAvailabilityTx(tx, node, port, f.ID); err != nil {
@@ -1227,8 +1691,11 @@ func (h *Handler) tunnelDelete(w http.ResponseWriter, r *http.Request) {
 	if id <= 0 {
 		return
 	}
+	if err := h.cleanupFederationRuntime(id); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
 	h.cleanupTunnelRuntime(id)
-	h.cleanupFederationRuntime(id)
 	if err := h.deleteTunnelByID(id); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -1295,8 +1762,12 @@ func (h *Handler) tunnelBatchDelete(w http.ResponseWriter, r *http.Request) {
 			failures = appendBatchFailure(failures, id, tunnelName, err)
 			continue
 		}
+		if err := h.cleanupFederationRuntime(id); err != nil {
+			fail++
+			failures = appendBatchFailure(failures, id, tunnelName, err)
+			continue
+		}
 		h.cleanupTunnelRuntime(id)
-		h.cleanupFederationRuntime(id)
 		if err := h.deleteTunnelByID(id); err != nil {
 			fail++
 			failures = appendBatchFailure(failures, id, tunnelName, err)
@@ -1395,34 +1866,35 @@ func (h *Handler) redeployTunnelAndForwards(tunnelID int64) error {
 	}
 
 	if tunnel.Type == 2 {
-		h.cleanupTunnelRuntime(tunnelID)
-		h.cleanupFederationRuntime(tunnelID)
 		state, err := h.reconstructTunnelState(tunnelID)
 		if err != nil {
 			return err
 		}
+		if err := validateTunnelRuntimeBeforeApply(state); err != nil {
+			return err
+		}
+		if err := h.cleanupFederationRuntime(tunnelID); err != nil {
+			return err
+		}
+		h.cleanupTunnelRuntime(tunnelID)
 		federationBindings, federationReleaseRefs, fedErr := h.applyFederationRuntime(state, h.federationLocalDomain())
 		if fedErr != nil {
-			return fedErr
+			return errors.Join(fedErr, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		}
 		tx := h.repo.BeginTx()
 		if tx.Error != nil {
-			h.releaseFederationRuntimeRefs(federationReleaseRefs)
-			return tx.Error
+			return errors.Join(tx.Error, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		}
 		if replaceErr := h.repo.ReplaceFederationTunnelBindingsTx(tx, tunnelID, federationBindings); replaceErr != nil {
 			tx.Rollback()
-			h.releaseFederationRuntimeRefs(federationReleaseRefs)
-			return replaceErr
+			return errors.Join(replaceErr, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		}
 		if commitErr := tx.Commit().Error; commitErr != nil {
-			h.releaseFederationRuntimeRefs(federationReleaseRefs)
-			return commitErr
+			return errors.Join(commitErr, h.releaseFederationRuntimeRefs(federationReleaseRefs))
 		}
 		_, _, applyErr := h.applyTunnelRuntime(state)
 		if applyErr != nil {
-			h.releaseFederationRuntimeRefs(federationReleaseRefs)
-			_ = h.repo.DeleteFederationTunnelBindingsByTunnel(tunnelID)
+			applyErr = errors.Join(applyErr, h.cleanupFederationRuntime(tunnelID))
 			return applyErr
 		}
 	}
@@ -1511,6 +1983,24 @@ func (h *Handler) tunnelBatchRedeploy(w http.ResponseWriter, r *http.Request) {
 		if tunnelErr != nil {
 			fail++
 			failures = appendBatchFailure(failures, tunnelID, tunnelName, tunnelErr)
+			continue
+		}
+		if nftMode, entryNodeIDs, modeErr := h.tunnelUsesNftables(tunnelID); modeErr != nil {
+			fail++
+			failures = appendBatchFailure(failures, tunnelID, tunnelName, modeErr)
+			continue
+		} else if nftMode {
+			if len(entryNodeIDs) == 0 {
+				fail++
+				failures = appendBatchFailureReason(failures, tunnelID, tunnelName, "nftables 转发缺少入口节点")
+				continue
+			}
+			if reconcileErr := h.reconcileNftablesNodeByRequest(entryNodeIDs[0]); reconcileErr != nil {
+				fail++
+				failures = appendBatchFailure(failures, tunnelID, tunnelName, reconcileErr)
+				continue
+			}
+			success++
 			continue
 		}
 		if err := h.redeployTunnelAndForwards(tunnelID); err != nil {
@@ -1610,14 +2100,32 @@ func (h *Handler) userTunnelUpdate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, oldErr.Error()))
 		return
 	}
+	oldTunnel, oldTunnelErr := h.repo.GetUserTunnelByID(id)
+	if oldTunnelErr != nil {
+		response.WriteJSON(w, response.Err(-2, oldTunnelErr.Error()))
+		return
+	}
+	if oldTunnel == nil {
+		response.WriteJSON(w, response.ErrDefault("隧道权限不存在"))
+		return
+	}
+	flow, flowMiB, flowErr := parseTrafficLimit(req, 0)
+	if flowErr != nil {
+		response.WriteJSON(w, response.ErrDefault(flowErr.Error()))
+		return
+	}
+	if _, supplied := req["flowMiB"]; !supplied && oldTunnel.Flow == flow {
+		flowMiB = oldTunnel.FlowMiB
+	}
 
 	if err := h.repo.UpdateUserTunnel(id,
-		asInt64(req["flow"], 0),
+		flow,
 		asInt(req["num"], 0),
 		asInt64(req["expTime"], time.Now().Add(365*24*time.Hour).UnixMilli()),
 		asInt64(req["flowResetTime"], 1),
 		nullableInt(speedID),
 		asInt(req["status"], 1),
+		flowMiB,
 	); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -1632,6 +2140,7 @@ func (h *Handler) userTunnelUpdate(w http.ResponseWriter, r *http.Request) {
 			oldFlowReset,
 			oldSpeedID,
 			oldStatus,
+			oldTunnel.FlowMiB,
 		)
 		if rollbackErr != nil {
 			response.WriteJSON(w, response.Err(-2, fmt.Sprintf("下发失败且回滚失败: %v; 回滚错误: %v", syncErr, rollbackErr)))
@@ -1684,6 +2193,12 @@ func (h *Handler) forwardCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("转发名称和目标地址不能为空"))
 		return
 	}
+	if roleID != 0 && !h.allowLocalRemoteAddr() {
+		if err := IsSafeRemoteAddr(remoteAddr); err != nil {
+			response.WriteJSON(w, response.Err(403, err.Error()))
+			return
+		}
+	}
 	if roleID != 0 {
 		if speedIDVal, ok := req["speedId"]; ok && speedIDVal != nil {
 			response.WriteJSON(w, response.Err(-1, "普通用户无法设置限速规则"))
@@ -1696,6 +2211,18 @@ func (h *Handler) forwardCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	if roleID != 0 {
+		if ipSpeedIDVal, ok := req["ipSpeedId"]; ok && ipSpeedIDVal != nil {
+			response.WriteJSON(w, response.Err(-1, "普通用户无法设置每 IP 限速规则"))
+			return
+		}
+	}
+	ipSpeedID := asAnyToInt64Ptr(req["ipSpeedId"])
+	ipSpeedID, err = h.normalizeSpeedLimitReference(ipSpeedID)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
 	port := asInt(req["inPort"], 0)
 	if port <= 0 {
 		port = h.pickTunnelPort(tunnelID)
@@ -1704,6 +2231,17 @@ func (h *Handler) forwardCreate(w http.ResponseWriter, r *http.Request) {
 		port = 10000
 	}
 	entryNodes, _ := h.tunnelEntryNodeIDs(tunnelID)
+	isNftTunnel, _, err := h.tunnelUsesNftables(tunnelID)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if isNftTunnel {
+		if err := h.validateNftablesForwardRequest(tunnel, remoteAddr, entryNodes); err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+	}
 	inIp := strings.TrimSpace(asString(req["inIp"]))
 	if inIp != "" && len(entryNodes) > 1 {
 		response.WriteJSON(w, response.ErrDefault("多入口隧道的转发不支持自定义监听IP"))
@@ -1733,7 +2271,16 @@ func (h *Handler) forwardCreate(w http.ResponseWriter, r *http.Request) {
 	if userName == "" {
 		userName = "user"
 	}
-	forwardID, err := h.repo.CreateForwardTx(userID, userName, name, tunnelID, remoteAddr, defaultString(asString(req["strategy"]), "fifo"), now, inx, entryNodes, port, inIp, nullableInt(speedID))
+	maxConn := asInt(req["maxConn"], 0)
+	ipMaxConn := asInt(req["ipMaxConn"], 0)
+	if ipMaxConn < 0 {
+		ipMaxConn = 0
+	}
+	proxyProtocol := asInt(req["proxyProtocol"], 0)
+	proxyProtocolReceive := asInt(req["proxyProtocolReceive"], 0)
+	proxyProtocolSend := asInt(req["proxyProtocolSend"], proxyProtocol)
+
+	forwardID, err := h.repo.CreateForwardTx(userID, userName, name, tunnelID, remoteAddr, defaultString(asString(req["strategy"]), "fifo"), now, inx, entryNodes, port, inIp, nullableInt(speedID), maxConn, ipMaxConn, nullableInt(ipSpeedID), proxyProtocol, proxyProtocolReceive, proxyProtocolSend)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -1804,6 +2351,23 @@ func (h *Handler) forwardUpdate(w http.ResponseWriter, r *http.Request) {
 	if remoteAddr == "" {
 		remoteAddr = forward.RemoteAddr
 	}
+	isNftTunnel, entryNodes, err := h.tunnelUsesNftables(tunnelID)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if isNftTunnel {
+		if err := h.validateNftablesForwardRequest(tunnel, remoteAddr, entryNodes); err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+	}
+	if actorRole != 0 && !h.allowLocalRemoteAddr() {
+		if err := IsSafeRemoteAddr(remoteAddr); err != nil {
+			response.WriteJSON(w, response.Err(403, err.Error()))
+			return
+		}
+	}
 	strategy := strings.TrimSpace(asString(req["strategy"]))
 	if strategy == "" {
 		strategy = forward.Strategy
@@ -1825,6 +2389,27 @@ func (h *Handler) forwardUpdate(w http.ResponseWriter, r *http.Request) {
 		newSpeedID = sql.NullInt64{Int64: *speedID, Valid: true}
 	} else if _, ok := req["speedId"]; ok {
 		newSpeedID = sql.NullInt64{Valid: false}
+	}
+	rawIPSpeedID, hasIPSpeedID := req["ipSpeedId"]
+	requestedIPSpeedID := asAnyToInt64Ptr(rawIPSpeedID)
+	newIPSpeedID := forward.IPSpeedID
+	if actorRole != 0 {
+		if hasIPSpeedID && !sameSpeedLimitSelection(forward.IPSpeedID, requestedIPSpeedID) {
+			response.WriteJSON(w, response.Err(-1, "普通用户无法修改每 IP 限速规则"))
+			return
+		}
+	} else {
+		ipSpeedID := requestedIPSpeedID
+		ipSpeedID, err = h.normalizeSpeedLimitReference(ipSpeedID)
+		if err != nil {
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
+		if ipSpeedID != nil {
+			newIPSpeedID = sql.NullInt64{Int64: *ipSpeedID, Valid: true}
+		} else if hasIPSpeedID {
+			newIPSpeedID = sql.NullInt64{Valid: false}
+		}
 	}
 
 	port := asInt(req["inPort"], 0)
@@ -1878,7 +2463,16 @@ func (h *Handler) forwardUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	now := time.Now().UnixMilli()
-	if err := h.repo.UpdateForward(id, name, tunnelID, remoteAddr, strategy, now, newSpeedID); err != nil {
+	maxConn := asInt(req["maxConn"], forward.MaxConn)
+	ipMaxConn := asInt(req["ipMaxConn"], forward.IPMaxConn)
+	if ipMaxConn < 0 {
+		ipMaxConn = 0
+	}
+	proxyProtocol := asInt(req["proxyProtocol"], forward.ProxyProtocol)
+	proxyProtocolReceive := asInt(req["proxyProtocolReceive"], forward.ProxyProtocolReceive)
+	proxyProtocolSend := asInt(req["proxyProtocolSend"], forward.ProxyProtocolSend)
+
+	if err := h.repo.UpdateForward(id, name, tunnelID, remoteAddr, strategy, now, newSpeedID, maxConn, ipMaxConn, newIPSpeedID, proxyProtocol, proxyProtocolReceive, proxyProtocolSend); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -1956,13 +2550,29 @@ func (h *Handler) forwardDelete(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
-	if err := h.controlForwardServices(forward, "DeleteService", true); err != nil {
+	var nftNodeID int64
+	if nftMode, entryNodeIDs, modeErr := h.tunnelUsesNftables(forward.TunnelID); modeErr != nil {
+		response.WriteJSON(w, response.Err(-2, modeErr.Error()))
+		return
+	} else if nftMode {
+		if len(entryNodeIDs) == 0 {
+			response.WriteJSON(w, response.ErrDefault("nftables 转发缺少入口节点"))
+			return
+		}
+		nftNodeID = entryNodeIDs[0]
+	} else if err := h.controlForwardServices(forward, "DeleteService", true); err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
 	if err := h.deleteForwardByID(id); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
+	}
+	if nftNodeID > 0 {
+		if err := h.reconcileNftablesNodeByRequest(nftNodeID); err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
 	}
 	response.WriteJSON(w, response.OKEmpty())
 }
@@ -1972,7 +2582,7 @@ func (h *Handler) forwardForceDelete(w http.ResponseWriter, r *http.Request) {
 	if id <= 0 {
 		return
 	}
-	_, _, _, err := h.resolveForwardAccess(r, id)
+	forward, _, _, err := h.resolveForwardAccess(r, id)
 	if err != nil {
 		if errors.Is(err, errForwardNotFound) {
 			response.WriteJSON(w, response.ErrDefault("转发不存在"))
@@ -1987,6 +2597,13 @@ func (h *Handler) forwardForceDelete(w http.ResponseWriter, r *http.Request) {
 	if err := h.deleteForwardByID(id); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
+	}
+	_ = h.repo.DeleteNftRuleBindingsByForward(id)
+	if nftMode, entryNodeIDs, modeErr := h.tunnelUsesNftables(forward.TunnelID); modeErr == nil && nftMode && len(entryNodeIDs) > 0 {
+		if err := h.reconcileNftablesNodeByRequest(entryNodeIDs[0]); err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
 	}
 	response.WriteJSON(w, response.OKEmpty())
 }
@@ -2010,6 +2627,26 @@ func (h *Handler) forwardPause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = h.repo.UpdateForwardStatus(id, 0, time.Now().UnixMilli())
+	response.WriteJSON(w, response.OKEmpty())
+}
+
+func (h *Handler) forwardResetFlow(w http.ResponseWriter, r *http.Request) {
+	id := idFromBody(r, w)
+	if id <= 0 {
+		return
+	}
+	if _, _, _, err := h.resolveForwardAccess(r, id); err != nil {
+		if errors.Is(err, errForwardNotFound) {
+			response.WriteJSON(w, response.ErrDefault("转发不存在"))
+			return
+		}
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.repo.ResetForwardFlow(id, time.Now().UnixMilli()); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
 	response.WriteJSON(w, response.OKEmpty())
 }
 
@@ -2105,7 +2742,19 @@ func (h *Handler) forwardBatchDelete(w http.ResponseWriter, r *http.Request) {
 			failures = appendBatchFailure(failures, id, "", accessErr)
 			continue
 		}
-		if err := h.controlForwardServices(forward, "DeleteService", true); err != nil {
+		var nftNodeID int64
+		if nftMode, entryNodeIDs, modeErr := h.tunnelUsesNftables(forward.TunnelID); modeErr != nil {
+			f++
+			failures = appendBatchFailure(failures, id, forward.Name, modeErr)
+			continue
+		} else if nftMode {
+			if len(entryNodeIDs) == 0 {
+				f++
+				failures = appendBatchFailureReason(failures, id, forward.Name, "nftables 转发缺少入口节点")
+				continue
+			}
+			nftNodeID = entryNodeIDs[0]
+		} else if err := h.controlForwardServices(forward, "DeleteService", true); err != nil {
 			f++
 			failures = appendBatchFailure(failures, id, forward.Name, err)
 			continue
@@ -2113,9 +2762,16 @@ func (h *Handler) forwardBatchDelete(w http.ResponseWriter, r *http.Request) {
 		if err := h.deleteForwardByID(id); err != nil {
 			f++
 			failures = appendBatchFailure(failures, id, forward.Name, err)
-		} else {
-			s++
+			continue
 		}
+		if nftNodeID > 0 {
+			if err := h.reconcileNftablesNodeByRequest(nftNodeID); err != nil {
+				f++
+				failures = appendBatchFailure(failures, id, forward.Name, err)
+				continue
+			}
+		}
+		s++
 	}
 	response.WriteJSON(w, response.OK(batchOperationResult{SuccessCount: s, FailCount: f, Failures: failures}))
 }
@@ -2214,6 +2870,24 @@ func (h *Handler) forwardBatchRedeploy(w http.ResponseWriter, r *http.Request) {
 		if accessErr != nil {
 			f++
 			failures = appendBatchFailure(failures, id, "", accessErr)
+			continue
+		}
+		if nftMode, entryNodeIDs, modeErr := h.tunnelUsesNftables(forward.TunnelID); modeErr != nil {
+			f++
+			failures = appendBatchFailure(failures, id, forward.Name, modeErr)
+			continue
+		} else if nftMode {
+			if len(entryNodeIDs) == 0 {
+				f++
+				failures = appendBatchFailureReason(failures, id, forward.Name, "nftables 转发缺少入口节点")
+				continue
+			}
+			if err := h.reconcileNftablesNodeByRequest(entryNodeIDs[0]); err != nil {
+				f++
+				failures = appendBatchFailure(failures, id, forward.Name, err)
+			} else {
+				s++
+			}
 			continue
 		}
 		if err := h.syncForwardServices(forward, "UpdateService", true); err != nil {
@@ -2815,12 +3489,13 @@ func (h *Handler) prepareTunnelCreateState(tx *gorm.DB, req map[string]interface
 	existingNodeIDs := make(map[int64]struct{})
 	if excludeTunnelID > 0 {
 		var existIDs []int64
-		if err := tx.Model(&model.ChainTunnel{}).
-			Where("tunnel_id = ?", excludeTunnelID).
-			Pluck("node_id", &existIDs).Error; err == nil {
-			for _, eid := range existIDs {
-				existingNodeIDs[eid] = struct{}{}
-			}
+		var err error
+		existIDs, err = h.repo.ListTunnelChainNodeIDsTx(tx, excludeTunnelID)
+		if err != nil {
+			return nil, err
+		}
+		for _, eid := range existIDs {
+			existingNodeIDs[eid] = struct{}{}
 		}
 	}
 
@@ -2866,6 +3541,59 @@ func (h *Handler) prepareTunnelCreateState(tx *gorm.DB, req map[string]interface
 	}
 
 	return state, nil
+}
+
+func validateTunnelRuntimeBeforeApply(state *tunnelCreateState) error {
+	if state.Type != 2 {
+		return nil
+	}
+	for _, node := range state.Nodes {
+		if node.IsRemote == 1 && (strings.TrimSpace(node.RemoteURL) == "" || strings.TrimSpace(node.RemoteToken) == "") {
+			return fmt.Errorf("远程节点 %s 缺少共享配置", nodeDisplayName(node))
+		}
+	}
+	groups := append([][]tunnelRuntimeNode{state.InNodes}, state.ChainHops...)
+	groups = append(groups, state.OutNodes)
+	for i := 0; i+1 < len(groups); i++ {
+		for _, source := range groups[i] {
+			for _, target := range groups[i+1] {
+				node := state.Nodes[target.NodeID]
+				if node == nil {
+					return errors.New("节点不存在")
+				}
+				if _, err := selectTunnelDialHost(state.Nodes[source.NodeID], node, state.IPPreference, target.ConnectIP); err != nil {
+					return err
+				}
+				if node.IsRemote != 1 && target.Port <= 0 {
+					return errors.New("节点端口不能为空")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Exercise known chain write constraints inside the validation transaction.
+// Remote ports that have not been reserved yet remain NULL until actual apply.
+func (h *Handler) validateTunnelChainReplacementTx(tx *gorm.DB, state *tunnelCreateState) error {
+	if err := h.repo.DeleteChainTunnelsByTunnelTx(tx, state.TunnelID); err != nil {
+		return err
+	}
+	groups := append([][]tunnelRuntimeNode{state.InNodes, state.OutNodes}, state.ChainHops...)
+	for groupIndex, group := range groups {
+		for nodeIndex, node := range group {
+			inx := nodeIndex + 1
+			if node.ChainType == 2 {
+				inx = groupIndex - 1
+			}
+			port := sql.NullInt64{Int64: int64(node.Port), Valid: node.Port > 0}
+			if err := h.repo.CreateChainTunnelTx(tx, state.TunnelID, strconv.Itoa(node.ChainType),
+				node.NodeID, port, node.Strategy, inx, node.Protocol, node.ConnectIP); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func buildTunnelInIP(inNodes []tunnelRuntimeNode, nodes map[int64]*nodeRecord, ipPreference string) string {
@@ -3017,8 +3745,7 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 		remoteURL := strings.TrimSpace(node.RemoteURL)
 		remoteToken := strings.TrimSpace(node.RemoteToken)
 		if remoteURL == "" || remoteToken == "" {
-			h.releaseFederationRuntimeRefs(releaseRefs)
-			return nil, nil, fmt.Errorf("远程节点 %s 缺少共享配置", nodeDisplayName(node))
+			return bindings, releaseRefs, fmt.Errorf("远程节点 %s 缺少共享配置", nodeDisplayName(node))
 		}
 
 		resourceKey := federationRuntimeResourceKey(state.TunnelID, outNode.NodeID, 3, 0)
@@ -3033,9 +3760,13 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 			reserveRes, err = fc.ReservePort(remoteURL, remoteToken, localDomain, reserveReq)
 		}
 		if err != nil {
-			h.releaseFederationRuntimeRefs(releaseRefs)
-			return nil, nil, fmt.Errorf("远程节点 %s 端口分配失败: %w", nodeDisplayName(node), err)
+			return bindings, releaseRefs, fmt.Errorf("远程节点 %s 端口分配失败: %w", nodeDisplayName(node), err)
 		}
+
+		releaseRefs = append(releaseRefs, federationRuntimeReleaseRef{
+			RemoteURL: remoteURL, RemoteToken: remoteToken, BindingID: reserveRes.BindingID,
+			ReservationID: reserveRes.ReservationID, ResourceKey: resourceKey,
+		})
 
 		state.OutNodes[outIdx].Port = reserveRes.AllocatedPort
 		outNode = state.OutNodes[outIdx]
@@ -3049,8 +3780,7 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 		}
 		applyRes, err := fc.ApplyRole(remoteURL, remoteToken, localDomain, applyReq)
 		if err != nil {
-			h.releaseFederationRuntimeRefs(releaseRefs)
-			return nil, nil, fmt.Errorf("远程节点 %s 运行时下发失败: %w", nodeDisplayName(node), err)
+			return bindings, releaseRefs, fmt.Errorf("远程节点 %s 运行时下发失败: %w", nodeDisplayName(node), err)
 		}
 		if applyRes.AllocatedPort > 0 {
 			state.OutNodes[outIdx].Port = applyRes.AllocatedPort
@@ -3070,13 +3800,7 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 			CreatedTime:     now,
 			UpdatedTime:     now,
 		})
-		releaseRefs = append(releaseRefs, federationRuntimeReleaseRef{
-			RemoteURL:     remoteURL,
-			RemoteToken:   remoteToken,
-			BindingID:     applyRes.BindingID,
-			ReservationID: reserveRes.ReservationID,
-			ResourceKey:   resourceKey,
-		})
+		releaseRefs[len(releaseRefs)-1].BindingID = defaultString(applyRes.BindingID, reserveRes.BindingID)
 	}
 
 	for hopIdx := len(state.ChainHops) - 1; hopIdx >= 0; hopIdx-- {
@@ -3089,8 +3813,7 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 			remoteURL := strings.TrimSpace(node.RemoteURL)
 			remoteToken := strings.TrimSpace(node.RemoteToken)
 			if remoteURL == "" || remoteToken == "" {
-				h.releaseFederationRuntimeRefs(releaseRefs)
-				return nil, nil, fmt.Errorf("远程节点 %s 缺少共享配置", nodeDisplayName(node))
+				return bindings, releaseRefs, fmt.Errorf("远程节点 %s 缺少共享配置", nodeDisplayName(node))
 			}
 
 			resourceKey := federationRuntimeResourceKey(state.TunnelID, chainNode.NodeID, 2, hopIdx+1)
@@ -3105,9 +3828,13 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 				reserveRes, err = fc.ReservePort(remoteURL, remoteToken, localDomain, reserveReq)
 			}
 			if err != nil {
-				h.releaseFederationRuntimeRefs(releaseRefs)
-				return nil, nil, fmt.Errorf("远程节点 %s 端口分配失败: %w", nodeDisplayName(node), err)
+				return bindings, releaseRefs, fmt.Errorf("远程节点 %s 端口分配失败: %w", nodeDisplayName(node), err)
 			}
+
+			releaseRefs = append(releaseRefs, federationRuntimeReleaseRef{
+				RemoteURL: remoteURL, RemoteToken: remoteToken, BindingID: reserveRes.BindingID,
+				ReservationID: reserveRes.ReservationID, ResourceKey: resourceKey,
+			})
 
 			state.ChainHops[hopIdx][nodeIdx].Port = reserveRes.AllocatedPort
 			chainNode = state.ChainHops[hopIdx][nodeIdx]
@@ -3115,22 +3842,21 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 			nextTargets := state.OutNodes
 			if hopIdx+1 < len(state.ChainHops) {
 				nextTargets = state.ChainHops[hopIdx+1]
+			} else {
+				nextTargets = h.orderBestExitTargets(state.TunnelID, chainNode.NodeID, nextTargets)
 			}
 			applyTargets := make([]client.RuntimeTarget, 0, len(nextTargets))
 			for _, target := range nextTargets {
 				targetNode := state.Nodes[target.NodeID]
 				if targetNode == nil {
-					h.releaseFederationRuntimeRefs(releaseRefs)
-					return nil, nil, errors.New("节点不存在")
+					return bindings, releaseRefs, errors.New("节点不存在")
 				}
 				host, hostErr := selectTunnelDialHost(node, targetNode, state.IPPreference, target.ConnectIP)
 				if hostErr != nil {
-					h.releaseFederationRuntimeRefs(releaseRefs)
-					return nil, nil, hostErr
+					return bindings, releaseRefs, hostErr
 				}
 				if target.Port <= 0 {
-					h.releaseFederationRuntimeRefs(releaseRefs)
-					return nil, nil, errors.New("节点端口不能为空")
+					return bindings, releaseRefs, errors.New("节点端口不能为空")
 				}
 				applyTargets = append(applyTargets, client.RuntimeTarget{
 					Host:     host,
@@ -3144,13 +3870,12 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 				ResourceKey:   resourceKey,
 				Role:          "middle",
 				Protocol:      defaultString(chainNode.Protocol, "tls"),
-				Strategy:      defaultString(chainNode.Strategy, "round"),
+				Strategy:      runtimeStrategyForTargets(chainNode, nextTargets),
 				Targets:       applyTargets,
 			}
 			applyRes, err := fc.ApplyRole(remoteURL, remoteToken, localDomain, applyReq)
 			if err != nil {
-				h.releaseFederationRuntimeRefs(releaseRefs)
-				return nil, nil, fmt.Errorf("远程节点 %s 运行时下发失败: %w", nodeDisplayName(node), err)
+				return bindings, releaseRefs, fmt.Errorf("远程节点 %s 运行时下发失败: %w", nodeDisplayName(node), err)
 			}
 			if applyRes.AllocatedPort > 0 {
 				state.ChainHops[hopIdx][nodeIdx].Port = applyRes.AllocatedPort
@@ -3170,73 +3895,135 @@ func (h *Handler) applyFederationRuntime(state *tunnelCreateState, localDomain s
 				CreatedTime:     now,
 				UpdatedTime:     now,
 			})
-			releaseRefs = append(releaseRefs, federationRuntimeReleaseRef{
-				RemoteURL:     remoteURL,
-				RemoteToken:   remoteToken,
-				BindingID:     applyRes.BindingID,
-				ReservationID: reserveRes.ReservationID,
-				ResourceKey:   resourceKey,
-			})
+			releaseRefs[len(releaseRefs)-1].BindingID = defaultString(applyRes.BindingID, reserveRes.BindingID)
 		}
 	}
 
 	return bindings, releaseRefs, nil
 }
 
-func (h *Handler) releaseFederationRuntimeRefs(refs []federationRuntimeReleaseRef) {
+// releaseFederationRuntimeRefs is used after the caller has rolled back its
+// transaction. Failed releases survive process restarts in a separate queue.
+func (h *Handler) releaseFederationRuntimeRefs(refs []federationRuntimeReleaseRef) error {
 	if h == nil || len(refs) == 0 {
-		return
+		return nil
 	}
 	fc := client.NewFederationClient()
 	localDomain := h.federationLocalDomain()
+	var failures []error
 	for i := len(refs) - 1; i >= 0; i-- {
 		ref := refs[i]
-		if strings.TrimSpace(ref.RemoteURL) == "" || strings.TrimSpace(ref.RemoteToken) == "" {
+		pending := &model.FederationPendingRelease{
+			RemoteURL: ref.RemoteURL, RemoteToken: ref.RemoteToken,
+			BindingID: ref.BindingID, ReservationID: ref.ReservationID, ResourceKey: ref.ResourceKey,
+		}
+		if err := h.repo.SavePendingFederationRelease(pending); err != nil {
+			failures = append(failures, fmt.Errorf("保存共享运行时清理任务失败: %w", err))
 			continue
 		}
 		req := client.RuntimeReleaseRoleRequest{
-			BindingID:     ref.BindingID,
-			ReservationID: ref.ReservationID,
-			ResourceKey:   ref.ResourceKey,
+			BindingID: ref.BindingID, ReservationID: ref.ReservationID, ResourceKey: ref.ResourceKey,
 		}
-		_ = fc.ReleaseRole(ref.RemoteURL, ref.RemoteToken, localDomain, req)
+		if err := fc.ReleaseRole(ref.RemoteURL, ref.RemoteToken, localDomain, req); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if err := h.repo.DeletePendingFederationRelease(pending.ID); err != nil {
+			failures = append(failures, err)
+		}
 	}
+	return errors.Join(failures...)
 }
 
-func (h *Handler) cleanupFederationRuntime(tunnelID int64) {
+func (h *Handler) cleanupFederationRuntime(tunnelID int64) error {
 	if h == nil || tunnelID <= 0 {
-		return
+		return nil
 	}
-	bindings, err := h.repo.ListActiveFederationTunnelBindingsByTunnel(tunnelID)
-	if err != nil || len(bindings) == 0 {
-		return
+	bindings, err := h.repo.ListFederationTunnelBindingsForCleanup(tunnelID)
+	if err != nil {
+		return err
 	}
-
-	fc := client.NewFederationClient()
-	localDomain := h.federationLocalDomain()
+	var failures []error
 	for _, b := range bindings {
-		node, nodeErr := h.repo.GetNodeByID(b.NodeID)
-		if nodeErr != nil || node == nil {
+		// Persist intent before sending the request: timeouts can occur after
+		// the peer has already acted, and must remain safely retryable.
+		if err := h.repo.MarkFederationTunnelBindingPendingRelease(b.ID); err != nil {
+			failures = append(failures, err)
 			continue
 		}
-		remoteURL := strings.TrimSpace(node.RemoteURL.String)
-		if remoteURL == "" {
-			remoteURL = strings.TrimSpace(b.RemoteURL)
+		if err := h.releaseFederationTunnelBinding(b); err != nil {
+			failures = append(failures, err)
 		}
-		remoteToken := strings.TrimSpace(node.RemoteToken.String)
-		if remoteURL == "" || remoteToken == "" {
-			continue
-		}
-		req := client.RuntimeReleaseRoleRequest{
-			BindingID:   strings.TrimSpace(b.RemoteBindingID),
-			ResourceKey: strings.TrimSpace(b.ResourceKey),
-		}
-		_ = fc.ReleaseRole(remoteURL, remoteToken, localDomain, req)
 	}
-	_ = h.repo.DeleteFederationTunnelBindingsByTunnel(tunnelID)
+	return errors.Join(failures...)
+}
+
+func (h *Handler) releaseFederationTunnelBinding(b repo.FederationTunnelBinding) error {
+	node, err := h.repo.GetNodeByID(b.NodeID)
+	if err != nil {
+		return err
+	}
+	if node == nil {
+		return fmt.Errorf("共享节点 %d 不存在，保留待清理绑定", b.NodeID)
+	}
+	remoteURL := strings.TrimSpace(b.RemoteURL)
+	if remoteURL == "" {
+		remoteURL = strings.TrimSpace(node.RemoteURL.String)
+	}
+	remoteToken := strings.TrimSpace(node.RemoteToken.String)
+	if remoteURL == "" || remoteToken == "" {
+		return fmt.Errorf("共享节点 %d 缺少连接配置，保留待清理绑定", b.NodeID)
+	}
+	req := client.RuntimeReleaseRoleRequest{
+		BindingID: strings.TrimSpace(b.RemoteBindingID), ResourceKey: strings.TrimSpace(b.ResourceKey),
+	}
+	if err := client.NewFederationClient().ReleaseRole(remoteURL, remoteToken, h.federationLocalDomain(), req); err != nil {
+		return fmt.Errorf("共享节点 %d 清理失败: %w", b.NodeID, err)
+	}
+	return h.repo.DeleteFederationTunnelBinding(b.ID)
+}
+
+// retryPendingFederationRuntimeCleanup never touches active bindings.
+func (h *Handler) retryPendingFederationRuntimeCleanup() error {
+	bindings, err := h.repo.ListPendingFederationTunnelBindings()
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, binding := range bindings {
+		if err := h.releaseFederationTunnelBinding(binding); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	pending, err := h.repo.ListPendingFederationReleases()
+	if err != nil {
+		return errors.Join(append(failures, err)...)
+	}
+	fc := client.NewFederationClient()
+	for _, item := range pending {
+		req := client.RuntimeReleaseRoleRequest{
+			BindingID: item.BindingID, ReservationID: item.ReservationID, ResourceKey: item.ResourceKey,
+		}
+		if err := fc.ReleaseRole(item.RemoteURL, item.RemoteToken, h.federationLocalDomain(), req); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if err := h.repo.DeletePendingFederationRelease(item.ID); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func (h *Handler) applyTunnelRuntime(state *tunnelCreateState) ([]int64, []int64, error) {
+	return h.applyTunnelRuntimeWithMode(state, false)
+}
+
+func (h *Handler) applyTunnelRuntimeUpsert(state *tunnelCreateState) ([]int64, []int64, error) {
+	return h.applyTunnelRuntimeWithMode(state, true)
+}
+
+func (h *Handler) applyTunnelRuntimeWithMode(state *tunnelCreateState, upsert bool) ([]int64, []int64, error) {
 	if h == nil || state == nil {
 		return nil, nil, errors.New("invalid tunnel runtime state")
 	}
@@ -3250,12 +4037,14 @@ func (h *Handler) applyTunnelRuntime(state *tunnelCreateState) ([]int64, []int64
 		targets := state.OutNodes
 		if len(state.ChainHops) > 0 {
 			targets = state.ChainHops[0]
+		} else {
+			targets = h.orderBestExitTargets(state.TunnelID, inNode.NodeID, targets)
 		}
 		chainData, err := buildTunnelChainConfig(state.TunnelID, inNode.NodeID, targets, state.Nodes, state.IPPreference)
 		if err != nil {
 			return createdChains, createdServices, err
 		}
-		if _, err := h.sendNodeCommand(inNode.NodeID, "AddChains", chainData, true, false); err != nil {
+		if err := h.applyTunnelChainOnNode(inNode.NodeID, chainData, upsert); err != nil {
 			if shouldDeferTunnelRuntimeApplyError(err) {
 				continue
 			}
@@ -3265,11 +4054,13 @@ func (h *Handler) applyTunnelRuntime(state *tunnelCreateState) ([]int64, []int64
 	}
 
 	for i, hop := range state.ChainHops {
-		nextTargets := state.OutNodes
-		if i+1 < len(state.ChainHops) {
-			nextTargets = state.ChainHops[i+1]
-		}
 		for _, chainNode := range hop {
+			nextTargets := state.OutNodes
+			if i+1 < len(state.ChainHops) {
+				nextTargets = state.ChainHops[i+1]
+			} else {
+				nextTargets = h.orderBestExitTargets(state.TunnelID, chainNode.NodeID, nextTargets)
+			}
 			node := state.Nodes[chainNode.NodeID]
 			if node != nil && (node.IsRemote == 1 || node.Status != 1) {
 				continue
@@ -3278,7 +4069,7 @@ func (h *Handler) applyTunnelRuntime(state *tunnelCreateState) ([]int64, []int64
 			if err != nil {
 				return createdChains, createdServices, err
 			}
-			if _, err := h.sendNodeCommand(chainNode.NodeID, "AddChains", chainData, true, false); err != nil {
+			if err := h.applyTunnelChainOnNode(chainNode.NodeID, chainData, upsert); err != nil {
 				if shouldDeferTunnelRuntimeApplyError(err) {
 					continue
 				}
@@ -3287,7 +4078,7 @@ func (h *Handler) applyTunnelRuntime(state *tunnelCreateState) ([]int64, []int64
 			createdChains = append(createdChains, chainNode.NodeID)
 
 			serviceData := buildTunnelChainServiceConfig(state.TunnelID, chainNode, state.Nodes[chainNode.NodeID], len(nextTargets))
-			if err := h.addTunnelServiceOnNode(chainNode.NodeID, state.TunnelID, serviceData); err != nil {
+			if err := h.addTunnelServiceOnNodeWithMode(chainNode.NodeID, state.TunnelID, serviceData, upsert); err != nil {
 				if shouldDeferTunnelRuntimeApplyError(err) {
 					continue
 				}
@@ -3303,7 +4094,7 @@ func (h *Handler) applyTunnelRuntime(state *tunnelCreateState) ([]int64, []int64
 			continue
 		}
 		serviceData := buildTunnelChainServiceConfig(state.TunnelID, outNode, state.Nodes[outNode.NodeID], 1)
-		if err := h.addTunnelServiceOnNode(outNode.NodeID, state.TunnelID, serviceData); err != nil {
+		if err := h.addTunnelServiceOnNodeWithMode(outNode.NodeID, state.TunnelID, serviceData, upsert); err != nil {
 			if shouldDeferTunnelRuntimeApplyError(err) {
 				continue
 			}
@@ -3313,6 +4104,151 @@ func (h *Handler) applyTunnelRuntime(state *tunnelCreateState) ([]int64, []int64
 	}
 
 	return createdChains, createdServices, nil
+}
+
+func (h *Handler) applyTunnelChainOnNode(nodeID int64, chainData map[string]interface{}, upsert bool) error {
+	if upsert {
+		return h.upsertTunnelChainOnNode(nodeID, chainData)
+	}
+	_, err := h.sendNodeCommand(nodeID, "AddChains", chainData, true, false)
+	return err
+}
+
+func (h *Handler) applyBestExitChainOrder(tunnelID, ownerNodeID int64, outNodes []chainNodeRecord, scores []bestExitCandidateScore, ipPreference string) error {
+	if h == nil {
+		log.Printf("best_exit: invalid chain update context tunnel=%d owner=%d", tunnelID, ownerNodeID)
+		return errors.New("invalid best exit chain update context")
+	}
+	if tunnelID <= 0 || ownerNodeID <= 0 || len(outNodes) == 0 {
+		log.Printf("best_exit: invalid chain update input tunnel=%d owner=%d exits=%d", tunnelID, ownerNodeID, len(outNodes))
+		return fmt.Errorf("invalid best exit chain update input tunnel=%d owner=%d exits=%d", tunnelID, ownerNodeID, len(outNodes))
+	}
+	targets := chainRecordsToRuntimeTargets(outNodes)
+	orderedIDs := make([]int64, 0, len(scores))
+	for _, score := range scores {
+		if score.ExitNodeID > 0 {
+			orderedIDs = append(orderedIDs, score.ExitNodeID)
+		}
+	}
+	targets = orderRuntimeTargetsByNodeID(targets, orderedIDs)
+	nodes := make(map[int64]*nodeRecord, len(targets)+1)
+	if owner, err := h.getNodeRecord(ownerNodeID); err == nil && owner != nil {
+		nodes[ownerNodeID] = owner
+	}
+	for _, target := range targets {
+		if node, err := h.getNodeRecord(target.NodeID); err == nil && node != nil {
+			nodes[target.NodeID] = node
+		}
+	}
+	owner := nodes[ownerNodeID]
+	if owner != nil && owner.IsRemote == 1 {
+		if err := h.applyRemoteBestExitChainOrder(tunnelID, ownerNodeID, owner, targets, nodes, ipPreference); err != nil {
+			log.Printf("best_exit: update remote federation chain failed tunnel=%d owner=%d err=%v", tunnelID, ownerNodeID, err)
+			return err
+		}
+		log.Printf("best_exit: updated remote federation chain tunnel=%d owner=%d best_exit=%d", tunnelID, ownerNodeID, targets[0].NodeID)
+		return nil
+	}
+	chainData, err := buildTunnelChainConfig(tunnelID, ownerNodeID, targets, nodes, ipPreference)
+	if err != nil {
+		log.Printf("best_exit: build chain failed tunnel=%d owner=%d err=%v", tunnelID, ownerNodeID, err)
+		return err
+	}
+	if err := h.applyTunnelChainOnNode(ownerNodeID, chainData, true); err != nil {
+		log.Printf("best_exit: update chain failed tunnel=%d owner=%d err=%v", tunnelID, ownerNodeID, err)
+		return err
+	}
+	log.Printf("best_exit: updated chain tunnel=%d owner=%d best_exit=%d", tunnelID, ownerNodeID, targets[0].NodeID)
+	return nil
+}
+
+func (h *Handler) applyRemoteBestExitChainOrder(tunnelID, ownerNodeID int64, owner *nodeRecord, targets []tunnelRuntimeNode, nodes map[int64]*nodeRecord, ipPreference string) error {
+	if h == nil || h.repo == nil || owner == nil {
+		return errors.New("invalid remote best exit update context")
+	}
+	bindings, err := h.repo.ListActiveFederationTunnelBindingsByTunnel(tunnelID)
+	if err != nil {
+		return err
+	}
+	var binding *repo.FederationTunnelBinding
+	for i := range bindings {
+		if bindings[i].NodeID == ownerNodeID && bindings[i].ChainType == 2 && bindings[i].Status == 1 {
+			binding = &bindings[i]
+			break
+		}
+	}
+	if binding == nil {
+		return fmt.Errorf("active federation middle binding not found for tunnel=%d owner=%d", tunnelID, ownerNodeID)
+	}
+
+	remoteURL := strings.TrimSpace(owner.RemoteURL)
+	if remoteURL == "" {
+		remoteURL = strings.TrimSpace(binding.RemoteURL)
+	}
+	remoteToken := strings.TrimSpace(owner.RemoteToken)
+	if remoteURL == "" || remoteToken == "" {
+		return errors.New("远程节点缺少共享配置")
+	}
+
+	applyTargets := make([]client.RuntimeTarget, 0, len(targets))
+	for _, target := range targets {
+		targetNode := nodes[target.NodeID]
+		if targetNode == nil {
+			return errors.New("节点不存在")
+		}
+		host, hostErr := selectTunnelDialHost(owner, targetNode, ipPreference, target.ConnectIP)
+		if hostErr != nil {
+			return hostErr
+		}
+		if target.Port <= 0 {
+			return errors.New("节点端口不能为空")
+		}
+		applyTargets = append(applyTargets, client.RuntimeTarget{
+			Host:     host,
+			Port:     target.Port,
+			Protocol: defaultString(target.Protocol, "tls"),
+		})
+	}
+
+	ownerRuntimeNode := tunnelRuntimeNode{NodeID: ownerNodeID, Protocol: "tls", Strategy: "round", ChainType: 2}
+	if chainRows, listErr := h.repo.ListChainNodesForTunnel(tunnelID); listErr == nil {
+		for _, row := range chainRows {
+			if row.NodeID == ownerNodeID && row.ChainType == 2 {
+				ownerRuntimeNode = tunnelRuntimeNode{
+					NodeID:    row.NodeID,
+					Protocol:  row.Protocol,
+					Strategy:  row.Strategy,
+					Inx:       int(row.Inx),
+					ChainType: row.ChainType,
+					Port:      row.Port,
+					ConnectIP: row.ConnectIP,
+				}
+				break
+			}
+		}
+	}
+
+	_, err = client.NewFederationClient().ApplyRole(remoteURL, remoteToken, h.federationLocalDomain(), client.RuntimeApplyRoleRequest{
+		ResourceKey: strings.TrimSpace(binding.ResourceKey),
+		Role:        "middle",
+		Protocol:    defaultString(ownerRuntimeNode.Protocol, "tls"),
+		Strategy:    runtimeStrategyForTargets(ownerRuntimeNode, targets),
+		Targets:     applyTargets,
+	})
+	return err
+}
+
+func (h *Handler) upsertTunnelChainOnNode(nodeID int64, chainData map[string]interface{}) error {
+	if h == nil {
+		return errors.New("invalid tunnel chain context")
+	}
+	chainName := asString(chainData["name"])
+	if strings.TrimSpace(chainName) == "" {
+		return errors.New("转发链名称不能为空")
+	}
+	payload := map[string]interface{}{"chain": chainName, "data": chainData}
+	_, err := h.sendNodeCommand(nodeID, "UpdateChains", payload, true, false)
+	return err
 }
 
 func retryTunnelServiceAddWithCleanup(add func() error, cleanup func() error, wait time.Duration) error {
@@ -3336,13 +4272,26 @@ func retryTunnelServiceAddWithCleanup(add func() error, cleanup func() error, wa
 }
 
 func (h *Handler) addTunnelServiceOnNode(nodeID, tunnelID int64, serviceData []map[string]interface{}) error {
+	return h.addTunnelServiceOnNodeWithMode(nodeID, tunnelID, serviceData, false)
+}
+
+func (h *Handler) addTunnelServiceOnNodeWithMode(nodeID, tunnelID int64, serviceData []map[string]interface{}, upsert bool) error {
 	if h == nil {
 		return errors.New("invalid tunnel service context")
 	}
 	serviceName := fmt.Sprintf("%d_tls", tunnelID)
+	if len(serviceData) > 0 {
+		if name, ok := serviceData[0]["name"].(string); ok && strings.TrimSpace(name) != "" {
+			serviceName = strings.TrimSpace(name)
+		}
+	}
+	command := "AddService"
+	if upsert {
+		command = "UpdateService"
+	}
 	return retryTunnelServiceAddWithCleanup(
 		func() error {
-			_, err := h.sendNodeCommand(nodeID, "AddService", serviceData, true, false)
+			_, err := h.sendNodeCommand(nodeID, command, serviceData, true, false)
 			return err
 		},
 		func() error {
@@ -3353,19 +4302,22 @@ func (h *Handler) addTunnelServiceOnNode(nodeID, tunnelID int64, serviceData []m
 	)
 }
 
-func (h *Handler) rollbackTunnelRuntime(chainNodeIDs, serviceNodeIDs []int64, tunnelID int64) {
+func (h *Handler) rollbackTunnelRuntime(chainNodeIDs, serviceNodeIDs []int64, tunnelID int64, protocol string) {
 	if h == nil || tunnelID <= 0 {
 		return
 	}
+	if protocol == "" {
+		protocol = "tls"
+	}
 	seenServices := make(map[int64]struct{})
-	serviceName := fmt.Sprintf("%d_tls", tunnelID)
+	serviceNames := tunnelRuntimeServiceNames(tunnelID)
 	for i := len(serviceNodeIDs) - 1; i >= 0; i-- {
 		nodeID := serviceNodeIDs[i]
 		if _, ok := seenServices[nodeID]; ok {
 			continue
 		}
 		seenServices[nodeID] = struct{}{}
-		_, _ = h.sendNodeCommand(nodeID, "DeleteService", map[string]interface{}{"services": []string{serviceName}}, false, true)
+		_, _ = h.sendNodeCommand(nodeID, "DeleteService", map[string]interface{}{"services": serviceNames}, false, true)
 	}
 
 	seenChains := make(map[int64]struct{})
@@ -3430,20 +4382,33 @@ func buildTunnelChainConfig(tunnelID int64, fromNodeID int64, targets []tunnelRu
 		connector := map[string]interface{}{
 			"type": "relay",
 		}
-		if isTLSTunnelProtocol(protocol) {
-			connector["metadata"] = map[string]interface{}{"nodelay": true}
+		connectorMetadata := map[string]interface{}{}
+		if isTCPTunnelProtocol(protocol) {
+			connectorMetadata["nodelay"] = true
+			connectorMetadata["mux.keepaliveInterval"] = "15s"
+			connectorMetadata["mux.keepaliveTimeout"] = "45s"
+			connectorMetadata["mux.maxFrameSize"] = 32768
+			connectorMetadata["mux.maxStreamBuffer"] = 2097152
+		}
+		if isKCPTunnelProtocol(protocol) {
+			connectorMetadata["connectTimeout"] = "30s"
+			connectorMetadata["mux.keepaliveInterval"] = "15s"
+			connectorMetadata["mux.keepaliveTimeout"] = "45s"
+			connectorMetadata["mux.maxFrameSize"] = 32768
+			connectorMetadata["mux.maxStreamBuffer"] = 2097152
+		}
+		if len(connectorMetadata) > 0 {
+			connector["metadata"] = connectorMetadata
 		}
 		nodeItems = append(nodeItems, map[string]interface{}{
 			"name":      fmt.Sprintf("node_%d", idx+1),
 			"addr":      processServerAddress(fmt.Sprintf("%s:%d", host, port)),
 			"connector": connector,
-			"dialer": map[string]interface{}{
-				"type": protocol,
-			},
+			"dialer":    buildTunnelDialerConfig(protocol),
 		})
 	}
 
-	strategy := defaultString(strings.TrimSpace(targets[0].Strategy), "round")
+	strategy := runtimeTunnelStrategy(defaultString(strings.TrimSpace(targets[0].Strategy), "round"))
 	hop := map[string]interface{}{
 		"name": fmt.Sprintf("hop_%d", tunnelID),
 		"selector": map[string]interface{}{
@@ -3463,6 +4428,24 @@ func buildTunnelChainConfig(tunnelID int64, fromNodeID int64, targets []tunnelRu
 	}, nil
 }
 
+func (h *Handler) orderBestExitTargets(tunnelID, ownerNodeID int64, targets []tunnelRuntimeNode) []tunnelRuntimeNode {
+	if len(targets) <= 1 || !isBestTunnelStrategy(targets[0].Strategy) {
+		return append([]tunnelRuntimeNode(nil), targets...)
+	}
+	if h == nil || h.bestExit == nil {
+		return append([]tunnelRuntimeNode(nil), targets...)
+	}
+	return h.bestExit.orderTargets(bestExitOwnerKey{TunnelID: tunnelID, OwnerNodeID: ownerNodeID}, targets)
+}
+
+func runtimeStrategyForTargets(owner tunnelRuntimeNode, targets []tunnelRuntimeNode) string {
+	strategy := defaultString(owner.Strategy, "round")
+	if len(targets) > 0 {
+		strategy = defaultString(targets[0].Strategy, strategy)
+	}
+	return runtimeTunnelStrategy(strategy)
+}
+
 func buildTunnelChainServiceConfig(tunnelID int64, chainNode tunnelRuntimeNode, node *nodeRecord, nextHopCandidateCount int) []map[string]interface{} {
 	if node == nil {
 		return nil
@@ -3471,19 +4454,32 @@ func buildTunnelChainServiceConfig(tunnelID int64, chainNode tunnelRuntimeNode, 
 	handlerCfg := map[string]interface{}{
 		"type": "relay",
 	}
-	if isTLSTunnelProtocol(protocol) {
-		handlerCfg["metadata"] = map[string]interface{}{"nodelay": true}
+	handlerMetadata := map[string]interface{}{}
+	if isTCPTunnelProtocol(protocol) {
+		handlerMetadata["nodelay"] = true
+		handlerMetadata["mux.keepaliveInterval"] = "15s"
+		handlerMetadata["mux.keepaliveTimeout"] = "45s"
+		handlerMetadata["mux.maxFrameSize"] = 32768
+		handlerMetadata["mux.maxStreamBuffer"] = 2097152
+	}
+	if isKCPTunnelProtocol(protocol) {
+		handlerMetadata["connectTimeout"] = "30s"
+		handlerMetadata["mux.keepaliveInterval"] = "15s"
+		handlerMetadata["mux.keepaliveTimeout"] = "45s"
+		handlerMetadata["mux.maxFrameSize"] = 32768
+		handlerMetadata["mux.maxStreamBuffer"] = 2097152
+	}
+	if len(handlerMetadata) > 0 {
+		handlerCfg["metadata"] = handlerMetadata
 	}
 	if nextHopCandidateCount > 1 {
 		handlerCfg["retries"] = nextHopCandidateCount - 1
 	}
 	service := map[string]interface{}{
-		"name":    fmt.Sprintf("%d_tls", tunnelID),
-		"addr":    processServerAddress(fmt.Sprintf("%s:%d", defaultString(strings.TrimSpace(chainNode.ConnectIP), node.TCPListenAddr), chainNode.Port)),
-		"handler": handlerCfg,
-		"listener": map[string]interface{}{
-			"type": protocol,
-		},
+		"name":     fmt.Sprintf("tunnel_%d", tunnelID),
+		"addr":     processServerAddress(fmt.Sprintf("%s:%d", defaultString(strings.TrimSpace(chainNode.ConnectIP), node.TCPListenAddr), chainNode.Port)),
+		"handler":  handlerCfg,
+		"listener": buildTunnelListenerConfig(protocol),
 	}
 	if chainNode.ChainType == 2 {
 		service["handler"].(map[string]interface{})["chain"] = fmt.Sprintf("chains_%d", tunnelID)
@@ -3566,8 +4562,65 @@ func nodeDisplayName(node *nodeRecord) string {
 	return fmt.Sprintf("node_%d", node.ID)
 }
 
+func isTCPTunnelProtocol(protocol string) bool {
+	p := strings.ToLower(strings.TrimSpace(defaultString(protocol, "tls")))
+	return p == "tls" || p == "mtls" || p == "mtcp"
+}
+
+func isKCPTunnelProtocol(protocol string) bool {
+	return strings.EqualFold(strings.TrimSpace(protocol), "kcp")
+}
+
 func isTLSTunnelProtocol(protocol string) bool {
 	return strings.EqualFold(strings.TrimSpace(defaultString(protocol, "tls")), "tls")
+}
+
+func buildTunnelDialerConfig(protocol string) map[string]interface{} {
+	dialer := map[string]interface{}{
+		"type": protocol,
+	}
+	if isKCPTunnelProtocol(protocol) {
+		dialer["metadata"] = map[string]interface{}{
+			"kcp.keepalive":   10,
+			"kcp.tcp":         false,
+			"kcp.mode":        "fast3",
+			"kcp.sndwnd":      4096,
+			"kcp.rcvwnd":      4096,
+			"kcp.mtu":         1350,
+			"kcp.sockbuf":     4194304,
+			"kcp.smuxbuf":     4194304,
+			"kcp.streambuf":   2097152,
+			"kcp.datashard":   10,
+			"kcp.parityshard": 3,
+			"kcp.nocomp":      true,
+			"kcp.nc":          1,
+		}
+	}
+	return dialer
+}
+
+func buildTunnelListenerConfig(protocol string) map[string]interface{} {
+	listener := map[string]interface{}{
+		"type": protocol,
+	}
+	if isKCPTunnelProtocol(protocol) {
+		listener["metadata"] = map[string]interface{}{
+			"kcp.keepalive":   10,
+			"kcp.tcp":         false,
+			"kcp.mode":        "fast3",
+			"kcp.sndwnd":      4096,
+			"kcp.rcvwnd":      4096,
+			"kcp.mtu":         1350,
+			"kcp.sockbuf":     4194304,
+			"kcp.smuxbuf":     4194304,
+			"kcp.streambuf":   2097152,
+			"kcp.datashard":   10,
+			"kcp.parityshard": 3,
+			"kcp.nocomp":      true,
+			"kcp.nc":          1,
+		}
+	}
+	return listener
 }
 
 func nodeSupportsV4(node *nodeRecord) bool {
@@ -3930,7 +4983,7 @@ func (h *Handler) rollbackForwardMutation(oldForward *forwardRecord, oldPorts []
 	h.repo.RollbackForwardFields(
 		oldForward.ID, oldForward.UserID, oldForward.UserName, oldForward.Name,
 		oldForward.TunnelID, oldForward.RemoteAddr, oldForward.Strategy, oldForward.Status,
-		oldForward.SpeedID,
+		oldForward.SpeedID, oldForward.MaxConn, oldForward.IPMaxConn, oldForward.IPSpeedID, oldForward.ProxyProtocol, oldForward.ProxyProtocolReceive, oldForward.ProxyProtocolSend,
 		time.Now().UnixMilli(),
 	)
 
@@ -3959,6 +5012,14 @@ func (h *Handler) upsertUserTunnel(req map[string]interface{}) error {
 	}
 
 	reqFlow := asInt64(req["flow"], -1)
+	var reqFlowMiB int64
+	if _, hasFlowMiB := req["flowMiB"]; hasFlowMiB {
+		var flowErr error
+		reqFlow, reqFlowMiB, flowErr = parseTrafficLimit(req, 0)
+		if flowErr != nil {
+			return flowErr
+		}
+	}
 	reqNum := asInt(req["num"], -1)
 	reqExpTime := asInt64(req["expTime"], -1)
 	reqFlowReset := asInt64(req["flowResetTime"], -1)
@@ -3970,6 +5031,9 @@ func (h *Handler) upsertUserTunnel(req map[string]interface{}) error {
 			if uErr == nil {
 				if reqFlow < 0 {
 					reqFlow = uFlow
+					if user, err := h.repo.GetUserByID(userID); err == nil && user != nil {
+						reqFlowMiB = user.FlowMiB
+					}
 				}
 				if reqNum < 0 {
 					reqNum = uNum
@@ -3998,7 +5062,7 @@ func (h *Handler) upsertUserTunnel(req map[string]interface{}) error {
 			reqStatus = 1
 		}
 
-		if err := h.repo.InsertUserTunnel(userID, tunnelID, nullableInt(speedID), reqNum, reqFlow, reqFlowReset, reqExpTime, reqStatus); err != nil {
+		if err := h.repo.InsertUserTunnel(userID, tunnelID, nullableInt(speedID), reqNum, reqFlow, reqFlowReset, reqExpTime, reqStatus, reqFlowMiB); err != nil {
 			return err
 		}
 
@@ -4022,8 +5086,20 @@ func (h *Handler) upsertUserTunnel(req map[string]interface{}) error {
 	}
 
 	newFlow := currentFlow
+	oldTunnel, err := h.repo.GetUserTunnelByID(existingID)
+	if err != nil {
+		return err
+	}
+	if oldTunnel == nil {
+		return fmt.Errorf("隧道权限不存在")
+	}
+	newFlowMiB := oldTunnel.FlowMiB
 	if reqFlow >= 0 {
 		newFlow = reqFlow
+		newFlowMiB = reqFlowMiB
+		if _, supplied := req["flowMiB"]; !supplied && reqFlow == currentFlow {
+			newFlowMiB = oldTunnel.FlowMiB
+		}
 	}
 
 	newNum := int(currentNum)
@@ -4053,7 +5129,7 @@ func (h *Handler) upsertUserTunnel(req map[string]interface{}) error {
 		newSpeedID = sql.NullInt64{Valid: false}
 	}
 
-	if err := h.repo.UpdateUserTunnelFields(existingID, newSpeedID, newFlow, newNum, newExpTime, newFlowReset, newStatus); err != nil {
+	if err := h.repo.UpdateUserTunnelFields(existingID, newSpeedID, newFlow, newNum, newExpTime, newFlowReset, newStatus, newFlowMiB); err != nil {
 		return err
 	}
 
@@ -4066,6 +5142,7 @@ func (h *Handler) upsertUserTunnel(req map[string]interface{}) error {
 			currentExpTime,
 			currentFlowReset,
 			currentStatus,
+			oldTunnel.FlowMiB,
 		)
 		if rollbackErr != nil {
 			return fmt.Errorf("下发失败且回滚失败: %v; 回滚错误: %w", syncErr, rollbackErr)
@@ -4092,6 +5169,26 @@ func (h *Handler) syncUserTunnelForwards(userID, tunnelID int64) error {
 	}
 
 	return nil
+}
+
+func (h *Handler) syncUserMaxConnForwards(userID int64) ([]string, error) {
+	forwards, err := h.listActiveForwardsByUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	warnings := make([]string, 0)
+	for i := range forwards {
+		f := &forwards[i]
+		if f.MaxConn > 0 {
+			continue
+		}
+		syncWarnings, syncErr := h.syncForwardServicesWithWarnings(f, "UpdateService", true)
+		warnings = append(warnings, syncWarnings...)
+		if syncErr != nil {
+			return warnings, syncErr
+		}
+	}
+	return warnings, nil
 }
 
 // cleanupForwardsForUserTunnel deletes all forwarding rules belonging to a
@@ -4161,6 +5258,13 @@ func asMapSlice(v interface{}) []map[string]interface{} {
 		}
 	}
 	return out
+}
+
+func asMap(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok && m != nil {
+		return m
+	}
+	return map[string]interface{}{}
 }
 
 func asString(v interface{}) string {
@@ -4298,6 +5402,15 @@ func normalizeNodeRenewalCycle(v string) string {
 		return strings.ToLower(strings.TrimSpace(v))
 	default:
 		return ""
+	}
+}
+
+func defaultNodeForwardMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "nftables":
+		return "nftables"
+	default:
+		return "agent"
 	}
 }
 

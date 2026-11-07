@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -145,11 +146,15 @@ type ServiceMonitorCheckResult struct {
 }
 
 const (
-	reporterReadWait  = 60 * time.Second
-	reporterWriteWait = 5 * time.Second
-	wsPingInterval    = 20 * time.Second // 独立 WebSocket ping 间隔
-	initialBackoff    = 2 * time.Second  // 重连初始退避
-	maxBackoff        = 2 * time.Minute  // 重连最大退避
+	reporterReadWait            = 60 * time.Second
+	reporterWriteWait           = 5 * time.Second
+	wsPingInterval              = 20 * time.Second // 独立 WebSocket ping 间隔
+	initialBackoff              = 2 * time.Second  // 重连初始退避
+	maxBackoff                  = 2 * time.Minute  // 重连最大退避
+	defaultMetricReportInterval = 5 * time.Second
+	maxConcurrentTCPPings       = 8
+	maxConcurrentReadCommands   = 16
+	maxQueuedMutationCommands   = 256
 )
 
 type WebSocketReporter struct {
@@ -157,6 +162,9 @@ type WebSocketReporter struct {
 	addr              string // 保存服务器地址
 	secret            string // 保存密钥
 	version           string // 保存版本号
+	http              int
+	tls               int
+	socks             int
 	preferredWSScheme string
 	conn              *websocket.Conn
 	curBackoff        time.Duration // 当前重连退避间隔
@@ -168,6 +176,10 @@ type WebSocketReporter struct {
 	connecting        bool              // 正在连接状态
 	connMutex         sync.Mutex        // 连接状态锁
 	aesCrypto         *crypto.AESCrypto // AES加密器
+	tcpPingSem        chan struct{}     // 限制诊断探测并发，避免离线目标耗尽连接
+	readCommandSem    chan struct{}     // 限制只读命令并发，避免诊断请求耗尽资源
+	mutationQueue     chan CommandMessage
+	workers           sync.WaitGroup
 }
 
 var wsDial = func(dialer *websocket.Dialer, rawURL string) (*websocket.Conn, *http.Response, error) {
@@ -189,20 +201,53 @@ func NewWebSocketReporter(serverURL string, secret string) *WebSocketReporter {
 
 	return &WebSocketReporter{
 		url:            serverURL,
-		curBackoff:     initialBackoff,   // 当前退避间隔
-		pingInterval:   1 * time.Second,  // 指标上报间隔（每秒采集）
-		configInterval: 10 * time.Minute, // 配置上报间隔
+		curBackoff:     initialBackoff,              // 当前退避间隔
+		pingInterval:   defaultMetricReportInterval, // 指标上报间隔
+		configInterval: 10 * time.Minute,            // 配置上报间隔
 		ctx:            ctx,
 		cancel:         cancel,
 		connected:      false,
 		connecting:     false,
 		aesCrypto:      aesCrypto,
+		tcpPingSem:     make(chan struct{}, maxConcurrentTCPPings),
+		readCommandSem: make(chan struct{}, maxConcurrentReadCommands),
+		mutationQueue:  make(chan CommandMessage, maxQueuedMutationCommands),
+	}
+}
+
+func (w *WebSocketReporter) tryAcquireTCPPingSlot() bool {
+	if w == nil || w.tcpPingSem == nil {
+		return false
+	}
+	select {
+	case w.tcpPingSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *WebSocketReporter) releaseTCPPingSlot() {
+	if w == nil || w.tcpPingSem == nil {
+		return
+	}
+	select {
+	case <-w.tcpPingSem:
+	default:
 	}
 }
 
 // Start 启动WebSocket报告器
 func (w *WebSocketReporter) Start() {
-	go w.run()
+	w.workers.Add(2)
+	go func() {
+		defer w.workers.Done()
+		w.runMutationCommands()
+	}()
+	go func() {
+		defer w.workers.Done()
+		w.run()
+	}()
 }
 
 // Stop 停止WebSocket报告器
@@ -213,6 +258,7 @@ func (w *WebSocketReporter) Stop() {
 		w.conn.Close()
 	}
 	w.connMutex.Unlock()
+	w.workers.Wait()
 }
 
 // backoffWithJitter 返回带随机抖动的退避时间（±25%）
@@ -295,17 +341,17 @@ func (w *WebSocketReporter) connect() error {
 		Socks  int    `json:"socks"`
 	}
 
-	var cfg LocalConfig
+	cfg := LocalConfig{Http: w.http, Tls: w.tls, Socks: w.socks}
 	if b, err := os.ReadFile("config.json"); err == nil {
-		json.Unmarshal(b, &cfg)
+		_ = json.Unmarshal(b, &cfg)
 	}
 
 	candidates := buildWebSocketCandidates(w.addr, w.secret, w.version, cfg.Http, cfg.Tls, cfg.Socks, w.preferredWSScheme)
 
-	dialer := websocket.DefaultDialer
+	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second
 
-	conn, usedURL, err := dialWebSocketWithFallback(dialer, candidates)
+	conn, usedURL, err := dialWebSocketWithFallback(&dialer, candidates)
 	if err != nil {
 		return err
 	}
@@ -491,7 +537,11 @@ func (w *WebSocketReporter) handleConnection() {
 	}()
 
 	// 启动消息接收goroutine
-	go w.receiveMessages()
+	w.workers.Add(1)
+	go func() {
+		defer w.workers.Done()
+		w.receiveMessages()
+	}()
 
 	// 指标上报 ticker
 	metricTicker := time.NewTicker(w.pingInterval)
@@ -748,8 +798,7 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 			}
 
 			if cmdMsg.Type != "call" {
-				// 所有命令统一异步执行，避免阻塞消息接收循环
-				go w.routeCommand(cmdMsg)
+				w.dispatchCommand(cmdMsg)
 			}
 		} else {
 			// 处理普通消息
@@ -760,8 +809,7 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 				return
 			}
 			if cmdMsg.Type != "call" {
-				// 所有命令统一异步执行，避免阻塞消息接收循环
-				go w.routeCommand(cmdMsg)
+				w.dispatchCommand(cmdMsg)
 			}
 		}
 
@@ -770,8 +818,96 @@ func (w *WebSocketReporter) handleReceivedMessage(messageType int, message []byt
 	}
 }
 
+// dispatchCommand keeps all runtime mutations ordered while allowing bounded
+// concurrency for read-only diagnostics. Mutations share process-wide
+// registries and configuration, so running them concurrently can corrupt the
+// persisted config or interleave service lifecycle operations.
+func (w *WebSocketReporter) dispatchCommand(cmd CommandMessage) {
+	if isMutationCommand(cmd.Type) {
+		select {
+		case w.mutationQueue <- cmd:
+		case <-w.ctx.Done():
+			w.sendCommandFailure(cmd, "Agent is shutting down")
+		default:
+			w.sendCommandFailure(cmd, "运行时配置命令队列已满，请稍后重试")
+		}
+		return
+	}
+
+	select {
+	case w.readCommandSem <- struct{}{}:
+		go func() {
+			defer func() { <-w.readCommandSem }()
+			w.routeCommandSafely(cmd)
+		}()
+	case <-w.ctx.Done():
+		w.sendCommandFailure(cmd, "Agent is shutting down")
+	default:
+		w.sendCommandFailure(cmd, "只读命令并发过多，请稍后重试")
+	}
+}
+
+func (w *WebSocketReporter) runMutationCommands() {
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case cmd := <-w.mutationQueue:
+			w.routeCommandSafely(cmd)
+		}
+	}
+}
+
+func (w *WebSocketReporter) routeCommandSafely(cmd CommandMessage) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			fmt.Printf("❌ 命令处理 panic: type=%s panic=%v\n%s", cmd.Type, recovered, debug.Stack())
+			w.sendCommandFailure(cmd, fmt.Sprintf("命令处理异常: %v", recovered))
+		}
+	}()
+	w.routeCommand(cmd)
+}
+
+func (w *WebSocketReporter) sendCommandFailure(cmd CommandMessage, message string) {
+	w.sendResponse(CommandResponse{
+		Type:      commandResponseType(cmd.Type),
+		Success:   false,
+		Message:   message,
+		RequestId: cmd.RequestId,
+	})
+}
+
+func commandResponseType(commandType string) string {
+	commandType = strings.TrimSpace(commandType)
+	if commandType == "" {
+		return "UnknownCommandResponse"
+	}
+	return commandType + "Response"
+}
+
+func isMutationCommand(commandType string) bool {
+	switch strings.ToLower(strings.TrimSpace(commandType)) {
+	case "addservice", "updateservice", "deleteservice", "pauseservice", "resumeservice",
+		"addchains", "updatechains", "deletechains",
+		"addlimiters", "updatelimiters", "deletelimiters",
+		"addclimiters", "updateclimiters", "deleteclimiters",
+		"setprotocol", "upgradeagent", "rollbackagent", "reload":
+		return true
+	default:
+		return false
+	}
+}
+
 // routeCommand 路由命令到对应的处理函数
 func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
+	if isMutationCommand(cmd.Type) {
+		unlock := config.LockMutation()
+		defer unlock()
+		if w.ctx.Err() != nil {
+			w.sendCommandFailure(cmd, "Agent is shutting down")
+			return
+		}
+	}
 	jsonBytes, errs := json.Marshal(cmd)
 	if errs != nil {
 		fmt.Println("Error marshaling JSON:", errs)
@@ -781,7 +917,6 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 	fmt.Println("🔔 收到命令: ", string(jsonBytes))
 	var err error
 	var response CommandResponse
-	var needSaveConfig bool // 标记是否需要保存配置（只有状态变更命令才需要）
 
 	// 传递 requestId
 	response.RequestId = cmd.RequestId
@@ -791,59 +926,69 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 	case "AddService":
 		err = w.handleAddService(cmd.Data)
 		response.Type = "AddServiceResponse"
-		needSaveConfig = true
 	case "UpdateService":
 		err = w.handleUpdateService(cmd.Data)
 		response.Type = "UpdateServiceResponse"
-		needSaveConfig = true
 	case "DeleteService":
 		err = w.handleDeleteService(cmd.Data)
 		response.Type = "DeleteServiceResponse"
-		needSaveConfig = true
 	case "PauseService":
 		err = w.handlePauseService(cmd.Data)
 		response.Type = "PauseServiceResponse"
-		needSaveConfig = true
 	case "ResumeService":
 		err = w.handleResumeService(cmd.Data)
 		response.Type = "ResumeServiceResponse"
-		needSaveConfig = true
 
 	// Chain 相关命令
 	case "AddChains":
 		err = w.handleAddChain(cmd.Data)
 		response.Type = "AddChainsResponse"
-		needSaveConfig = true
 	case "UpdateChains":
 		err = w.handleUpdateChain(cmd.Data)
 		response.Type = "UpdateChainsResponse"
-		needSaveConfig = true
 	case "DeleteChains":
 		err = w.handleDeleteChain(cmd.Data)
 		response.Type = "DeleteChainsResponse"
-		needSaveConfig = true
 
 	// Limiter 相关命令
 	case "AddLimiters":
 		err = w.handleAddLimiter(cmd.Data)
 		response.Type = "AddLimitersResponse"
-		needSaveConfig = true
 	case "UpdateLimiters":
 		err = w.handleUpdateLimiter(cmd.Data)
 		response.Type = "UpdateLimitersResponse"
-		needSaveConfig = true
 	case "DeleteLimiters":
 		err = w.handleDeleteLimiter(cmd.Data)
 		response.Type = "DeleteLimitersResponse"
-		needSaveConfig = true
+	case "AddCLimiters":
+		err = w.handleAddCLimiter(cmd.Data)
+		response.Type = "AddCLimitersResponse"
+	case "UpdateCLimiters":
+		err = w.handleUpdateCLimiter(cmd.Data)
+		response.Type = "UpdateCLimitersResponse"
+	case "DeleteCLimiters":
+		err = w.handleDeleteCLimiter(cmd.Data)
+		response.Type = "DeleteCLimitersResponse"
 
 	// TCP Ping 诊断命令（只读，不需要保存配置）
 	case "TcpPing":
+		response.Type = "TcpPingResponse"
+		if !w.tryAcquireTCPPingSlot() {
+			err = fmt.Errorf("TCP探测任务过多，请稍后重试")
+			break
+		}
+		defer w.releaseTCPPingSlot()
 		var tcpPingResult TcpPingResponse
 		tcpPingResult, err = w.handleTcpPing(cmd.Data)
-		response.Type = "TcpPingResponse"
 		response.Data = tcpPingResult
 		// needSaveConfig = false (默认值)
+
+	// UDP Ping 诊断命令（只读，不需要保存配置）
+	case "UdpPing":
+		var udpPingResult TcpPingResponse
+		udpPingResult, err = w.handleUdpPing(cmd.Data)
+		response.Type = "UdpPingResponse"
+		response.Data = udpPingResult
 
 	// Service monitor check (read-only)
 	case "ServiceMonitorCheck":
@@ -856,7 +1001,6 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 	case "SetProtocol":
 		err = w.handleSetProtocol(cmd.Data)
 		response.Type = "SetProtocolResponse"
-		needSaveConfig = true
 
 	// 升级 Agent 命令（异步执行，不需要保存配置）
 	case "UpgradeAgent":
@@ -873,20 +1017,6 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 	default:
 		err = fmt.Errorf("未知命令类型: %s", cmd.Type)
 		response.Type = "UnknownCommandResponse"
-	}
-
-	// 只有状态变更命令才保存配置
-	if needSaveConfig {
-		if saveErr := saveConfig(); saveErr != nil {
-			fmt.Printf("❌ 保存配置失败: %v\n", saveErr)
-			if err == nil {
-				err = fmt.Errorf("保存配置失败: %v", saveErr)
-			} else {
-				err = fmt.Errorf("%v; 保存配置失败: %v", err, saveErr)
-			}
-		} else {
-			fmt.Println("✅ 配置已保存到 gost.json")
-		}
 	}
 
 	// 发送响应
@@ -1123,6 +1253,67 @@ func (w *WebSocketReporter) handleDeleteLimiter(data interface{}) error {
 	return deleteLimiter(deleteReq)
 }
 
+func (w *WebSocketReporter) handleAddCLimiter(data interface{}) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("序列化数据失败: %v", err)
+	}
+
+	var limiterConfig config.LimiterConfig
+	if err := json.Unmarshal(jsonData, &limiterConfig); err != nil {
+		return fmt.Errorf("解析限流器配置失败: %v", err)
+	}
+
+	req := createLimiterRequest{Data: limiterConfig}
+	return createConnLimiter(req)
+}
+
+func (w *WebSocketReporter) handleUpdateCLimiter(data interface{}) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("序列化数据失败: %v", err)
+	}
+
+	var updateReq struct {
+		Limiter string               `json:"limiter"`
+		Data    config.LimiterConfig `json:"data"`
+	}
+
+	if err := json.Unmarshal(jsonData, &updateReq); err != nil {
+		var limiterConfig config.LimiterConfig
+		if err := json.Unmarshal(jsonData, &limiterConfig); err != nil {
+			return fmt.Errorf("解析更新请求失败: %v", err)
+		}
+		updateReq.Limiter = limiterConfig.Name
+		updateReq.Data = limiterConfig
+	}
+
+	req := updateLimiterRequest{
+		Limiter: updateReq.Limiter,
+		Data:    updateReq.Data,
+	}
+	return updateConnLimiter(req)
+}
+
+func (w *WebSocketReporter) handleDeleteCLimiter(data interface{}) error {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("序列化数据失败: %v", err)
+	}
+
+	var deleteReq deleteLimiterRequest
+
+	if err := json.Unmarshal(jsonData, &deleteReq); err != nil {
+		var limiterName string
+		if err := json.Unmarshal(jsonData, &limiterName); err != nil {
+			return fmt.Errorf("解析删除请求失败: %v", err)
+		}
+		deleteReq.Limiter = limiterName
+	}
+
+	return deleteConnLimiter(deleteReq)
+}
+
 // handleSetProtocol 处理设置屏蔽协议的命令
 func (w *WebSocketReporter) handleSetProtocol(data interface{}) error {
 	jsonData, err := json.Marshal(data)
@@ -1318,7 +1509,7 @@ func (w *WebSocketReporter) handleUpgradeAgent(data interface{}) error {
 	// 执行重启脚本
 	// 使用 systemd-run 在独立的 transient unit 中运行重启脚本，
 	// 避免 systemctl stop 杀死 flux_agent cgroup 内所有进程（包括此脚本自身）导致 mv 未执行。
-	script := fmt.Sprintf("sleep 1 && systemctl stop flux_agent && mv %s %s && systemctl start flux_agent", tmpPath, binaryPath)
+	script := buildAgentRestartScript(tmpPath, binaryPath)
 	cmd := exec.Command("systemd-run", "--quiet", "/bin/sh", "-c", script)
 	if err := cmd.Start(); err != nil {
 		os.Remove(tmpPath)
@@ -1350,6 +1541,14 @@ func (w *WebSocketReporter) handleRollbackAgent(data interface{}) error {
 
 	fmt.Println("🔄 回退脚本已启动, Agent 将在 1 秒后重启...")
 	return nil
+}
+
+func buildAgentRestartScript(tmpPath, binaryPath string) string {
+	return fmt.Sprintf(
+		"sleep 1 && systemctl stop flux_agent && legacy_service='' && for service_file in /etc/systemd/system/gost.service /lib/systemd/system/gost.service /usr/lib/systemd/system/gost.service; do if [ -f \"$service_file\" ] && grep -Fq \"WorkingDirectory=/etc/gost\" \"$service_file\" && (grep -Fq \"ExecStart=/etc/gost/gost\" \"$service_file\" || (grep -Fq \"ExecStart=/usr/local/bin/gost\" \"$service_file\" && [ -f /etc/gost/config.json ] && [ -f /etc/gost/gost.json ])); then legacy_service=\"$service_file\"; break; fi; done && if [ -n \"$legacy_service\" ]; then (systemctl stop gost 2>/dev/null || true) && (systemctl disable gost 2>/dev/null || true) && rm -f /usr/local/bin/gost /etc/gost/gost \"$legacy_service\" && (systemctl daemon-reload 2>/dev/null || true); fi && mv %s %s && systemctl start flux_agent",
+		tmpPath,
+		binaryPath,
+	)
 }
 
 // updateLocalConfigJSON 将 http/tls/socks 写入工作目录下的 config.json
@@ -1599,15 +1798,38 @@ func StartWebSocketReporterWithConfig(addr string, secret string, http int, tls 
 	candidates := buildWebSocketCandidates(addr, secret, version, http, tls, socks, "")
 	fullURL := candidates[0]
 
-	fmt.Printf("🔗 WebSocket连接URL: %s\n", fullURL)
+	fmt.Printf("🔗 WebSocket连接URL: %s\n", sanitizeWebSocketURL(fullURL))
 
 	reporter := NewWebSocketReporter(fullURL, secret)
-	// 保存 addr, secret, version 供重连时使用
+	// 保存 addr, secret, version 和协议能力供重连时使用
 	reporter.addr = addr
 	reporter.secret = secret
 	reporter.version = version
+	reporter.http = http
+	reporter.tls = tls
+	reporter.socks = socks
 	reporter.Start()
 	return reporter
+}
+
+var configPersistPath string
+
+// SetConfigPersistPath sets the path where runtime config changes will be
+// persisted to disk (gost.json). Called by main during agent startup.
+func SetConfigPersistPath(path string) {
+	configPersistPath = path
+	config.SetPersistPath(path)
+}
+
+// EnableConfigPersist turns on automatic disk persistence after the initial
+// config has been loaded and applied.
+func EnableConfigPersist() {
+	config.EnablePersist()
+	path := config.PersistPath()
+	if path == "" {
+		path = configPersistPath
+	}
+	fmt.Printf("🔒 节点配置持久化已启用，运行时变更将自动保存到 %s\n", path)
 }
 
 // handleTcpPing 处理TCP ping诊断命令
@@ -1654,6 +1876,64 @@ func (w *WebSocketReporter) handleTcpPing(data interface{}) (TcpPingResponse, er
 
 	// 执行TCP ping操作
 	avgTime, packetLoss, err := tcpPingHost(req.IP, req.Port, req.Count, req.Timeout)
+
+	response := TcpPingResponse{
+		IP:        req.IP,
+		Port:      req.Port,
+		RequestId: req.RequestId,
+	}
+
+	if err != nil {
+		response.Success = false
+		response.ErrorMessage = err.Error()
+	} else {
+		response.Success = true
+		response.AverageTime = avgTime
+		response.PacketLoss = packetLoss
+	}
+
+	return response, nil
+}
+
+func (w *WebSocketReporter) handleUdpPing(data interface{}) (TcpPingResponse, error) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return TcpPingResponse{}, fmt.Errorf("序列化UDP ping数据失败: %v", err)
+	}
+
+	var req TcpPingRequest
+	if err := json.Unmarshal(jsonData, &req); err != nil {
+		return TcpPingResponse{}, fmt.Errorf("解析UDP ping请求失败: %v", err)
+	}
+
+	if net.ParseIP(req.IP) == nil && !isValidHostname(req.IP) {
+		return TcpPingResponse{
+			IP:           req.IP,
+			Port:         req.Port,
+			Success:      false,
+			ErrorMessage: "无效的IP地址或主机名",
+			RequestId:    req.RequestId,
+		}, nil
+	}
+
+	if req.Port <= 0 || req.Port > 65535 {
+		return TcpPingResponse{
+			IP:           req.IP,
+			Port:         req.Port,
+			Success:      false,
+			ErrorMessage: "无效的端口号，范围应为1-65535",
+			RequestId:    req.RequestId,
+		}, nil
+	}
+
+	if req.Count <= 0 {
+		req.Count = 4
+	}
+	if req.Timeout <= 0 {
+		req.Timeout = 5000
+	}
+
+	avgTime, packetLoss, err := udpPingHost(req.IP, req.Port, req.Count, req.Timeout)
 
 	response := TcpPingResponse{
 		IP:        req.IP,
@@ -1947,6 +2227,76 @@ func tcpPingHost(ip string, port int, count int, timeoutMs int) (float64, float6
 	packetLoss := float64(count-successCount) / float64(count) * 100
 
 	fmt.Printf("✅ TCP ping完成: 平均连接时间 %.2fms，失败率 %.1f%%\n", avgTime, packetLoss)
+
+	return avgTime, packetLoss, nil
+}
+
+func udpPingHost(ip string, port int, count int, timeoutMs int) (float64, float64, error) {
+	var totalTime float64
+	var successCount int
+
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	target := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+
+	fmt.Printf("🔍 开始UDP ping测试: %s，次数: %d，超时: %dms\n", target, count, timeoutMs)
+
+	if net.ParseIP(ip) == nil {
+		fmt.Printf("🔍 检测到域名，正在解析DNS...\n")
+		dnsStart := time.Now()
+
+		addrs, err := net.LookupHost(ip)
+		dnsDuration := time.Since(dnsStart)
+
+		if err != nil {
+			return 0, 100.0, fmt.Errorf("DNS解析失败: %v", err)
+		}
+		if len(addrs) == 0 {
+			return 0, 100.0, fmt.Errorf("DNS解析未返回任何IP地址")
+		}
+
+		fmt.Printf("✅ DNS解析完成 (%.2fms)，解析到 %d 个IP: %v\n",
+			dnsDuration.Seconds()*1000, len(addrs), addrs)
+
+		target = net.JoinHostPort(addrs[0], fmt.Sprintf("%d", port))
+		fmt.Printf("🎯 使用IP地址进行测试: %s\n", target)
+	} else {
+		fmt.Printf("🎯 使用IP地址进行测试: %s\n", target)
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", target)
+	if err != nil {
+		return 0, 100.0, fmt.Errorf("解析UDP地址失败: %v", err)
+	}
+
+	for i := 0; i < count; i++ {
+		start := time.Now()
+
+		conn, err := net.DialTimeout("udp", addr.String(), timeout)
+
+		elapsed := time.Since(start)
+
+		if err != nil {
+			fmt.Printf("  第%d次UDP连接失败: %v (%.2fms)\n", i+1, err, elapsed.Seconds()*1000)
+		} else {
+			fmt.Printf("  第%d次UDP连接成功: %.2fms\n", i+1, elapsed.Seconds()*1000)
+			conn.Close()
+			totalTime += elapsed.Seconds() * 1000
+			successCount++
+		}
+
+		if i < count-1 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	if successCount == 0 {
+		return 0, 100.0, fmt.Errorf("所有UDP连接尝试都失败")
+	}
+
+	avgTime := totalTime / float64(successCount)
+	packetLoss := float64(count-successCount) / float64(count) * 100
+
+	fmt.Printf("✅ UDP ping完成: 平均连接时间 %.2fms，失败率 %.1f%%\n", avgTime, packetLoss)
 
 	return avgTime, packetLoss, nil
 }

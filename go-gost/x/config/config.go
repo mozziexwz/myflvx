@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"io"
+	"reflect"
 	"sync"
 	"time"
 
@@ -22,17 +23,105 @@ func init() {
 }
 
 var (
-	global    = &Config{}
-	globalMux sync.RWMutex
+	global      = &Config{}
+	globalMux   sync.RWMutex
+	mutationMux sync.Mutex
 )
+
+// LockMutation serializes complete runtime/config transactions across panel
+// commands, management API requests, startup and reload. It is separate from
+// globalMux so callers may safely use Global, Set and OnUpdate while holding it.
+// Lock before reading/parsing the config and hold through persistence/rollback.
+func LockMutation() func() {
+	mutationMux.Lock()
+	return mutationMux.Unlock
+}
 
 func Global() *Config {
 	globalMux.RLock()
 	defer globalMux.RUnlock()
 
-	cfg := &Config{}
-	*cfg = *global
-	return cfg
+	return cloneConfig(global)
+}
+
+// cloneConfig returns a detached snapshot of the runtime config. Runtime
+// commands mutate slices, pointers and metadata maps, so a shallow struct copy
+// is not sufficient once readers and persistence run concurrently.
+func cloneConfig(c *Config) *Config {
+	if c == nil {
+		return nil
+	}
+	v := cloneConfigValue(reflect.ValueOf(c))
+	if !v.IsValid() || v.IsNil() {
+		return nil
+	}
+	return v.Interface().(*Config)
+}
+
+func cloneConfigValue(v reflect.Value) reflect.Value {
+	if !v.IsValid() {
+		return reflect.Value{}
+	}
+
+	switch v.Kind() {
+	case reflect.Interface:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		cloned := cloneConfigValue(v.Elem())
+		out := reflect.New(v.Type()).Elem()
+		if cloned.IsValid() && cloned.Type().AssignableTo(v.Type()) {
+			out.Set(cloned)
+		} else if cloned.IsValid() && cloned.Type().Implements(v.Type()) {
+			out.Set(cloned)
+		} else if cloned.IsValid() {
+			out.Set(cloned)
+		}
+		return out
+	case reflect.Pointer:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(cloneConfigValue(v.Elem()))
+		return out
+	case reflect.Map:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		iter := v.MapRange()
+		for iter.Next() {
+			out.SetMapIndex(cloneConfigValue(iter.Key()), cloneConfigValue(iter.Value()))
+		}
+		return out
+	case reflect.Slice:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := 0; i < v.Len(); i++ {
+			out.Index(i).Set(cloneConfigValue(v.Index(i)))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.Len(); i++ {
+			out.Index(i).Set(cloneConfigValue(v.Index(i)))
+		}
+		return out
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Elem()
+		out.Set(v)
+		for i := 0; i < v.NumField(); i++ {
+			if out.Field(i).CanSet() && v.Field(i).CanInterface() {
+				out.Field(i).Set(cloneConfigValue(v.Field(i)))
+			}
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func Set(c *Config) {
@@ -44,9 +133,14 @@ func Set(c *Config) {
 
 func OnUpdate(f func(c *Config) error) error {
 	globalMux.Lock()
-	defer globalMux.Unlock()
+	err := f(global)
+	globalMux.Unlock()
 
-	return f(global)
+	if err == nil {
+		err = persist()
+	}
+
+	return err
 }
 
 type LogConfig struct {
@@ -573,6 +667,7 @@ func (c *Config) Load() error {
 	if err := v.ReadInConfig(); err != nil {
 		return err
 	}
+	SetPersistPath(v.ConfigFileUsed())
 
 	return v.Unmarshal(c)
 }
@@ -590,6 +685,7 @@ func (c *Config) ReadFile(file string) error {
 	if err := v.ReadInConfig(); err != nil {
 		return err
 	}
+	SetPersistPath(v.ConfigFileUsed())
 	return v.Unmarshal(c)
 }
 

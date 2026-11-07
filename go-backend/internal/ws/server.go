@@ -42,6 +42,18 @@ type nodeSession struct {
 	crypto *security.AESCrypto // 缓存的 AES 加密器，避免每条消息重建
 }
 
+type adminSession struct {
+	userID int64
+	claims auth.Claims
+	conn   *connWrap
+}
+
+type monitorSession struct {
+	userID int64
+	claims auth.Claims
+	conn   *connWrap
+}
+
 type commandResponse struct {
 	Type      string          `json:"type"`
 	Success   bool            `json:"success"`
@@ -74,12 +86,14 @@ type Server struct {
 	upgrader     websocket.Upgrader
 	onNodeOnline func(nodeID int64)
 	onNodeMetric func(nodeID int64, info SystemInfo)
+	getUserAuthState func(userID int64) (*auth.UserAuthState, error)
 
 	mu      sync.RWMutex
-	admins  map[*connWrap]struct{}
-	nodes   map[int64]*nodeSession
-	byConn  map[*websocket.Conn]*nodeSession
-	pending map[string]pendingRequest
+	admins   map[*adminSession]struct{}
+	monitors map[*monitorSession]struct{}
+	nodes    map[int64]*nodeSession
+	byConn   map[*websocket.Conn]*nodeSession
+	pending  map[string]pendingRequest
 }
 
 type SystemInfo struct {
@@ -123,11 +137,21 @@ func NewServer(repo *repo.Repository, jwtSecret string) *Server {
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		admins:  make(map[*connWrap]struct{}),
-		nodes:   make(map[int64]*nodeSession),
-		byConn:  make(map[*websocket.Conn]*nodeSession),
-		pending: make(map[string]pendingRequest),
+		admins:   make(map[*adminSession]struct{}),
+		monitors: make(map[*monitorSession]struct{}),
+		nodes:    make(map[int64]*nodeSession),
+		byConn:   make(map[*websocket.Conn]*nodeSession),
+		pending:  make(map[string]pendingRequest),
 	}
+}
+
+func (s *Server) SetUserAuthStateLookup(fn func(userID int64) (*auth.UserAuthState, error)) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.getUserAuthState = fn
+	s.mu.Unlock()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -146,18 +170,36 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if typeVal == "0" {
-		if _, ok := auth.ValidateToken(secret, s.jwtSecret); !ok {
+		claims, ok := auth.ValidateToken(secret, s.jwtSecret)
+		if !ok {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		s.handleAdmin(w, r)
+		userID, err := strconv.ParseInt(claims.Sub, 10, 64)
+		if err != nil {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if claims.RoleID == 0 {
+			if !s.validateAdminSession(userID, claims) {
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			s.handleAdmin(w, r, userID, claims)
+			return
+		}
+		if !s.validateMonitorSession(userID, claims) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		s.handleMonitor(w, r, userID, claims)
 		return
 	}
 
 	http.Error(w, "bad request", http.StatusBadRequest)
 }
 
-func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, userID int64, claims auth.Claims) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -168,16 +210,54 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	})
 	done := make(chan struct{})
-	go startKeepalive(cw, done)
+	session := &adminSession{userID: userID, claims: claims, conn: cw}
+	go startKeepalive(cw, done, func() bool {
+		return s.validateAdminSession(session.userID, session.claims)
+	})
 
 	s.mu.Lock()
-	s.admins[cw] = struct{}{}
+	s.admins[session] = struct{}{}
 	s.mu.Unlock()
 
 	defer func() {
 		close(done)
 		s.mu.Lock()
-		delete(s.admins, cw)
+		delete(s.admins, session)
+		s.mu.Unlock()
+		_ = conn.Close()
+	}()
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request, userID int64, claims auth.Claims) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	cw := &connWrap{conn: conn}
+	_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+	})
+	done := make(chan struct{})
+	session := &monitorSession{userID: userID, claims: claims, conn: cw}
+	go startKeepalive(cw, done, func() bool {
+		return s.validateMonitorSession(session.userID, session.claims)
+	})
+
+	s.mu.Lock()
+	s.monitors[session] = struct{}{}
+	s.mu.Unlock()
+
+	defer func() {
+		close(done)
+		s.mu.Lock()
+		delete(s.monitors, session)
 		s.mu.Unlock()
 		_ = conn.Close()
 	}()
@@ -200,7 +280,7 @@ func (s *Server) handleNode(w http.ResponseWriter, r *http.Request, nodeID int64
 		return conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	})
 	done := make(chan struct{})
-	go startKeepalive(cw, done)
+	go startKeepalive(cw, done, nil)
 
 	version := r.URL.Query().Get("version")
 	httpVal := parseIntDefault(r.URL.Query().Get("http"), 0)
@@ -237,7 +317,7 @@ func (s *Server) handleNode(w http.ResponseWriter, r *http.Request, nodeID int64
 		needOfflineBroadcast := false
 		s.mu.Lock()
 		current, ok := s.nodes[nodeID]
-		if ok && current.conn.conn == conn {
+		if ok && current.conn != nil && current.conn.conn == conn {
 			delete(s.nodes, nodeID)
 			needOfflineBroadcast = true
 		}
@@ -417,11 +497,7 @@ func (s *Server) SendCommand(nodeID int64, cmdType string, data interface{}, tim
 		}
 	}
 
-	ns.conn.mu.Lock()
-	_ = ns.conn.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-	err = ns.conn.conn.WriteMessage(websocket.TextMessage, messageData)
-	_ = ns.conn.conn.SetWriteDeadline(time.Time{})
-	ns.conn.mu.Unlock()
+	err = writeWSMessage(ns.conn, websocket.TextMessage, messageData)
 	if err != nil {
 		cleanup()
 		return CommandResult{}, err
@@ -537,35 +613,47 @@ func (s *Server) broadcastStatus(nodeID int64, status int) {
 		"data": status,
 	}
 	raw, _ := json.Marshal(payload)
-	s.broadcastToAdmins(string(raw))
+	s.broadcastToRealtime(string(raw))
 }
 
 func (s *Server) broadcastInfo(nodeID int64, data string) {
 	payload := broadcastMessage{ID: nodeID, Type: "info", Data: data}
 	raw, _ := json.Marshal(payload)
-	s.broadcastToAdmins(string(raw))
+	s.broadcastToRealtime(string(raw))
 }
 
 func (s *Server) broadcastTyped(nodeID int64, msgType string, data string) {
 	payload := broadcastMessage{ID: nodeID, Type: msgType, Data: data}
 	raw, _ := json.Marshal(payload)
-	s.broadcastToAdmins(string(raw))
+	s.broadcastToRealtime(string(raw))
 }
 
-func (s *Server) broadcastToAdmins(message string) {
+func (s *Server) broadcastToRealtime(message string) {
 	s.mu.RLock()
-	admins := make([]*connWrap, 0, len(s.admins))
+	admins := make([]*adminSession, 0, len(s.admins))
 	for c := range s.admins {
 		admins = append(admins, c)
+	}
+	monitors := make([]*monitorSession, 0, len(s.monitors))
+	for c := range s.monitors {
+		monitors = append(monitors, c)
 	}
 	s.mu.RUnlock()
 
 	for _, c := range admins {
-		c.mu.Lock()
-		_ = c.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-		err := c.conn.WriteMessage(websocket.TextMessage, []byte(message))
-		_ = c.conn.SetWriteDeadline(time.Time{})
-		c.mu.Unlock()
+		if c == nil || c.conn == nil || c.conn.conn == nil {
+			continue
+		}
+		err := writeWSMessage(c.conn, websocket.TextMessage, []byte(message))
+		if err != nil {
+			log.Printf("websocket broadcast failed: %v", err)
+		}
+	}
+	for _, c := range monitors {
+		if c == nil || c.conn == nil || c.conn.conn == nil {
+			continue
+		}
+		err := writeWSMessage(c.conn, websocket.TextMessage, []byte(message))
 		if err != nil {
 			log.Printf("websocket broadcast failed: %v", err)
 		}
@@ -602,7 +690,60 @@ func parseIntDefault(v string, fallback int) int {
 	return x
 }
 
-func startKeepalive(cw *connWrap, done <-chan struct{}) {
+func (s *Server) validateAdminSession(userID int64, claims auth.Claims) bool {
+	if s == nil {
+		return false
+	}
+	if claims.Exp <= time.Now().Unix() {
+		return false
+	}
+	if s.getUserAuthState == nil {
+		return true
+	}
+	state, err := s.getUserAuthState(userID)
+	if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || claims.IatMs <= state.PasswordChangedAt {
+		return false
+	}
+	return true
+}
+
+func (s *Server) validateMonitorSession(userID int64, claims auth.Claims) bool {
+	if s == nil {
+		return false
+	}
+	if claims.Exp <= time.Now().Unix() {
+		return false
+	}
+	if s.getUserAuthState != nil {
+		state, err := s.getUserAuthState(userID)
+		if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || claims.IatMs <= state.PasswordChangedAt {
+			return false
+		}
+	}
+	if s.repo == nil {
+		return false
+	}
+	allowed, err := s.repo.HasMonitorPermission(userID)
+	if err != nil || !allowed {
+		return false
+	}
+	return true
+}
+
+func writeWSMessage(cw *connWrap, messageType int, payload []byte) error {
+	if cw == nil || cw.conn == nil {
+		return errors.New("websocket connection not initialized")
+	}
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+
+	_ = cw.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+	err := cw.conn.WriteMessage(messageType, payload)
+	_ = cw.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func startKeepalive(cw *connWrap, done <-chan struct{}, validate func() bool) {
 	if cw == nil || cw.conn == nil {
 		return
 	}
@@ -614,11 +755,11 @@ func startKeepalive(cw *connWrap, done <-chan struct{}) {
 		case <-done:
 			return
 		case <-ticker.C:
-			cw.mu.Lock()
-			_ = cw.conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
-			err := cw.conn.WriteMessage(websocket.PingMessage, nil)
-			_ = cw.conn.SetWriteDeadline(time.Time{})
-			cw.mu.Unlock()
+			if validate != nil && !validate() {
+				_ = cw.conn.Close()
+				return
+			}
+			err := writeWSMessage(cw, websocket.PingMessage, nil)
 			if err != nil {
 				_ = cw.conn.Close()
 				return

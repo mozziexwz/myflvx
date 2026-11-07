@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go-backend/internal/http/client"
+	runtimenft "go-backend/internal/runtime/nftables"
 	"go-backend/internal/store/model"
 	"go-backend/internal/ws"
 )
@@ -26,6 +27,16 @@ type forwardPortRecord = model.ForwardPortRecord
 type nodeRecord = model.NodeRecord
 
 type chainNodeRecord = model.ChainNodeRecord
+
+type forwardRuntimeLimiters struct {
+	TrafficLimiter string
+	ConnLimiter    string
+}
+
+type forwardLimiterConfig struct {
+	Name   string
+	Limits []string
+}
 
 type diagnosisTarget struct {
 	Address string
@@ -42,11 +53,13 @@ type diagnosisWorkItem struct {
 	toNode       chainNodeRecord
 	hasChainHop  bool
 	ipPreference string
+	protocol     string
 }
 
 type diagnosisExecOptions struct {
 	commandTimeout time.Duration
 	pingTimeoutMS  int
+	pingCount      int
 	timeoutMessage string
 }
 
@@ -185,14 +198,6 @@ func (h *Handler) listForwardPorts(forwardID int64) ([]forwardPortRecord, error)
 	return h.repo.ListForwardPorts(forwardID)
 }
 
-func (h *Handler) isTunnelSelectedTLSProtocol(tunnelID int64) (bool, error) {
-	protocol, err := h.repo.GetTunnelOutProtocol(tunnelID)
-	if err != nil {
-		return false, err
-	}
-	return isTLSTunnelProtocol(protocol), nil
-}
-
 func (h *Handler) getNodeRecord(nodeID int64) (*nodeRecord, error) {
 	n, err := h.repo.GetNodeRecord(nodeID)
 	if err != nil {
@@ -237,6 +242,19 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 	if err != nil {
 		return nil, err
 	}
+	nftMode, entryNodeIDs, err := h.tunnelUsesNftables(forward.TunnelID)
+	if err != nil {
+		return nil, err
+	}
+	if nftMode {
+		if err := h.validateNftablesForwardRequest(tunnel, forward.RemoteAddr, entryNodeIDs); err != nil {
+			return nil, err
+		}
+		if len(entryNodeIDs) == 0 {
+			return nil, errors.New("nftables 转发缺少入口节点")
+		}
+		return nil, h.syncNftablesNode(entryNodeIDs[0])
+	}
 	ports, err := h.listForwardPorts(forward.ID)
 	if err != nil {
 		return nil, err
@@ -271,14 +289,31 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 		speed = utSpeed
 	}
 
+	var ipSpeed *int
+	if forward.IPSpeedID.Valid && forward.IPSpeedID.Int64 > 0 {
+		if speedVal, err := h.repo.GetSpeedLimitSpeed(forward.IPSpeedID.Int64); err == nil && speedVal > 0 {
+			ipSpeed = &speedVal
+		}
+	}
+
 	serviceBase := buildForwardServiceBaseWithResolvedUserTunnel(forward.ID, forward.UserID, userTunnelID)
-	tunnelTLSProtocol, err := h.isTunnelSelectedTLSProtocol(forward.TunnelID)
+
+	user, err := h.repo.GetUserByID(forward.UserID)
 	if err != nil {
 		return nil, err
 	}
 
+	userMaxConn := 0
+	if user != nil && user.MaxConn > 0 {
+		userMaxConn = user.MaxConn
+	}
+	connLimiterConfigs := buildConnLimiterConfigs(forward, userMaxConn)
+
 	for _, fp := range ports {
+		runtimeLimiters := forwardRuntimeLimiters{ConnLimiter: joinLimiterNames(connLimiterConfigs)}
+		trafficLimiterNames := make([]string, 0, 2)
 		if limiterID != nil && speed != nil {
+			totalLimiterName := strconv.FormatInt(*limiterID, 10)
 			if err := h.ensureLimiterOnNode(fp.NodeID, *limiterID, *speed); err != nil {
 				// If the limiter push fails because the node is offline, skip it with a warning
 				if isNodeOfflineOrTimeoutError(err) {
@@ -292,13 +327,38 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 				}
 				return nil, err
 			}
+			trafficLimiterNames = append(trafficLimiterNames, totalLimiterName)
+		}
+		if ipSpeed != nil {
+			ruleLimiterName := fmt.Sprintf("rule_traffic_limit_%d", forward.ID)
+			if err := h.ensureTrafficLimiterOnNode(fp.NodeID, ruleLimiterName, nil, ipSpeed); err != nil {
+				// If the limiter push fails because the node is offline, skip it with a warning
+				if isNodeOfflineOrTimeoutError(err) {
+					node, _ := h.getNodeRecord(fp.NodeID)
+					nodeName := fmt.Sprintf("%d", fp.NodeID)
+					if node != nil && strings.TrimSpace(node.Name) != "" {
+						nodeName = strings.TrimSpace(node.Name)
+					}
+					warnings = append(warnings, fmt.Sprintf("节点 %s 不在线，已跳过下发", nodeName))
+					continue
+				}
+				return nil, err
+			}
+			trafficLimiterNames = append(trafficLimiterNames, ruleLimiterName)
+		}
+		runtimeLimiters.TrafficLimiter = strings.Join(trafficLimiterNames, ",")
+
+		for _, connLimiterConfig := range connLimiterConfigs {
+			if err := h.ensureConnLimiterOnNode(fp.NodeID, connLimiterConfig); err != nil {
+				warnings = append(warnings, fmt.Sprintf("节点 %d 连接限制器下发失败: %v", fp.NodeID, err))
+			}
 		}
 
 		node, err := h.getNodeRecord(fp.NodeID)
 		if err != nil {
 			return nil, err
 		}
-		services := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, strings.TrimSpace(fp.InIP), limiterID, tunnelTLSProtocol)
+		services := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, strings.TrimSpace(fp.InIP), runtimeLimiters)
 		_, err = h.sendNodeCommand(node.ID, method, services, true, false)
 		if err != nil && allowFallbackAdd && method == "UpdateService" {
 			if isNotFoundError(err) {
@@ -313,7 +373,7 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 		}
 		if err != nil && strings.EqualFold(strings.TrimSpace(method), "UpdateService") && isCannotAssignRequestedAddressError(err) {
 			var warning string
-			warning, err = h.fallbackForwardPortToDefaultBind(forward, tunnel, node, fp, serviceBase, limiterID, tunnelTLSProtocol)
+			warning, err = h.fallbackForwardPortToDefaultBind(forward, tunnel, node, fp, serviceBase, runtimeLimiters)
 			if err == nil && warning != "" {
 				warnings = append(warnings, warning)
 			}
@@ -339,7 +399,7 @@ func (h *Handler) syncForwardServicesWithWarnings(forward *forwardRecord, method
 	return warnings, nil
 }
 
-func (h *Handler) fallbackForwardPortToDefaultBind(forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, fp forwardPortRecord, serviceBase string, limiterID *int64, tunnelTLSProtocol bool) (string, error) {
+func (h *Handler) fallbackForwardPortToDefaultBind(forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, fp forwardPortRecord, serviceBase string, runtimeLimiters forwardRuntimeLimiters) (string, error) {
 	if h == nil || forward == nil || tunnel == nil || node == nil {
 		return "", errors.New("invalid bind fallback context")
 	}
@@ -356,7 +416,7 @@ func (h *Handler) fallbackForwardPortToDefaultBind(forward *forwardRecord, tunne
 	}
 
 	time.Sleep(150 * time.Millisecond)
-	defaultServices := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, "", limiterID, tunnelTLSProtocol)
+	defaultServices := buildForwardServiceConfigs(serviceBase, forward, tunnel, node, fp.Port, "", runtimeLimiters)
 	if _, err := h.sendNodeCommand(node.ID, "AddService", defaultServices, true, false); err != nil {
 		return "", err
 	}
@@ -439,16 +499,57 @@ func (h *Handler) forwardServiceBaseCandidates(forward *forwardRecord) ([]string
 }
 
 func (h *Handler) deleteForwardServiceBasesOnNode(nodeID int64, bases []string) error {
-	return deleteForwardServiceCandidates(bases, func(name string) error {
-		payload := map[string]interface{}{
-			"services": []string{name},
+	names := buildForwardServiceDeleteNames(bases)
+	if len(names) == 0 {
+		return nil
+	}
+	payload := map[string]interface{}{"services": names}
+	_, err := h.sendNodeCommand(nodeID, "DeleteService", payload, false, true)
+	return err
+}
+
+func buildForwardServiceDeleteNames(bases []string) []string {
+	names := make([]string, 0, len(bases)*3)
+	seen := make(map[string]struct{}, len(bases)*3)
+	appendName := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
 		}
-		_, err := h.sendNodeCommand(nodeID, "DeleteService", payload, false, false)
-		return err
-	})
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for _, base := range bases {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			continue
+		}
+		appendName(base + "_tcp")
+		appendName(base + "_udp")
+		appendName(base)
+	}
+	return names
+}
+
+type forwardServiceControlOptions struct {
+	tolerateNotFound bool
+	tolerateOffline  bool
+	allowSelfHeal    bool
+	continueOnError  bool
 }
 
 func (h *Handler) controlForwardServices(forward *forwardRecord, commandType string, tolerateNotFound bool) error {
+	return h.controlForwardServicesWithOptions(forward, commandType, forwardServiceControlOptions{
+		tolerateNotFound: tolerateNotFound,
+		tolerateOffline:  true,
+		allowSelfHeal:    true,
+	})
+}
+
+func (h *Handler) controlForwardServicesWithOptions(forward *forwardRecord, commandType string, opts forwardServiceControlOptions) error {
 	if h == nil || forward == nil {
 		return errors.New("invalid forward control context")
 	}
@@ -475,6 +576,30 @@ func (h *Handler) controlForwardServices(forward *forwardRecord, commandType str
 	candidateTunnelIDs = append(candidateTunnelIDs, userTunnelIDs...)
 	candidateTunnelIDs = append(candidateTunnelIDs, allUserTunnelIDs...)
 	bases := buildForwardServiceBaseCandidates(forward.ID, forward.UserID, userTunnelID, candidateTunnelIDs)
+	var nodeErrors []error
+	if strings.EqualFold(strings.TrimSpace(commandType), "DeleteService") {
+		seen := map[int64]struct{}{}
+		for _, fp := range ports {
+			if _, ok := seen[fp.NodeID]; ok {
+				continue
+			}
+			seen[fp.NodeID] = struct{}{}
+			if err := h.deleteForwardServiceBasesOnNode(fp.NodeID, bases); err != nil {
+				if opts.tolerateOffline && isNodeOfflineOrTimeoutError(err) {
+					continue
+				}
+				if opts.tolerateNotFound && isNotFoundError(err) {
+					continue
+				}
+				if opts.continueOnError {
+					nodeErrors = append(nodeErrors, h.nodeCommandError(fp.NodeID, err))
+					continue
+				}
+				return err
+			}
+		}
+		return errors.Join(nodeErrors...)
+	}
 	seen := map[int64]struct{}{}
 	healed := false
 	for _, fp := range ports {
@@ -483,34 +608,50 @@ func (h *Handler) controlForwardServices(forward *forwardRecord, commandType str
 		}
 		seen[fp.NodeID] = struct{}{}
 
-		nodeHandled, lastNotFoundErr, err := h.controlForwardServicesOnNode(fp.NodeID, bases, commandType)
-		if err != nil {
-			return err
-		}
-
-		if !nodeHandled && lastNotFoundErr != nil && !healed && shouldSelfHealForwardServiceControl(commandType) {
-			if healErr := h.syncForwardServices(forward, "UpdateService", true); healErr != nil {
-				return healErr
-			}
-			healed = true
-			nodeHandled, lastNotFoundErr, err = h.controlForwardServicesOnNode(fp.NodeID, bases, commandType)
+		nodeErr := func() error {
+			nodeHandled, lastNotFoundErr, err := h.controlForwardServicesOnNode(fp.NodeID, bases, commandType)
 			if err != nil {
+				if opts.tolerateOffline && isNodeOfflineOrTimeoutError(err) {
+					return nil
+				}
 				return err
 			}
-		}
 
-		if nodeHandled {
-			continue
+			if opts.allowSelfHeal && !nodeHandled && lastNotFoundErr != nil && !healed && shouldSelfHealForwardServiceControl(commandType) {
+				if healErr := h.syncForwardServices(forward, "UpdateService", true); healErr != nil {
+					return healErr
+				}
+				healed = true
+				nodeHandled, lastNotFoundErr, err = h.controlForwardServicesOnNode(fp.NodeID, bases, commandType)
+				if err != nil {
+					return err
+				}
+			}
+
+			if nodeHandled || opts.tolerateNotFound {
+				return nil
+			}
+			if lastNotFoundErr != nil {
+				return lastNotFoundErr
+			}
+			return errors.New("service control failed")
+		}()
+		if nodeErr != nil {
+			if !opts.continueOnError {
+				return nodeErr
+			}
+			nodeErrors = append(nodeErrors, h.nodeCommandError(fp.NodeID, nodeErr))
 		}
-		if tolerateNotFound {
-			continue
-		}
-		if lastNotFoundErr != nil {
-			return lastNotFoundErr
-		}
-		return errors.New("service control failed")
 	}
-	return nil
+	return errors.Join(nodeErrors...)
+}
+
+func (h *Handler) nodeCommandError(nodeID int64, err error) error {
+	name := strconv.FormatInt(nodeID, 10)
+	if node, lookupErr := h.getNodeRecord(nodeID); lookupErr == nil && node != nil {
+		name = defaultString(strings.TrimSpace(node.Name), name)
+	}
+	return fmt.Errorf("节点 %s (ID %d): %w", name, nodeID, err)
 }
 
 func (h *Handler) controlForwardServicesOnNode(nodeID int64, bases []string, commandType string) (bool, error, error) {
@@ -666,6 +807,9 @@ func (h *Handler) diagnoseForwardRuntime(ctx context.Context, forward *forwardRe
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if payload, handled, err := h.diagnoseNftablesForwardRuntime(forward); handled || err != nil {
+		return payload, err
+	}
 	forwardName, workItems, err := h.prepareForwardDiagnosis(forward)
 	if err != nil {
 		return nil, err
@@ -679,6 +823,111 @@ func (h *Handler) diagnoseForwardRuntime(ctx context.Context, forward *forwardRe
 		"results":     results,
 	}
 	return payload, nil
+}
+
+func (h *Handler) diagnoseNftablesForwardRuntime(forward *forwardRecord) (map[string]interface{}, bool, error) {
+	if forward == nil {
+		return nil, false, errForwardNotFound
+	}
+	nftMode, entryNodeIDs, err := h.tunnelUsesNftables(forward.TunnelID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !nftMode {
+		return nil, false, nil
+	}
+	if len(entryNodeIDs) == 0 {
+		return nil, true, errors.New("nftables 转发缺少入口节点")
+	}
+	targets, err := resolveDiagnosisTargets(forward.RemoteAddr)
+	if err != nil {
+		return nil, true, err
+	}
+	results, err := h.buildNftablesForwardDiagnosisResults(forward, entryNodeIDs[0], targets)
+	if err != nil {
+		return nil, true, err
+	}
+	payload := map[string]interface{}{
+		"forwardName": forward.Name,
+		"timestamp":   time.Now().UnixMilli(),
+		"results":     results,
+	}
+	return payload, true, nil
+}
+
+func (h *Handler) buildNftablesForwardDiagnosisResults(forward *forwardRecord, nodeID int64, targets []diagnosisTarget) ([]map[string]interface{}, error) {
+	if h == nil || h.repo == nil {
+		return nil, errors.New("handler not initialized")
+	}
+	node, err := h.getNodeRecord(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	bindings, err := h.repo.ListNftRuleBindingsByNode(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	var binding *model.NftRuleBinding
+	for i := range bindings {
+		if bindings[i].ForwardID == forward.ID {
+			binding = &bindings[i]
+			break
+		}
+	}
+	target := diagnosisTarget{}
+	if len(targets) > 0 {
+		target = targets[0]
+	}
+
+	status := "missing"
+	message := "nftables 规则未下发"
+	success := false
+	inPort := 0
+	protocols := ""
+	targetAddr := strings.TrimSpace(forward.RemoteAddr)
+	ruleHash := ""
+	if binding != nil {
+		status = strings.ToLower(strings.TrimSpace(binding.Status))
+		inPort = binding.InPort
+		protocols = strings.TrimSpace(binding.Protocols)
+		targetAddr = strings.TrimSpace(binding.TargetAddr)
+		ruleHash = strings.TrimSpace(binding.RuleHash)
+		if status == "" {
+			status = "pending"
+		}
+		if status == runtimenft.StatusApplied {
+			success = true
+			message = "nftables 规则已下发"
+		} else if strings.TrimSpace(binding.LastError) != "" {
+			message = binding.LastError
+		} else {
+			message = "nftables 规则未完成下发"
+		}
+	}
+
+	packetLoss := 100
+	if success {
+		packetLoss = 0
+	}
+	result := map[string]interface{}{
+		"success":       success,
+		"nodeName":      node.Name,
+		"nodeId":        strconv.FormatInt(nodeID, 10),
+		"targetIp":      target.IP,
+		"targetPort":    target.Port,
+		"description":   fmt.Sprintf("nftables规则(%s)->目标(%s)", node.Name, defaultString(target.Address, targetAddr)),
+		"averageTime":   0,
+		"packetLoss":    packetLoss,
+		"message":       message,
+		"fromChainType": 1,
+		"forwardMode":   "nftables",
+		"nftRuleStatus": status,
+		"nftRuleHash":   ruleHash,
+		"inPort":        inPort,
+		"protocols":     protocols,
+		"targetAddr":    targetAddr,
+	}
+	return []map[string]interface{}{result}, nil
 }
 
 func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []diagnosisWorkItem, error) {
@@ -704,6 +953,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 	}
 
 	ipPreference := h.repo.GetTunnelIPPreference(forward.TunnelID)
+	protocol := strings.ToLower(strings.TrimSpace(tunnel.Protocol))
 
 	inNodes, chainHops, outNodes := splitChainNodeGroups(chainRows)
 	workItems := make([]diagnosisWorkItem, 0, len(chainRows)*2+len(targets))
@@ -718,6 +968,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 					targetIP:    target.IP,
 					targetPort:  target.Port,
 					description: description,
+					protocol:    "tcp",
 					metadata: map[string]interface{}{
 						"fromChainType": 1,
 					},
@@ -735,6 +986,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 						hasChainHop:  true,
 						ipPreference: ipPreference,
 						description:  description,
+						protocol:     defaultString(strings.ToLower(strings.TrimSpace(firstNode.Protocol)), protocol),
 						metadata: map[string]interface{}{
 							"fromChainType": 1,
 							"toChainType":   2,
@@ -751,6 +1003,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 						hasChainHop:  true,
 						ipPreference: ipPreference,
 						description:  description,
+						protocol:     defaultString(strings.ToLower(strings.TrimSpace(outNode.Protocol)), protocol),
 						metadata: map[string]interface{}{
 							"fromChainType": 1,
 							"toChainType":   3,
@@ -771,6 +1024,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 							hasChainHop:  true,
 							ipPreference: ipPreference,
 							description:  description,
+							protocol:     defaultString(strings.ToLower(strings.TrimSpace(nextNode.Protocol)), protocol),
 							metadata: map[string]interface{}{
 								"fromChainType": 2,
 								"fromInx":       currentNode.Inx,
@@ -788,6 +1042,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 							hasChainHop:  true,
 							ipPreference: ipPreference,
 							description:  description,
+							protocol:     defaultString(strings.ToLower(strings.TrimSpace(outNode.Protocol)), protocol),
 							metadata: map[string]interface{}{
 								"fromChainType": 2,
 								"fromInx":       currentNode.Inx,
@@ -807,6 +1062,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 					targetIP:    target.IP,
 					targetPort:  target.Port,
 					description: description,
+					protocol:    "tcp",
 					metadata: map[string]interface{}{
 						"fromChainType": 3,
 					},
@@ -822,6 +1078,7 @@ func (h *Handler) prepareForwardDiagnosis(forward *forwardRecord) (string, []dia
 					targetIP:    target.IP,
 					targetPort:  target.Port,
 					description: description,
+					protocol:    "tcp",
 					metadata: map[string]interface{}{
 						"fromChainType": 1,
 					},
@@ -876,6 +1133,8 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 	}
 
 	ipPreference := h.repo.GetTunnelIPPreference(tunnelID)
+	protocol := strings.ToLower(strings.TrimSpace(tunnel.Protocol))
+	probeTarget := effectiveTunnelProbeTargetValues(tunnel.ProbeTargetHost, tunnel.ProbeTargetPort)
 	inNodes, chainHops, outNodes := splitChainNodeGroups(chainRows)
 	workItems := make([]diagnosisWorkItem, 0, len(chainRows)*2)
 
@@ -885,9 +1144,10 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 			description := fmt.Sprintf("入口(%s)->外网", inNode.NodeName)
 			workItems = append(workItems, diagnosisWorkItem{
 				fromNodeID:  inNode.NodeID,
-				targetIP:    "www.bing.com",
-				targetPort:  443,
+				targetIP:    probeTarget.Host,
+				targetPort:  probeTarget.Port,
 				description: description,
+				protocol:    "tcp",
 				metadata: map[string]interface{}{
 					"fromChainType": 1,
 				},
@@ -904,6 +1164,7 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 						hasChainHop:  true,
 						ipPreference: ipPreference,
 						description:  description,
+						protocol:     defaultString(strings.ToLower(strings.TrimSpace(firstNode.Protocol)), protocol),
 						metadata: map[string]interface{}{
 							"fromChainType": 1,
 							"toChainType":   2,
@@ -920,6 +1181,7 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 						hasChainHop:  true,
 						ipPreference: ipPreference,
 						description:  description,
+						protocol:     defaultString(strings.ToLower(strings.TrimSpace(outNode.Protocol)), protocol),
 						metadata: map[string]interface{}{
 							"fromChainType": 1,
 							"toChainType":   3,
@@ -940,6 +1202,7 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 							hasChainHop:  true,
 							ipPreference: ipPreference,
 							description:  description,
+							protocol:     defaultString(strings.ToLower(strings.TrimSpace(nextNode.Protocol)), protocol),
 							metadata: map[string]interface{}{
 								"fromChainType": 2,
 								"fromInx":       currentNode.Inx,
@@ -957,6 +1220,7 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 							hasChainHop:  true,
 							ipPreference: ipPreference,
 							description:  description,
+							protocol:     defaultString(strings.ToLower(strings.TrimSpace(outNode.Protocol)), protocol),
 							metadata: map[string]interface{}{
 								"fromChainType": 2,
 								"fromInx":       currentNode.Inx,
@@ -972,9 +1236,10 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 			description := fmt.Sprintf("出口(%s)->外网", outNode.NodeName)
 			workItems = append(workItems, diagnosisWorkItem{
 				fromNodeID:  outNode.NodeID,
-				targetIP:    "www.bing.com",
-				targetPort:  443,
+				targetIP:    probeTarget.Host,
+				targetPort:  probeTarget.Port,
 				description: description,
+				protocol:    "tcp",
 				metadata: map[string]interface{}{
 					"fromChainType": 3,
 				},
@@ -985,9 +1250,10 @@ func (h *Handler) prepareTunnelDiagnosis(tunnelID int64) (string, string, []diag
 			description := fmt.Sprintf("入口(%s)->外网", inNode.NodeName)
 			workItems = append(workItems, diagnosisWorkItem{
 				fromNodeID:  inNode.NodeID,
-				targetIP:    "www.bing.com",
-				targetPort:  443,
+				targetIP:    probeTarget.Host,
+				targetPort:  probeTarget.Port,
 				description: description,
+				protocol:    "tcp",
 				metadata: map[string]interface{}{
 					"fromChainType": 1,
 				},
@@ -1107,9 +1373,9 @@ func (h *Handler) executeDiagnosisWorkItem(workItem diagnosisWorkItem, options d
 	single := make([]map[string]interface{}, 0, 1)
 	nodeCache := map[int64]*nodeRecord{}
 	if workItem.hasChainHop {
-		h.appendChainHopDiagnosis(&single, nodeCache, workItem.fromNodeID, workItem.toNode, workItem.description, workItem.metadata, workItem.ipPreference, options)
+		h.appendChainHopDiagnosis(&single, nodeCache, workItem.fromNodeID, workItem.toNode, workItem.description, workItem.metadata, workItem.ipPreference, workItem.protocol, options)
 	} else {
-		h.appendPathDiagnosis(&single, nodeCache, workItem.fromNodeID, workItem.targetIP, workItem.targetPort, workItem.description, workItem.metadata, options)
+		h.appendPathDiagnosis(&single, nodeCache, workItem.fromNodeID, workItem.targetIP, workItem.targetPort, workItem.description, workItem.metadata, workItem.protocol, options)
 	}
 
 	if len(single) == 0 {
@@ -1235,14 +1501,14 @@ func (h *Handler) appendFailedDiagnosis(results *[]map[string]interface{}, nodeC
 		item["nodeName"] = node.Name
 	}
 	if strings.TrimSpace(message) == "" {
-		message = "TCP连接失败"
+		message = "连接失败"
 	}
 	item["success"] = false
 	item["message"] = message
 	*results = append(*results, item)
 }
 
-func (h *Handler) appendPathDiagnosis(results *[]map[string]interface{}, nodeCache map[int64]*nodeRecord, fromNodeID int64, targetIP string, targetPort int, description string, metadata map[string]interface{}, options diagnosisExecOptions) {
+func (h *Handler) appendPathDiagnosis(results *[]map[string]interface{}, nodeCache map[int64]*nodeRecord, fromNodeID int64, targetIP string, targetPort int, description string, metadata map[string]interface{}, protocol string, options diagnosisExecOptions) {
 	item := newDiagnosisResultItem(fromNodeID, targetIP, targetPort, description, metadata)
 
 	fromNode, err := h.cachedNode(nodeCache, fromNodeID)
@@ -1259,9 +1525,9 @@ func (h *Handler) appendPathDiagnosis(results *[]map[string]interface{}, nodeCac
 		pingErr  error
 	)
 	if fromNode.IsRemote == 1 {
-		pingData, pingErr = h.tcpPingViaRemoteNode(fromNode, targetIP, targetPort, options)
+		pingData, pingErr = h.pingViaRemoteNode(fromNode, targetIP, targetPort, protocol, options)
 	} else {
-		pingData, pingErr = h.tcpPingViaNode(fromNodeID, targetIP, targetPort, options)
+		pingData, pingErr = h.pingViaNode(fromNodeID, targetIP, targetPort, protocol, options)
 	}
 	if pingErr != nil {
 		item["success"] = false
@@ -1278,21 +1544,21 @@ func (h *Handler) appendPathDiagnosis(results *[]map[string]interface{}, nodeCac
 	message := strings.TrimSpace(asString(pingData["message"]))
 	if success {
 		if message == "" {
-			message = "TCP连接成功"
+			message = "连接成功"
 		}
 	} else {
 		if message == "" {
 			message = strings.TrimSpace(asString(pingData["errorMessage"]))
 		}
 		if message == "" {
-			message = "TCP连接失败"
+			message = "连接失败"
 		}
 	}
 	item["message"] = message
 	*results = append(*results, item)
 }
 
-func (h *Handler) appendChainHopDiagnosis(results *[]map[string]interface{}, nodeCache map[int64]*nodeRecord, fromNodeID int64, toNode chainNodeRecord, description string, metadata map[string]interface{}, ipPreference string, options diagnosisExecOptions) {
+func (h *Handler) appendChainHopDiagnosis(results *[]map[string]interface{}, nodeCache map[int64]*nodeRecord, fromNodeID int64, toNode chainNodeRecord, description string, metadata map[string]interface{}, ipPreference string, protocol string, options diagnosisExecOptions) {
 	fromNode, _ := h.cachedNode(nodeCache, fromNodeID)
 	targetNode, err := h.cachedNode(nodeCache, toNode.NodeID)
 	if err != nil {
@@ -1304,7 +1570,7 @@ func (h *Handler) appendChainHopDiagnosis(results *[]map[string]interface{}, nod
 		h.appendFailedDiagnosis(results, nodeCache, fromNodeID, strings.Trim(strings.TrimSpace(targetNode.ServerIP), "[]"), toNode.Port, description, metadata, err.Error())
 		return
 	}
-	h.appendPathDiagnosis(results, nodeCache, fromNodeID, targetIP, targetPort, description, metadata, options)
+	h.appendPathDiagnosis(results, nodeCache, fromNodeID, targetIP, targetPort, description, metadata, protocol, options)
 }
 
 func resolveChainProbeTarget(fromNode, targetNode *nodeRecord, preferredPort int, ipPreference string, connectIp string) (string, int, error) {
@@ -1364,10 +1630,14 @@ func (h *Handler) tcpPingViaNode(nodeID int64, ip string, port int, options diag
 	if options.pingTimeoutMS <= 0 {
 		options.pingTimeoutMS = int(diagnosisCommandTimeout / time.Millisecond)
 	}
+	pingCount := options.pingCount
+	if pingCount <= 0 {
+		pingCount = 4
+	}
 	res, err := h.sendNodeCommandWithTimeout(nodeID, "TcpPing", map[string]interface{}{
 		"ip":      ip,
 		"port":    port,
-		"count":   4,
+		"count":   pingCount,
 		"timeout": options.pingTimeoutMS,
 	}, options.commandTimeout, false, false)
 	if err != nil {
@@ -1394,14 +1664,86 @@ func (h *Handler) tcpPingViaRemoteNode(node *nodeRecord, ip string, port int, op
 	if options.pingTimeoutMS <= 0 {
 		options.pingTimeoutMS = int(diagnosisCommandTimeout / time.Millisecond)
 	}
+	pingCount := options.pingCount
+	if pingCount <= 0 {
+		pingCount = 4
+	}
 
 	fc := client.NewFederationClientWithTimeout(options.commandTimeout)
 	return fc.Diagnose(remoteURL, remoteToken, h.federationLocalDomain(), client.RuntimeDiagnoseRequest{
-		IP:      strings.TrimSpace(ip),
-		Port:    port,
-		Count:   4,
-		Timeout: options.pingTimeoutMS,
+		IP:       strings.TrimSpace(ip),
+		Port:     port,
+		Count:    pingCount,
+		Timeout:  options.pingTimeoutMS,
+		Protocol: "tcp",
 	})
+}
+
+func (h *Handler) udpPingViaRemoteNode(node *nodeRecord, ip string, port int, options diagnosisExecOptions) (map[string]interface{}, error) {
+	if node == nil {
+		return nil, errors.New("节点不存在")
+	}
+	remoteURL := strings.TrimSpace(node.RemoteURL)
+	remoteToken := strings.TrimSpace(node.RemoteToken)
+	if remoteURL == "" || remoteToken == "" {
+		return nil, errors.New("远程节点缺少共享配置")
+	}
+	if options.commandTimeout <= 0 {
+		options.commandTimeout = diagnosisCommandTimeout
+	}
+	if options.pingTimeoutMS <= 0 {
+		options.pingTimeoutMS = int(diagnosisCommandTimeout / time.Millisecond)
+	}
+
+	fc := client.NewFederationClientWithTimeout(options.commandTimeout)
+	return fc.Diagnose(remoteURL, remoteToken, h.federationLocalDomain(), client.RuntimeDiagnoseRequest{
+		IP:       strings.TrimSpace(ip),
+		Port:     port,
+		Count:    4,
+		Timeout:  options.pingTimeoutMS,
+		Protocol: "udp",
+	})
+}
+
+func isUDPBasedProtocol(protocol string) bool {
+	p := strings.ToLower(strings.TrimSpace(protocol))
+	return p == "kcp" || p == "udp" || p == "quic"
+}
+
+func (h *Handler) pingViaNode(nodeID int64, ip string, port int, protocol string, options diagnosisExecOptions) (map[string]interface{}, error) {
+	if isUDPBasedProtocol(protocol) {
+		return h.udpPingViaNode(nodeID, ip, port, options)
+	}
+	return h.tcpPingViaNode(nodeID, ip, port, options)
+}
+
+func (h *Handler) pingViaRemoteNode(node *nodeRecord, ip string, port int, protocol string, options diagnosisExecOptions) (map[string]interface{}, error) {
+	if isUDPBasedProtocol(protocol) {
+		return h.udpPingViaRemoteNode(node, ip, port, options)
+	}
+	return h.tcpPingViaRemoteNode(node, ip, port, options)
+}
+
+func (h *Handler) udpPingViaNode(nodeID int64, ip string, port int, options diagnosisExecOptions) (map[string]interface{}, error) {
+	if options.commandTimeout <= 0 {
+		options.commandTimeout = diagnosisCommandTimeout
+	}
+	if options.pingTimeoutMS <= 0 {
+		options.pingTimeoutMS = int(diagnosisCommandTimeout / time.Millisecond)
+	}
+	res, err := h.sendNodeCommandWithTimeout(nodeID, "UdpPing", map[string]interface{}{
+		"ip":      ip,
+		"port":    port,
+		"count":   4,
+		"timeout": options.pingTimeoutMS,
+	}, options.commandTimeout, false, false)
+	if err != nil {
+		return nil, err
+	}
+	if res.Data == nil {
+		return nil, errors.New("节点未返回诊断数据")
+	}
+	return res.Data, nil
 }
 
 func splitRemoteTargets(remoteAddr string) []string {
@@ -1561,11 +1903,12 @@ func compactErrorMessage(msg string) string {
 	return strings.Join(strings.Fields(strings.ToLower(msg)), "")
 }
 
-func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, port int, bindIP string, limiterID *int64, tunnelTLSProtocol bool) []map[string]interface{} {
+func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel *tunnelRecord, node *nodeRecord, port int, bindIP string, runtimeLimiters forwardRuntimeLimiters) []map[string]interface{} {
 	protocols := []string{"tcp", "udp"}
 	services := make([]map[string]interface{}, 0, 2)
 	targets := splitRemoteTargets(forward.RemoteAddr)
 	strategy := strings.TrimSpace(forward.Strategy)
+	proxyProtocolReceive, proxyProtocolSend := normalizeForwardProxyProtocol(forward.ProxyProtocol, forward.ProxyProtocolReceive, forward.ProxyProtocolSend)
 	if strategy == "" {
 		strategy = "fifo"
 	}
@@ -1604,10 +1947,27 @@ func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel 
 				},
 			},
 		}
+		if runtimeLimiters.ConnLimiter != "" {
+			service["climiter"] = runtimeLimiters.ConnLimiter
+		}
+		if runtimeLimiters.TrafficLimiter != "" {
+			service["limiter"] = runtimeLimiters.TrafficLimiter
+		}
+		if proxyProtocolReceive > 0 {
+			serviceMetadata := ensureServiceMetadata(service)
+			serviceMetadata["proxyProtocol"] = proxyProtocolReceive
+		}
+		if proxyProtocolSend > 0 {
+			handlerConfig := service["handler"].(map[string]interface{})
+			if handlerConfig["metadata"] == nil {
+				handlerConfig["metadata"] = map[string]interface{}{}
+			}
+			handlerConfig["metadata"].(map[string]interface{})["proxyProtocol"] = proxyProtocolSend
+		}
 		if protocol == "udp" {
-			listenerMetadata := map[string]interface{}{"keepAlive": true}
-			if tunnelTLSProtocol {
-				listenerMetadata["ttl"] = "10s"
+			listenerMetadata := map[string]interface{}{
+				"keepAlive": true,
+				"ttl":       "30s",
 			}
 			service["listener"].(map[string]interface{})["metadata"] = listenerMetadata
 		}
@@ -1615,10 +1975,8 @@ func buildForwardServiceConfigs(baseName string, forward *forwardRecord, tunnel 
 			service["handler"].(map[string]interface{})["chain"] = fmt.Sprintf("chains_%d", forward.TunnelID)
 		}
 		if tunnel != nil && tunnel.Type == 1 && strings.TrimSpace(node.InterfaceName) != "" {
-			service["metadata"] = map[string]interface{}{"interface": node.InterfaceName}
-		}
-		if limiterID != nil && *limiterID > 0 {
-			service["limiter"] = strconv.FormatInt(*limiterID, 10)
+			serviceMetadata := ensureServiceMetadata(service)
+			serviceMetadata["interface"] = node.InterfaceName
 		}
 		services = append(services, service)
 	}
@@ -1635,6 +1993,25 @@ func buildForwarderNodes(targets []string) []map[string]interface{} {
 		})
 	}
 	return nodes
+}
+
+func ensureServiceMetadata(service map[string]interface{}) map[string]interface{} {
+	if service["metadata"] == nil {
+		service["metadata"] = map[string]interface{}{}
+	}
+	metadata, ok := service["metadata"].(map[string]interface{})
+	if !ok {
+		metadata = map[string]interface{}{}
+		service["metadata"] = metadata
+	}
+	return metadata
+}
+
+func normalizeForwardProxyProtocol(legacy, receive, send int) (int, int) {
+	if send == 0 && legacy > 0 {
+		send = legacy
+	}
+	return receive, send
 }
 
 func processServerAddress(serverAddr string) string {
@@ -1719,14 +2096,76 @@ func (h *Handler) ensureLimiterOnNode(nodeID int64, limiterID int64, speed int) 
 	return nil
 }
 
-func buildLimiterAddPayload(limiterID int64, speed int) (string, map[string]interface{}) {
+func (h *Handler) ensureConnLimiterOnNode(nodeID int64, cfg forwardLimiterConfig) error {
+	if cfg.Name == "" || len(cfg.Limits) == 0 {
+		return nil
+	}
+	payload := map[string]interface{}{"name": cfg.Name, "limits": cfg.Limits}
+	if _, err := h.sendNodeCommand(nodeID, "AddCLimiters", payload, false, false); err != nil {
+		if !isAlreadyExistsMessage(err.Error()) {
+			return fmt.Errorf("连接限制器下发失败: %w", err)
+		}
+		updatePayload := map[string]interface{}{"limiter": cfg.Name, "data": payload}
+		if _, updateErr := h.sendNodeCommand(nodeID, "UpdateCLimiters", updatePayload, false, false); updateErr != nil {
+			return fmt.Errorf("连接限制器更新失败: %w", updateErr)
+		}
+	}
+	return nil
+}
+
+func buildConnLimiterConfigs(forward *forwardRecord, userMaxConn int) []forwardLimiterConfig {
+	if forward == nil {
+		return nil
+	}
+	if forward.MaxConn > 0 {
+		limits := []string{fmt.Sprintf("$ %d", forward.MaxConn)}
+		if forward.IPMaxConn > 0 {
+			limits = append(limits, fmt.Sprintf("$$ %d", forward.IPMaxConn))
+		}
+		return []forwardLimiterConfig{{Name: fmt.Sprintf("rule_conn_limit_%d", forward.ID), Limits: limits}}
+	}
+	configs := make([]forwardLimiterConfig, 0, 2)
+	if userMaxConn > 0 {
+		configs = append(configs, forwardLimiterConfig{Name: fmt.Sprintf("user_conn_limit_%d", forward.UserID), Limits: []string{fmt.Sprintf("$ %d", userMaxConn)}})
+	}
+	if forward.IPMaxConn > 0 {
+		configs = append(configs, forwardLimiterConfig{Name: fmt.Sprintf("rule_conn_limit_%d", forward.ID), Limits: []string{fmt.Sprintf("$$ %d", forward.IPMaxConn)}})
+	}
+	return configs
+}
+
+func joinLimiterNames(configs []forwardLimiterConfig) string {
+	names := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		if cfg.Name != "" {
+			names = append(names, cfg.Name)
+		}
+	}
+	return strings.Join(names, ",")
+}
+
+func speedToLimitLine(key string, speed int) string {
 	rate := float64(speed) / 8.0
-	limitStr := fmt.Sprintf("$ %.1fMB %.1fMB", rate, rate)
+	return fmt.Sprintf("%s %.1fMB %.1fMB", key, rate, rate)
+}
+
+func buildTrafficLimiterPayload(name string, totalSpeed *int, ipSpeed *int) map[string]interface{} {
+	limits := make([]string, 0, 3)
+	if totalSpeed != nil && *totalSpeed > 0 {
+		limits = append(limits, speedToLimitLine("$", *totalSpeed))
+	}
+	if ipSpeed != nil && *ipSpeed > 0 {
+		limits = append(limits, speedToLimitLine("0.0.0.0/0", *ipSpeed), speedToLimitLine("::/0", *ipSpeed))
+	}
+	return map[string]interface{}{"name": name, "limits": limits}
+}
+
+func buildLimiterAddPayload(limiterID int64, speed int) (string, map[string]interface{}) {
 	name := strconv.FormatInt(limiterID, 10)
 
 	return name, map[string]interface{}{
 		"name":   name,
-		"limits": []string{limitStr},
+		"limits": []string{speedToLimitLine("$", speed)},
 	}
 }
 
@@ -1752,5 +2191,22 @@ func (h *Handler) upsertLimiterOnNode(nodeID int64, limiterID int64, speed int) 
 		}
 	}
 
+	return nil
+}
+
+func (h *Handler) ensureTrafficLimiterOnNode(nodeID int64, name string, totalSpeed *int, ipSpeed *int) error {
+	payload := buildTrafficLimiterPayload(name, totalSpeed, ipSpeed)
+	limits, _ := payload["limits"].([]string)
+	if name == "" || len(limits) == 0 {
+		return nil
+	}
+	if _, err := h.sendNodeCommand(nodeID, "AddLimiters", payload, false, false); err != nil {
+		if !isAlreadyExistsMessage(err.Error()) {
+			return fmt.Errorf("限速规则下发失败: %w", err)
+		}
+		if _, updateErr := h.sendNodeCommand(nodeID, "UpdateLimiters", buildLimiterUpdatePayload(name, payload), false, false); updateErr != nil {
+			return fmt.Errorf("限速规则更新失败: %w", updateErr)
+		}
+	}
 	return nil
 }

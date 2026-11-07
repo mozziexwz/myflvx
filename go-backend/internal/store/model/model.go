@@ -10,39 +10,48 @@ import "database/sql"
 // User maps to the "user" table. PostgreSQL treats "user" as a reserved
 // word, so TableName() is required for correct quoting.
 type User struct {
-	ID            int64         `gorm:"primaryKey;autoIncrement"`
-	User          string        `gorm:"column:user;type:varchar(100);not null"`
-	Pwd           string        `gorm:"type:varchar(100);not null"`
-	RoleID        int           `gorm:"column:role_id;not null"`
-	ExpTime       int64         `gorm:"column:exp_time;not null"`
-	Flow          int64         `gorm:"not null"`
-	InFlow        int64         `gorm:"column:in_flow;not null;default:0"`
-	OutFlow       int64         `gorm:"column:out_flow;not null;default:0"`
-	FlowResetTime int64         `gorm:"column:flow_reset_time;not null"`
-	Num           int           `gorm:"not null"`
-	CreatedTime   int64         `gorm:"column:created_time;not null"`
-	UpdatedTime   sql.NullInt64 `gorm:"column:updated_time"`
-	Status        int           `gorm:"not null"`
+	ID                int64         `gorm:"primaryKey;autoIncrement"`
+	User              string        `gorm:"column:user;type:varchar(100);not null"`
+	Pwd               string        `gorm:"type:varchar(100);not null"`
+	RoleID            int           `gorm:"column:role_id;not null"`
+	ExpTime           int64         `gorm:"column:exp_time;not null"`
+	Flow              int64         `gorm:"not null"`
+	FlowMiB           int64         `gorm:"column:flow_mib;not null;default:0"`
+	InFlow            int64         `gorm:"column:in_flow;not null;default:0"`
+	OutFlow           int64         `gorm:"column:out_flow;not null;default:0"`
+	FlowResetTime     int64         `gorm:"column:flow_reset_time;not null"`
+	Num               int           `gorm:"not null"`
+	CreatedTime       int64         `gorm:"column:created_time;not null"`
+	UpdatedTime       sql.NullInt64 `gorm:"column:updated_time"`
+	Status            int           `gorm:"not null"`
+	PasswordChangedAt int64         `gorm:"column:password_changed_at;not null;default:0"`
+	MaxConn           int           `gorm:"column:max_conn;not null;default:0"`
 }
 
 func (User) TableName() string { return "user" }
 
 // Forward maps to the "forward" table.
 type Forward struct {
-	ID          int64         `gorm:"primaryKey;autoIncrement"`
-	UserID      int64         `gorm:"column:user_id;not null"`
-	UserName    string        `gorm:"column:user_name;type:varchar(100);not null"`
-	Name        string        `gorm:"type:varchar(100);not null"`
-	TunnelID    int64         `gorm:"column:tunnel_id;not null"`
-	RemoteAddr  string        `gorm:"column:remote_addr;type:text;not null"`
-	Strategy    string        `gorm:"type:varchar(100);not null;default:'fifo'"`
-	InFlow      int64         `gorm:"not null;default:0"`
-	OutFlow     int64         `gorm:"column:out_flow;not null;default:0"`
-	CreatedTime int64         `gorm:"column:created_time;not null"`
-	UpdatedTime int64         `gorm:"column:updated_time;not null"`
-	Status      int           `gorm:"not null"`
-	Inx         int           `gorm:"not null;default:0"`
-	SpeedID     sql.NullInt64 `gorm:"column:speed_id"`
+	ID                   int64         `gorm:"primaryKey;autoIncrement"`
+	UserID               int64         `gorm:"column:user_id;not null"`
+	UserName             string        `gorm:"column:user_name;type:varchar(100);not null"`
+	Name                 string        `gorm:"type:varchar(100);not null"`
+	TunnelID             int64         `gorm:"column:tunnel_id;not null"`
+	RemoteAddr           string        `gorm:"column:remote_addr;type:text;not null"`
+	Strategy             string        `gorm:"type:varchar(100);not null;default:'fifo'"`
+	InFlow               int64         `gorm:"not null;default:0"`
+	OutFlow              int64         `gorm:"column:out_flow;not null;default:0"`
+	CreatedTime          int64         `gorm:"column:created_time;not null"`
+	UpdatedTime          int64         `gorm:"column:updated_time;not null"`
+	Status               int           `gorm:"not null"`
+	Inx                  int           `gorm:"not null;default:0"`
+	SpeedID              sql.NullInt64 `gorm:"column:speed_id"`
+	MaxConn              int           `gorm:"column:max_conn;not null;default:0"`
+	IPMaxConn            int           `gorm:"column:ip_max_conn;not null;default:0"`
+	IPSpeedID            sql.NullInt64 `gorm:"column:ip_speed_id"`
+	ProxyProtocol        int           `gorm:"column:proxy_protocol;not null;default:0"`
+	ProxyProtocolReceive int           `gorm:"column:proxy_protocol_receive;not null;default:0"`
+	ProxyProtocolSend    int           `gorm:"column:proxy_protocol_send;not null;default:0"`
 }
 
 func (Forward) TableName() string { return "forward" }
@@ -81,6 +90,7 @@ type Node struct {
 	UDPListenAddr           string         `gorm:"column:udp_listen_addr;type:varchar(100);not null;default:'[::]'"`
 	Inx                     int            `gorm:"not null;default:0"`
 	IsRemote                int            `gorm:"column:is_remote;default:0"`
+	ForwardMode             string         `gorm:"column:forward_mode;type:varchar(20);not null;default:'agent'"`
 	RemoteURL               sql.NullString `gorm:"column:remote_url;type:text"`
 	RemoteToken             sql.NullString `gorm:"column:remote_token;type:text"`
 	RemoteConfig            sql.NullString `gorm:"column:remote_config;type:text"`
@@ -88,6 +98,57 @@ type Node struct {
 }
 
 func (Node) TableName() string { return "node" }
+
+type NodeSSHConfig struct {
+	ID          int64          `gorm:"primaryKey;autoIncrement"`
+	NodeID      int64          `gorm:"column:node_id;not null;uniqueIndex"`
+	Host        string         `gorm:"type:varchar(255);not null"`
+	Port        int            `gorm:"not null;default:22"`
+	Username    string         `gorm:"type:varchar(100);not null"`
+	AuthType    string         `gorm:"column:auth_type;type:varchar(20);not null"`
+	Password    sql.NullString `gorm:"type:text"`
+	PrivateKey  sql.NullString `gorm:"column:private_key;type:text"`
+	Passphrase  sql.NullString `gorm:"type:text"`
+	SudoMode    string         `gorm:"column:sudo_mode;type:varchar(20);not null;default:'none'"`
+	CreatedTime int64          `gorm:"column:created_time;not null"`
+	UpdatedTime int64          `gorm:"column:updated_time;not null"`
+}
+
+func (NodeSSHConfig) TableName() string { return "node_ssh_config" }
+
+type NftRuleBinding struct {
+	ID          int64  `gorm:"primaryKey;autoIncrement"`
+	ForwardID   int64  `gorm:"column:forward_id;not null;uniqueIndex:idx_nft_rule_binding_forward_node;index"`
+	NodeID      int64  `gorm:"column:node_id;not null;uniqueIndex:idx_nft_rule_binding_forward_node;index"`
+	InPort      int    `gorm:"column:in_port;not null"`
+	Protocols   string `gorm:"type:varchar(20);not null;default:'tcp,udp'"`
+	TargetAddr  string `gorm:"column:target_addr;type:text;not null"`
+	BindIP      string `gorm:"column:bind_ip;type:text;not null;default:''"`
+	RuleHash    string `gorm:"column:rule_hash;type:varchar(128);not null;default:''"`
+	Status      string `gorm:"type:varchar(20);not null;default:'pending'"`
+	LastError   string `gorm:"column:last_error;type:text;not null;default:''"`
+	AppliedTime int64  `gorm:"column:applied_time;not null;default:0"`
+	CreatedTime int64  `gorm:"column:created_time;not null"`
+	UpdatedTime int64  `gorm:"column:updated_time;not null"`
+}
+
+func (NftRuleBinding) TableName() string { return "nft_rule_binding" }
+
+type NftCounterState struct {
+	ID            int64  `gorm:"primaryKey;autoIncrement"`
+	NodeID        int64  `gorm:"column:node_id;not null;uniqueIndex:idx_nft_counter_state_key;index"`
+	ForwardID     int64  `gorm:"column:forward_id;not null;uniqueIndex:idx_nft_counter_state_key;index"`
+	Protocol      string `gorm:"type:varchar(10);not null;uniqueIndex:idx_nft_counter_state_key"`
+	Direction     string `gorm:"type:varchar(20);not null;uniqueIndex:idx_nft_counter_state_key"`
+	RuleHash      string `gorm:"column:rule_hash;type:varchar(128);not null;default:''"`
+	Bytes         int64  `gorm:"not null;default:0"`
+	Packets       int64  `gorm:"not null;default:0"`
+	CollectedTime int64  `gorm:"column:collected_time;not null;default:0"`
+	CreatedTime   int64  `gorm:"column:created_time;not null"`
+	UpdatedTime   int64  `gorm:"column:updated_time;not null"`
+}
+
+func (NftCounterState) TableName() string { return "nft_counter_state" }
 
 type SpeedLimit struct {
 	ID          int64          `gorm:"primaryKey;autoIncrement"`
@@ -114,18 +175,20 @@ type StatisticsFlow struct {
 func (StatisticsFlow) TableName() string { return "statistics_flow" }
 
 type Tunnel struct {
-	ID           int64          `gorm:"primaryKey;autoIncrement"`
-	Name         string         `gorm:"type:varchar(100);not null"`
-	TrafficRatio float64        `gorm:"column:traffic_ratio;not null;default:1.0"`
-	Type         int            `gorm:"not null"`
-	Protocol     string         `gorm:"type:varchar(10);not null;default:'tls'"`
-	Flow         int64          `gorm:"not null"`
-	CreatedTime  int64          `gorm:"column:created_time;not null"`
-	UpdatedTime  int64          `gorm:"column:updated_time;not null"`
-	Status       int            `gorm:"not null"`
-	InIP         sql.NullString `gorm:"column:in_ip;type:text"`
-	Inx          int            `gorm:"not null;default:0"`
-	IPPreference string         `gorm:"column:ip_preference;type:varchar(10);not null;default:''"`
+	ID              int64          `gorm:"primaryKey;autoIncrement"`
+	Name            string         `gorm:"type:varchar(100);not null"`
+	TrafficRatio    float64        `gorm:"column:traffic_ratio;not null;default:1.0"`
+	Type            int            `gorm:"not null"`
+	Protocol        string         `gorm:"type:varchar(10);not null;default:'tls'"`
+	Flow            int64          `gorm:"not null"`
+	CreatedTime     int64          `gorm:"column:created_time;not null"`
+	UpdatedTime     int64          `gorm:"column:updated_time;not null"`
+	Status          int            `gorm:"not null"`
+	InIP            sql.NullString `gorm:"column:in_ip;type:text"`
+	Inx             int            `gorm:"not null;default:0"`
+	IPPreference    string         `gorm:"column:ip_preference;type:varchar(10);not null;default:''"`
+	ProbeTargetHost string         `gorm:"column:probe_target_host;type:text;not null;default:''"`
+	ProbeTargetPort int            `gorm:"column:probe_target_port;not null;default:0"`
 }
 
 func (Tunnel) TableName() string { return "tunnel" }
@@ -168,6 +231,7 @@ type UserTunnel struct {
 	SpeedID       sql.NullInt64 `gorm:"column:speed_id"`
 	Num           int           `gorm:"not null"`
 	Flow          int64         `gorm:"not null"`
+	FlowMiB       int64         `gorm:"column:flow_mib;not null;default:0"`
 	InFlow        int64         `gorm:"column:in_flow;not null;default:0"`
 	OutFlow       int64         `gorm:"column:out_flow;not null;default:0"`
 	FlowResetTime int64         `gorm:"column:flow_reset_time;not null"`
@@ -290,23 +354,24 @@ type PeerShare struct {
 func (PeerShare) TableName() string { return "peer_share" }
 
 type PeerShareRuntime struct {
-	ID            int64  `gorm:"primaryKey;autoIncrement"`
-	ShareID       int64  `gorm:"column:share_id;not null;index:idx_peer_share_runtime_share_node_status"`
-	NodeID        int64  `gorm:"column:node_id;not null;index:idx_peer_share_runtime_share_node_status"`
-	ReservationID string `gorm:"column:reservation_id;type:text;not null;uniqueIndex"`
-	ResourceKey   string `gorm:"column:resource_key;type:text;not null;uniqueIndex"`
-	BindingID     string `gorm:"column:binding_id;type:text;not null;default:'';index:idx_peer_share_runtime_binding_id"`
-	Role          string `gorm:"type:text;not null;default:''"`
-	ChainName     string `gorm:"column:chain_name;type:text;not null;default:''"`
-	ServiceName   string `gorm:"column:service_name;type:text;not null;default:''"`
-	Protocol      string `gorm:"type:text;not null;default:'tls'"`
-	Strategy      string `gorm:"type:text;not null;default:'round'"`
-	Port          int    `gorm:"not null;default:0"`
-	Target        string `gorm:"type:text;not null;default:''"`
-	Applied       int    `gorm:"not null;default:0"`
-	Status        int    `gorm:"not null;default:1;index:idx_peer_share_runtime_share_node_status"`
-	CreatedTime   int64  `gorm:"column:created_time;not null"`
-	UpdatedTime   int64  `gorm:"column:updated_time;not null"`
+	ID             int64  `gorm:"primaryKey;autoIncrement"`
+	ShareID        int64  `gorm:"column:share_id;not null;index:idx_peer_share_runtime_share_node_status"`
+	NodeID         int64  `gorm:"column:node_id;not null;index:idx_peer_share_runtime_share_node_status"`
+	ReservationID  string `gorm:"column:reservation_id;type:text;not null;uniqueIndex"`
+	ResourceKey    string `gorm:"column:resource_key;type:text;not null;uniqueIndex"`
+	BindingID      string `gorm:"column:binding_id;type:text;not null;default:'';index:idx_peer_share_runtime_binding_id"`
+	Role           string `gorm:"type:text;not null;default:''"`
+	ChainName      string `gorm:"column:chain_name;type:text;not null;default:''"`
+	ServiceName    string `gorm:"column:service_name;type:text;not null;default:''"`
+	Protocol       string `gorm:"type:text;not null;default:'tls'"`
+	Strategy       string `gorm:"type:text;not null;default:'round'"`
+	Port           int    `gorm:"not null;default:0"`
+	Target         string `gorm:"type:text;not null;default:''"`
+	Applied        int    `gorm:"not null;default:0"`
+	ReleasePending int    `gorm:"column:release_pending;not null;default:0"`
+	Status         int    `gorm:"not null;default:1;index:idx_peer_share_runtime_share_node_status"`
+	CreatedTime    int64  `gorm:"column:created_time;not null"`
+	UpdatedTime    int64  `gorm:"column:updated_time;not null"`
 }
 
 func (PeerShareRuntime) TableName() string { return "peer_share_runtime" }
@@ -355,6 +420,7 @@ type UserBackup struct {
 	RoleID          int    `json:"roleId"`
 	ExpTime         int64  `json:"expTime"`
 	Flow            int64  `json:"flow"`
+	FlowMiB         int64  `json:"flowMiB,omitempty"`
 	InFlow          int64  `json:"inFlow"`
 	OutFlow         int64  `json:"outFlow"`
 	FlowResetTime   int64  `json:"flowResetTime"`
@@ -398,19 +464,21 @@ type NodeBackup struct {
 }
 
 type TunnelBackup struct {
-	ID           int64               `json:"id"`
-	Name         string              `json:"name"`
-	TrafficRatio float64             `json:"trafficRatio"`
-	Type         int                 `json:"type"`
-	Protocol     string              `json:"protocol"`
-	Flow         int64               `json:"flow"`
-	CreatedTime  int64               `json:"createdTime"`
-	UpdatedTime  int64               `json:"updatedTime"`
-	Status       int                 `json:"status"`
-	InIP         string              `json:"inIp,omitempty"`
-	Inx          int                 `json:"inx"`
-	IPPreference string              `json:"ipPreference,omitempty"`
-	ChainTunnels []ChainTunnelBackup `json:"chainTunnels,omitempty"`
+	ID              int64               `json:"id"`
+	Name            string              `json:"name"`
+	TrafficRatio    float64             `json:"trafficRatio"`
+	Type            int                 `json:"type"`
+	Protocol        string              `json:"protocol"`
+	Flow            int64               `json:"flow"`
+	CreatedTime     int64               `json:"createdTime"`
+	UpdatedTime     int64               `json:"updatedTime"`
+	Status          int                 `json:"status"`
+	InIP            string              `json:"inIp,omitempty"`
+	Inx             int                 `json:"inx"`
+	IPPreference    string              `json:"ipPreference,omitempty"`
+	ProbeTargetHost string              `json:"probeTargetHost,omitempty"`
+	ProbeTargetPort int                 `json:"probeTargetPort,omitempty"`
+	ChainTunnels    []ChainTunnelBackup `json:"chainTunnels,omitempty"`
 }
 
 type ChainTunnelBackup struct {
@@ -425,21 +493,26 @@ type ChainTunnelBackup struct {
 }
 
 type ForwardBackup struct {
-	ID           int64                `json:"id"`
-	UserID       int64                `json:"userId"`
-	UserName     string               `json:"userName"`
-	Name         string               `json:"name"`
-	TunnelID     int64                `json:"tunnelId"`
-	RemoteAddr   string               `json:"remoteAddr"`
-	Strategy     string               `json:"strategy"`
-	InFlow       int64                `json:"inFlow"`
-	OutFlow      int64                `json:"outFlow"`
-	CreatedTime  int64                `json:"createdTime"`
-	UpdatedTime  int64                `json:"updatedTime"`
-	Status       int                  `json:"status"`
-	Inx          int                  `json:"inx"`
-	SpeedID      *int64               `json:"speedId,omitempty"`
-	ForwardPorts *[]ForwardPortBackup `json:"forwardPorts,omitempty"`
+	ID                   int64                `json:"id"`
+	UserID               int64                `json:"userId"`
+	UserName             string               `json:"userName"`
+	Name                 string               `json:"name"`
+	TunnelID             int64                `json:"tunnelId"`
+	RemoteAddr           string               `json:"remoteAddr"`
+	Strategy             string               `json:"strategy"`
+	InFlow               int64                `json:"inFlow"`
+	OutFlow              int64                `json:"outFlow"`
+	CreatedTime          int64                `json:"createdTime"`
+	UpdatedTime          int64                `json:"updatedTime"`
+	Status               int                  `json:"status"`
+	Inx                  int                  `json:"inx"`
+	SpeedID              *int64               `json:"speedId,omitempty"`
+	IPMaxConn            int                  `json:"ipMaxConn,omitempty"`
+	IPSpeedID            *int64               `json:"ipSpeedId,omitempty"`
+	ForwardPorts         *[]ForwardPortBackup `json:"forwardPorts,omitempty"`
+	ProxyProtocol        int                  `json:"proxyProtocol"`
+	ProxyProtocolReceive int                  `json:"proxyProtocolReceive,omitempty"`
+	ProxyProtocolSend    int                  `json:"proxyProtocolSend,omitempty"`
 }
 
 type ForwardPortBackup struct {
@@ -454,6 +527,7 @@ type UserTunnelBackup struct {
 	SpeedID       int64 `json:"speedId,omitempty"`
 	Num           int   `json:"num"`
 	Flow          int64 `json:"flow"`
+	FlowMiB       int64 `json:"flowMiB,omitempty"`
 	InFlow        int64 `json:"inFlow"`
 	OutFlow       int64 `json:"outFlow"`
 	FlowResetTime int64 `json:"flowResetTime"`
@@ -528,24 +602,33 @@ type ImportResult struct {
 
 // ForwardRecord is a minimal forward view used by control plane and flow policy.
 type ForwardRecord struct {
-	ID         int64
-	UserID     int64
-	UserName   string
-	Name       string
-	TunnelID   int64
-	RemoteAddr string
-	Strategy   string
-	Status     int
-	SpeedID    sql.NullInt64
+	ID                   int64
+	UserID               int64
+	UserName             string
+	Name                 string
+	TunnelID             int64
+	RemoteAddr           string
+	Strategy             string
+	Status               int
+	SpeedID              sql.NullInt64
+	MaxConn              int
+	IPMaxConn            int
+	IPSpeedID            sql.NullInt64
+	ProxyProtocol        int
+	ProxyProtocolReceive int
+	ProxyProtocolSend    int
 }
 
 // TunnelRecord is a minimal tunnel view used by control plane.
 type TunnelRecord struct {
-	ID           int64
-	Type         int
-	Status       int
-	Flow         int64
-	TrafficRatio float64
+	ID              int64
+	Type            int
+	Status          int
+	Flow            int64
+	TrafficRatio    float64
+	Protocol        string
+	ProbeTargetHost string
+	ProbeTargetPort int
 }
 
 type UserQuotaView struct {
@@ -582,6 +665,7 @@ type NodeRecord struct {
 	UDPListenAddr string
 	InterfaceName string
 	IsRemote      int
+	ForwardMode   string
 	RemoteURL     string
 	RemoteToken   string
 	RemoteConfig  string
@@ -627,6 +711,7 @@ type UserTunnelDetail struct {
 	Status        int
 	TunnelFlow    int
 	Flow          int64
+	FlowMiB       int64 `gorm:"column:flow_mib"`
 	InFlow        int64
 	OutFlow       int64
 	Num           int
@@ -732,3 +817,23 @@ type TunnelQuality struct {
 }
 
 func (TunnelQuality) TableName() string { return "tunnel_quality" }
+
+// PeerShareResource is the durable desired state for a namespaced peer command.
+// Rows are retained as tombstones until deletion has been acknowledged.
+type PeerShareResource struct {
+	ID                  int64  `gorm:"primaryKey;autoIncrement"`
+	ShareID             int64  `gorm:"column:share_id;not null;uniqueIndex:idx_peer_share_resource_key"`
+	NodeID              int64  `gorm:"column:node_id;not null;index"`
+	Kind                string `gorm:"type:text;not null;uniqueIndex:idx_peer_share_resource_key"`
+	OriginalName        string `gorm:"column:original_name;type:text;not null;uniqueIndex:idx_peer_share_resource_key"`
+	RuntimeName         string `gorm:"column:runtime_name;type:text;not null;index"`
+	LegacyNames         string `gorm:"column:legacy_names;type:text;not null;default:''"`
+	LegacyServiceBase   string `gorm:"column:legacy_service_base;type:text;not null;default:''"`
+	ReleaseLegacyFamily bool   `gorm:"column:release_legacy_family;not null;default:false"`
+	Config              string `gorm:"type:text;not null;default:''"`
+	DesiredState        string `gorm:"column:desired_state;type:text;not null;default:'active'"`
+	Applied             int    `gorm:"not null;default:0"`
+	UpdatedTime         int64  `gorm:"column:updated_time;not null"`
+}
+
+func (PeerShareResource) TableName() string { return "peer_share_resource" }

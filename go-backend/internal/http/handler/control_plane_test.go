@@ -201,6 +201,52 @@ func TestDeleteForwardServiceCandidatesDeletesAllMatchingVariants(t *testing.T) 
 	}
 }
 
+func TestBuildForwardServiceDeleteNamesBatchesAndDeduplicatesVariants(t *testing.T) {
+	bases := []string{"57_7_7", "57_7_0", "57_7_7"}
+	got := buildForwardServiceDeleteNames(bases)
+	want := []string{"57_7_7_tcp", "57_7_7_udp", "57_7_7", "57_7_0_tcp", "57_7_0_udp", "57_7_0"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestRemovedTunnelRuntimeNodeIDsSeparatesChainAndServiceRoles(t *testing.T) {
+	oldRows := []chainNodeRecord{
+		{NodeID: 1, ChainType: 1},
+		{NodeID: 2, ChainType: 2},
+		{NodeID: 3, ChainType: 3},
+		{NodeID: 5, ChainType: 2},
+		{NodeID: 6, ChainType: 3},
+	}
+	newRows := []chainNodeRecord{
+		{NodeID: 2, ChainType: 3},
+		{NodeID: 3, ChainType: 3},
+		{NodeID: 5, ChainType: 1},
+	}
+
+	removedChains := removedTunnelRuntimeNodeIDs(oldRows, newRows, tunnelRuntimeNeedsChain)
+	if want := []int64{1, 2}; !reflect.DeepEqual(removedChains, want) {
+		t.Fatalf("expected removed chains %v, got %v", want, removedChains)
+	}
+
+	removedServices := removedTunnelRuntimeNodeIDs(oldRows, newRows, tunnelRuntimeNeedsService)
+	if want := []int64{5, 6}; !reflect.DeepEqual(removedServices, want) {
+		t.Fatalf("expected removed services %v, got %v", want, removedServices)
+	}
+}
+
+func TestTunnelForwardRuntimeNeedsSyncOnlyWhenTypeOrEntriesChange(t *testing.T) {
+	if tunnelForwardRuntimeNeedsSync(2, 2, []int64{1, 2}, []int64{2, 1}) {
+		t.Fatalf("same tunnel type and same entry set should not resync forwards")
+	}
+	if !tunnelForwardRuntimeNeedsSync(1, 2, []int64{1}, []int64{1}) {
+		t.Fatalf("type change should resync forwards")
+	}
+	if !tunnelForwardRuntimeNeedsSync(2, 2, []int64{1}, []int64{1, 2}) {
+		t.Fatalf("entry set change should resync forwards")
+	}
+}
+
 func TestValidateForwardPortAvailabilityRejectsOtherForwardOccupancy(t *testing.T) {
 	h := &Handler{repo: nil}
 	node := &nodeRecord{ID: 9, Name: "test-node"}
@@ -378,7 +424,7 @@ func TestRetryTunnelServiceAddWithCleanupReturnsCleanupError(t *testing.T) {
 func TestBuildForwardServiceConfigs_UsesBindIPForListen(t *testing.T) {
 	forward := &forwardRecord{RemoteAddr: "1.2.3.4:80", Strategy: "fifo", TunnelID: 7}
 	node := &nodeRecord{TCPListenAddr: "[::]", UDPListenAddr: "[::]"}
-	services := buildForwardServiceConfigs("1_2_0", forward, nil, node, 22000, "10.9.8.7", nil, false)
+	services := buildForwardServiceConfigs("1_2_0", forward, nil, node, 22000, "10.9.8.7", forwardRuntimeLimiters{})
 	if len(services) != 2 {
 		t.Fatalf("expected 2 services, got %d", len(services))
 	}
@@ -393,7 +439,7 @@ func TestBuildForwardServiceConfigs_UsesBindIPForListen(t *testing.T) {
 func TestBuildForwardServiceConfigs_DefaultListenAddrWhenBindIPEmpty(t *testing.T) {
 	forward := &forwardRecord{RemoteAddr: "1.2.3.4:80", Strategy: "fifo", TunnelID: 7}
 	node := &nodeRecord{TCPListenAddr: "0.0.0.0", UDPListenAddr: "[::]"}
-	services := buildForwardServiceConfigs("1_2_0", forward, nil, node, 22001, "", nil, false)
+	services := buildForwardServiceConfigs("1_2_0", forward, nil, node, 22001, "", forwardRuntimeLimiters{})
 	if len(services) != 2 {
 		t.Fatalf("expected 2 services, got %d", len(services))
 	}
@@ -409,7 +455,7 @@ func TestBuildForwardServiceConfigs_DefaultListenAddrWhenBindIPEmpty(t *testing.
 func TestBuildForwardServiceConfigs_BindIPAlreadyContainsPort(t *testing.T) {
 	forward := &forwardRecord{RemoteAddr: "1.2.3.4:80", Strategy: "fifo", TunnelID: 7}
 	node := &nodeRecord{TCPListenAddr: "[::]", UDPListenAddr: "[::]"}
-	services := buildForwardServiceConfigs("1_2_0", forward, nil, node, 55555, "3.3.3.3:12345", nil, false)
+	services := buildForwardServiceConfigs("1_2_0", forward, nil, node, 55555, "3.3.3.3:12345", forwardRuntimeLimiters{})
 	if len(services) != 2 {
 		t.Fatalf("expected 2 services, got %d", len(services))
 	}
@@ -464,7 +510,7 @@ func TestBuildForwardServiceConfigs_IPv6BindIP(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			forward := &forwardRecord{RemoteAddr: "1.2.3.4:80", Strategy: "fifo", TunnelID: 7}
 			node := &nodeRecord{TCPListenAddr: "[::]", UDPListenAddr: "[::]"}
-			services := buildForwardServiceConfigs("1_2_0", forward, nil, node, tt.port, tt.bindIP, nil, false)
+			services := buildForwardServiceConfigs("1_2_0", forward, nil, node, tt.port, tt.bindIP, forwardRuntimeLimiters{})
 			if len(services) != 2 {
 				t.Fatalf("expected 2 services, got %d", len(services))
 			}
@@ -477,6 +523,58 @@ func TestBuildForwardServiceConfigs_IPv6BindIP(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildConnLimiterConfigCombinesTotalAndPerIP(t *testing.T) {
+	cfgs := buildConnLimiterConfigs(&forwardRecord{ID: 42, UserID: 9, MaxConn: 100, IPMaxConn: 5}, 37)
+	want := []forwardLimiterConfig{{Name: "rule_conn_limit_42", Limits: []string{"$ 100", "$$ 5"}}}
+	if !reflect.DeepEqual(cfgs, want) {
+		t.Fatalf("expected %+v, got %+v", want, cfgs)
+	}
+}
+
+func TestBuildConnLimiterConfigUsesUserTotalWithRulePerIP(t *testing.T) {
+	cfgs := buildConnLimiterConfigs(&forwardRecord{ID: 42, UserID: 9, IPMaxConn: 5}, 37)
+	want := []forwardLimiterConfig{
+		{Name: "user_conn_limit_9", Limits: []string{"$ 37"}},
+		{Name: "rule_conn_limit_42", Limits: []string{"$$ 5"}},
+	}
+	if !reflect.DeepEqual(cfgs, want) {
+		t.Fatalf("expected %+v, got %+v", want, cfgs)
+	}
+	if got := joinLimiterNames(cfgs); got != "user_conn_limit_9,rule_conn_limit_42" {
+		t.Fatalf("expected composite limiter names, got %q", got)
+	}
+}
+
+func TestBuildTrafficLimiterPayloadUsesOnlyPerIPRulesWhenTotalIsSeparate(t *testing.T) {
+	payload := buildTrafficLimiterPayload("rule_traffic_limit_42", nil, intPtr(40))
+	wantLimits := []string{"0.0.0.0/0 5.0MB 5.0MB", "::/0 5.0MB 5.0MB"}
+	if payload["name"] != "rule_traffic_limit_42" {
+		t.Fatalf("expected name rule_traffic_limit_42, got %v", payload["name"])
+	}
+	if !reflect.DeepEqual(payload["limits"], wantLimits) {
+		t.Fatalf("expected limits %v, got %v", wantLimits, payload["limits"])
+	}
+}
+
+func TestBuildForwardServiceConfigsUsesRuntimeLimiterNames(t *testing.T) {
+	forward := &forwardRecord{RemoteAddr: "1.2.3.4:80", Strategy: "fifo", TunnelID: 7}
+	node := &nodeRecord{TCPListenAddr: "0.0.0.0", UDPListenAddr: "[::]"}
+	services := buildForwardServiceConfigs("1_2_0", forward, nil, node, 22001, "", forwardRuntimeLimiters{TrafficLimiter: "rule_traffic_limit_42", ConnLimiter: "rule_conn_limit_42"})
+	if len(services) != 2 {
+		t.Fatalf("expected 2 services, got %d", len(services))
+	}
+	for _, service := range services {
+		if service["limiter"] != "rule_traffic_limit_42" {
+			t.Fatalf("expected traffic limiter rule_traffic_limit_42, got %v", service["limiter"])
+		}
+		if service["climiter"] != "rule_conn_limit_42" {
+			t.Fatalf("expected conn limiter rule_conn_limit_42, got %v", service["climiter"])
+		}
+	}
+}
+
+func intPtr(v int) *int { return &v }
 
 func TestProcessServerAddress_StripsURLSchemeAndPath(t *testing.T) {
 	tests := []struct {

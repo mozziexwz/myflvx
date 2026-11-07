@@ -31,34 +31,32 @@ func createChain(req createChainRequest) error {
 		return errors.New("chain " + name + " already exists")
 	}
 
-	config.OnUpdate(func(c *config.Config) error {
+	return config.OnUpdate(func(c *config.Config) error {
 		c.Chains = append(c.Chains, &req.Data)
 		return nil
 	})
-
-	return nil
 }
 
 func updateChain(req updateChainRequest) error {
-
 	name := strings.TrimSpace(req.Chain)
-
-	if registry.ChainRegistry().IsRegistered(name) {
-		registry.ChainRegistry().Unregister(name)
+	if name == "" {
+		name = strings.TrimSpace(req.Data.Name)
+	}
+	if name == "" {
+		return errors.New("chain name is required")
 	}
 
 	req.Data.Name = name
-
 	v, err := parser.ParseChain(&req.Data, logger.Default())
 	if err != nil {
 		return errors.New("create chain " + name + " failed: " + err.Error())
 	}
 
-	if err := registry.ChainRegistry().Register(name, v); err != nil {
+	if err := registry.ReplaceChain(name, v); err != nil {
 		return errors.New("chain " + name + " already exists")
 	}
 
-	config.OnUpdate(func(c *config.Config) error {
+	return config.OnUpdate(func(c *config.Config) error {
 		found := false
 		for i := range c.Chains {
 			if c.Chains[i].Name == name {
@@ -72,8 +70,6 @@ func updateChain(req updateChainRequest) error {
 		}
 		return nil
 	})
-
-	return nil
 }
 
 func deleteChain(req deleteChainRequest) error {
@@ -84,7 +80,7 @@ func deleteChain(req deleteChainRequest) error {
 		registry.ChainRegistry().Unregister(name)
 	}
 
-	config.OnUpdate(func(c *config.Config) error {
+	return config.OnUpdate(func(c *config.Config) error {
 		chains := c.Chains
 		c.Chains = nil
 		for _, s := range chains {
@@ -95,8 +91,6 @@ func deleteChain(req deleteChainRequest) error {
 		}
 		return nil
 	})
-
-	return nil
 }
 
 type createChainRequest struct {

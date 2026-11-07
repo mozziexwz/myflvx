@@ -2,8 +2,11 @@ package handler
 
 import (
 	"context"
+	"log"
 	"time"
 )
+
+var nftablesTrafficCollectInterval = 30 * time.Second
 
 func (h *Handler) StartBackgroundJobs() {
 	if h == nil || h.repo == nil {
@@ -18,7 +21,7 @@ func (h *Handler) StartBackgroundJobs() {
 	ctx, cancel := context.WithCancel(context.Background())
 	h.jobsCancel = cancel
 	h.jobsStarted = true
-	h.jobsWG.Add(6)
+	h.jobsWG.Add(8)
 	h.jobsMu.Unlock()
 
 	go h.runHourlyStatsLoop(ctx)
@@ -27,6 +30,50 @@ func (h *Handler) StartBackgroundJobs() {
 	go h.runMetricsIngestion(ctx)
 	go h.runHealthChecks(ctx)
 	go h.runTunnelQualityProber(ctx)
+	go h.runNftablesTrafficCollectLoop(ctx)
+	go h.runFederationCleanupRetryLoop(ctx)
+}
+
+func (h *Handler) runFederationCleanupRetryLoop(ctx context.Context) {
+	defer h.jobsWG.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if err := h.retryPendingFederationRuntimeCleanup(); err != nil {
+			log.Printf("federation cleanup remains pending: %v", err)
+		}
+		h.retryPendingPeerShareOperations()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *Handler) retryPendingPeerShareOperations() {
+	nodeIDs, err := h.repo.ListPendingPeerShareNodeIDs()
+	if err != nil {
+		log.Printf("peer share pending operation lookup failed: %v", err)
+		return
+	}
+	for _, nodeID := range nodeIDs {
+		node, err := h.repo.GetNodeByID(nodeID)
+		if err != nil || node == nil || node.Status != 1 {
+			continue
+		}
+		if err := h.retryPendingPeerShareResourcesOnNode(nodeID); err != nil {
+			log.Printf("peer share resource retry failed node_id=%d err=%v", nodeID, err)
+		}
+		if err := h.retryPendingPeerShareRoleRuntimesOnNode(nodeID); err != nil {
+			log.Printf("peer share role retry failed node_id=%d err=%v", nodeID, err)
+		}
+	}
 }
 
 func (h *Handler) StopBackgroundJobs() {
@@ -66,11 +113,59 @@ func (h *Handler) runHealthChecks(ctx context.Context) {
 
 func (h *Handler) runTunnelQualityProber(ctx context.Context) {
 	defer h.jobsWG.Done()
-	if h == nil || h.qualityProber == nil || !h.isTunnelQualityMonitoringEnabled() {
+	if h == nil || h.qualityProber == nil {
 		return
 	}
 
 	h.qualityProber.Start(ctx)
+}
+
+func (h *Handler) runNftablesTrafficCollectLoop(ctx context.Context) {
+	defer h.jobsWG.Done()
+	h.runNftablesStartupReconcile(ctx)
+	select {
+	case <-ctx.Done():
+		return
+	default:
+		h.runNftablesTrafficCollectJob(time.Now())
+	}
+
+	interval := nftablesTrafficCollectInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.runNftablesTrafficCollectJob(time.Now())
+		}
+	}
+}
+
+func (h *Handler) runNftablesStartupReconcile(ctx context.Context) {
+	if h == nil || h.repo == nil {
+		return
+	}
+	nodes, err := h.repo.ListNftablesNodesForCollection()
+	if err != nil {
+		log.Printf("nftables startup reconcile failed op=list_nodes err=%v", err)
+		return
+	}
+	for _, node := range nodes {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if err := h.syncNftablesNode(node.NodeID); err != nil {
+			log.Printf("nftables startup reconcile failed node_id=%d err=%v", node.NodeID, err)
+		}
+	}
 }
 
 func (h *Handler) runHourlyStatsLoop(ctx context.Context) {

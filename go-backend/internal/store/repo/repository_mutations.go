@@ -37,23 +37,33 @@ func (r *Repository) UserExistsExcluding(username string, excludeID int64) (bool
 	return cnt > 0, err
 }
 
-func (r *Repository) CreateUser(username, pwdHash string, roleID int, expTime, flow, flowResetTime int64, num, status int, now int64) (int64, error) {
+func optionalFlowMiB(values []int64) int64 {
+	if len(values) > 0 {
+		return values[0]
+	}
+	return 0
+}
+
+func (r *Repository) CreateUser(username, pwdHash string, roleID int, expTime, flow, flowResetTime int64, num, status, maxConn int, now int64, flowMiB ...int64) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("repository not initialized")
 	}
 	user := model.User{
-		User:          username,
-		Pwd:           pwdHash,
-		RoleID:        roleID,
-		ExpTime:       expTime,
-		Flow:          flow,
-		InFlow:        0,
-		OutFlow:       0,
-		FlowResetTime: flowResetTime,
-		Num:           num,
-		CreatedTime:   now,
-		UpdatedTime:   sql.NullInt64{Int64: now, Valid: true},
-		Status:        status,
+		User:              username,
+		Pwd:               pwdHash,
+		RoleID:            roleID,
+		ExpTime:           expTime,
+		Flow:              flow,
+		FlowMiB:           optionalFlowMiB(flowMiB),
+		InFlow:            0,
+		OutFlow:           0,
+		FlowResetTime:     flowResetTime,
+		Num:               num,
+		MaxConn:           maxConn,
+		CreatedTime:       now,
+		UpdatedTime:       sql.NullInt64{Int64: now, Valid: true},
+		Status:            status,
+		PasswordChangedAt: now,
 	}
 	if err := r.db.Create(&user).Error; err != nil {
 		return 0, err
@@ -73,7 +83,28 @@ func (r *Repository) GetUserRoleID(userID int64) (int, error) {
 	return user.RoleID, nil
 }
 
-func (r *Repository) UpdateUserWithPassword(id int64, username, pwdHash string, flow int64, num int, expTime, flowResetTime int64, status int, now int64) error {
+func (r *Repository) UpdateUserWithPassword(id int64, username, pwdHash string, flow int64, num int, expTime, flowResetTime int64, status, maxConn int, now int64, flowMiB ...int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.User{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"user":                username,
+			"pwd":                 pwdHash,
+			"flow":                flow,
+			"flow_mib":            optionalFlowMiB(flowMiB),
+			"num":                 num,
+			"exp_time":            expTime,
+			"flow_reset_time":     flowResetTime,
+			"status":              status,
+			"max_conn":            maxConn,
+			"password_changed_at": now,
+			"updated_time":        sql.NullInt64{Int64: now, Valid: true},
+		}).Error
+}
+
+func (r *Repository) UpdateUserWithoutPassword(id int64, username string, flow int64, num int, expTime, flowResetTime int64, status, maxConn int, now int64, flowMiB ...int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
@@ -81,34 +112,31 @@ func (r *Repository) UpdateUserWithPassword(id int64, username, pwdHash string, 
 		Where("id = ?", id).
 		Updates(map[string]interface{}{
 			"user":            username,
-			"pwd":             pwdHash,
 			"flow":            flow,
+			"flow_mib":        optionalFlowMiB(flowMiB),
 			"num":             num,
 			"exp_time":        expTime,
 			"flow_reset_time": flowResetTime,
 			"status":          status,
+			"max_conn":        maxConn,
 			"updated_time":    sql.NullInt64{Int64: now, Valid: true},
 		}).Error
 }
 
-func (r *Repository) UpdateUserWithoutPassword(id int64, username string, flow int64, num int, expTime, flowResetTime int64, status int, now int64) error {
+func (r *Repository) UpdateUserPassword(userID int64, pwdHash string, now int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
 	return r.db.Model(&model.User{}).
-		Where("id = ?", id).
+		Where("id = ?", userID).
 		Updates(map[string]interface{}{
-			"user":            username,
-			"flow":            flow,
-			"num":             num,
-			"exp_time":        expTime,
-			"flow_reset_time": flowResetTime,
-			"status":          status,
-			"updated_time":    sql.NullInt64{Int64: now, Valid: true},
+			"pwd":                 pwdHash,
+			"password_changed_at": now,
+			"updated_time":        sql.NullInt64{Int64: now, Valid: true},
 		}).Error
 }
 
-func (r *Repository) PropagateUserFlowToTunnels(userID int64, flow int64, num int, expTime, flowResetTime int64) {
+func (r *Repository) PropagateUserFlowToTunnels(userID int64, flow int64, num int, expTime, flowResetTime int64, flowMiB ...int64) {
 	if r == nil || r.db == nil {
 		return
 	}
@@ -116,10 +144,18 @@ func (r *Repository) PropagateUserFlowToTunnels(userID int64, flow int64, num in
 		Where("user_id = ?", userID).
 		Updates(map[string]interface{}{
 			"flow":            flow,
+			"flow_mib":        optionalFlowMiB(flowMiB),
 			"num":             num,
 			"exp_time":        expTime,
 			"flow_reset_time": flowResetTime,
 		}).Error
+}
+
+func (r *Repository) DisableUserTunnels(userID int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.UserTunnel{}).Where("user_id = ?", userID).Update("status", 0).Error
 }
 
 func (r *Repository) DeleteUserCascade(userID int64) error {
@@ -127,6 +163,9 @@ func (r *Repository) DeleteUserCascade(userID int64) error {
 		return errors.New("repository not initialized")
 	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("user_id = ?", userID).Delete(&model.Passkey{}).Error; err != nil {
+			return err
+		}
 		forwardIDs := tx.Model(&model.Forward{}).Select("id").Where("user_id = ?", userID)
 		if err := tx.Where("forward_id IN (?)", forwardIDs).Delete(&model.ForwardPort{}).Error; err != nil {
 			return err
@@ -179,6 +218,19 @@ func (r *Repository) ResetUserFlowByUserTunnel(userTunnelID int64) {
 		Updates(map[string]interface{}{"in_flow": 0, "out_flow": 0}).Error
 }
 
+func (r *Repository) ResetForwardFlow(forwardID int64, now int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.Forward{}).
+		Where("id = ?", forwardID).
+		Updates(map[string]interface{}{
+			"in_flow":      0,
+			"out_flow":     0,
+			"updated_time": now,
+		}).Error
+}
+
 func (r *Repository) GetUsernameByID(userID int64) string {
 	if r == nil || r.db == nil {
 		return ""
@@ -202,7 +254,7 @@ func (r *Repository) GetUserDefaultsForTunnel(userID int64) (flow int64, num int
 	return user.Flow, user.Num, user.ExpTime, user.FlowResetTime, nil
 }
 
-func (r *Repository) CreateNode(name, secret, serverIP string, serverIPV4, serverIPV6, port, interfaceName, version, remark, expiryTime, renewalCycle interface{}, httpFlag, tlsFlag, socksFlag int, now int64, status int, tcpAddr, udpAddr string, inx, isRemote int, remoteURL, remoteToken, remoteConfig, extraIPs interface{}) error {
+func (r *Repository) CreateNode(name, secret, serverIP string, serverIPV4, serverIPV6, port, interfaceName, version, remark, expiryTime, renewalCycle interface{}, httpFlag, tlsFlag, socksFlag int, now int64, status int, tcpAddr, udpAddr string, inx, isRemote int, remoteURL, remoteToken, remoteConfig, extraIPs interface{}, forwardMode string) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
@@ -229,6 +281,7 @@ func (r *Repository) CreateNode(name, secret, serverIP string, serverIPV4, serve
 		UDPListenAddr: udpAddr,
 		Inx:           inx,
 		IsRemote:      isRemote,
+		ForwardMode:   defaultNodeForwardMode(forwardMode),
 		RemoteURL:     nullStringFromInterface(remoteURL),
 		RemoteToken:   nullStringFromInterface(remoteToken),
 		RemoteConfig:  nullStringFromInterface(remoteConfig),
@@ -248,31 +301,44 @@ func (r *Repository) GetNodeStatusFields(nodeID int64) (status, httpFlag, tlsFla
 	return node.Status, node.HTTP, node.TLS, node.Socks, nil
 }
 
-func (r *Repository) UpdateNode(id int64, name, serverIP string, serverIPV4, serverIPV6, port, interfaceName, extraIPs, remark, expiryTime, renewalCycle interface{}, httpFlag, tlsFlag, socksFlag int, tcpAddr, udpAddr string, now int64) error {
+func (r *Repository) UpdateNode(id int64, name, serverIP string, serverIPV4, serverIPV6, port, interfaceName, extraIPs, remark, expiryTime, renewalCycle interface{}, forwardMode string, httpFlag, tlsFlag, socksFlag int, tcpAddr, udpAddr string, now int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
+	updates := map[string]interface{}{
+		"name":                      name,
+		"remark":                    nullStringFromInterface(remark),
+		"expiry_time":               nullInt64FromInterface(expiryTime),
+		"renewal_cycle":             nullStringFromInterface(renewalCycle),
+		"server_ip":                 serverIP,
+		"server_ip_v4":              nullStringFromInterface(serverIPV4),
+		"server_ip_v6":              nullStringFromInterface(serverIPV6),
+		"extra_ips":                 nullStringFromInterface(extraIPs),
+		"port":                      stringFromInterface(port),
+		"interface_name":            nullStringFromInterface(interfaceName),
+		"http":                      httpFlag,
+		"tls":                       tlsFlag,
+		"socks":                     socksFlag,
+		"tcp_listen_addr":           tcpAddr,
+		"udp_listen_addr":           udpAddr,
+		"updated_time":              sql.NullInt64{Int64: now, Valid: true},
+		"expiry_reminder_dismissed": 0,
+	}
+	if strings.TrimSpace(forwardMode) != "" {
+		updates["forward_mode"] = defaultNodeForwardMode(forwardMode)
+	}
 	return r.db.Model(&model.Node{}).
 		Where("id = ?", id).
-		Updates(map[string]interface{}{
-			"name":                      name,
-			"remark":                    nullStringFromInterface(remark),
-			"expiry_time":               nullInt64FromInterface(expiryTime),
-			"renewal_cycle":             nullStringFromInterface(renewalCycle),
-			"server_ip":                 serverIP,
-			"server_ip_v4":              nullStringFromInterface(serverIPV4),
-			"server_ip_v6":              nullStringFromInterface(serverIPV6),
-			"extra_ips":                 nullStringFromInterface(extraIPs),
-			"port":                      stringFromInterface(port),
-			"interface_name":            nullStringFromInterface(interfaceName),
-			"http":                      httpFlag,
-			"tls":                       tlsFlag,
-			"socks":                     socksFlag,
-			"tcp_listen_addr":           tcpAddr,
-			"udp_listen_addr":           udpAddr,
-			"updated_time":              sql.NullInt64{Int64: now, Valid: true},
-			"expiry_reminder_dismissed": 0,
-		}).Error
+		Updates(updates).Error
+}
+
+func defaultNodeForwardMode(mode string) string {
+	switch strings.TrimSpace(strings.ToLower(mode)) {
+	case "nftables":
+		return "nftables"
+	default:
+		return "agent"
+	}
 }
 
 func (r *Repository) GetNodeSecret(nodeID int64) (string, error) {
@@ -394,21 +460,24 @@ func (r *Repository) UpdateTunnelOrder(tunnelID int64, inx int, now int64) {
 		Updates(map[string]interface{}{"inx": inx, "updated_time": now}).Error
 }
 
-func (r *Repository) UpdateTunnelTx(tx *gorm.DB, tunnelID int64, name string, typeVal int, flow int64, trafficRatio float64, status int, inIP, ipPreference string, now int64) error {
+func (r *Repository) UpdateTunnelTx(tx *gorm.DB, tunnelID int64, name string, typeVal int, flow int64, trafficRatio float64, status int, inIP, ipPreference string, protocol string, probeTargetHost string, probeTargetPort int, now int64) error {
 	if tx == nil {
 		return errors.New("database unavailable")
 	}
 	return tx.Model(&model.Tunnel{}).
 		Where("id = ?", tunnelID).
 		Updates(map[string]interface{}{
-			"name":          name,
-			"type":          typeVal,
-			"flow":          flow,
-			"traffic_ratio": trafficRatio,
-			"status":        status,
-			"in_ip":         nullStringFromInterface(inIP),
-			"ip_preference": ipPreference,
-			"updated_time":  now,
+			"name":              name,
+			"type":              typeVal,
+			"flow":              flow,
+			"traffic_ratio":     trafficRatio,
+			"status":            status,
+			"in_ip":             nullStringFromInterface(inIP),
+			"ip_preference":     ipPreference,
+			"protocol":          protocol,
+			"probe_target_host": probeTargetHost,
+			"probe_target_port": probeTargetPort,
+			"updated_time":      now,
 		}).Error
 }
 
@@ -602,7 +671,7 @@ func (r *Repository) DeleteUserTunnel(id int64) error {
 	return r.db.Where("id = ?", id).Delete(&model.UserTunnel{}).Error
 }
 
-func (r *Repository) UpdateUserTunnel(id int64, flow int64, num int, expTime, flowResetTime int64, speedID interface{}, status int) error {
+func (r *Repository) UpdateUserTunnel(id int64, flow int64, num int, expTime, flowResetTime int64, speedID interface{}, status int, flowMiB ...int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
@@ -610,6 +679,7 @@ func (r *Repository) UpdateUserTunnel(id int64, flow int64, num int, expTime, fl
 		Where("id = ?", id).
 		Updates(map[string]interface{}{
 			"flow":            flow,
+			"flow_mib":        optionalFlowMiB(flowMiB),
 			"num":             num,
 			"exp_time":        expTime,
 			"flow_reset_time": flowResetTime,
@@ -644,7 +714,7 @@ func (r *Repository) GetExistingUserTunnel(userID, tunnelID int64) (id int64, fl
 	return ut.ID, ut.Flow, int64(ut.Num), ut.ExpTime, ut.FlowResetTime, ut.SpeedID, ut.Status, nil
 }
 
-func (r *Repository) InsertUserTunnel(userID, tunnelID int64, speedID interface{}, num int, flow, flowResetTime, expTime int64, status int) error {
+func (r *Repository) InsertUserTunnel(userID, tunnelID int64, speedID interface{}, num int, flow, flowResetTime, expTime int64, status int, flowMiB ...int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
@@ -654,6 +724,7 @@ func (r *Repository) InsertUserTunnel(userID, tunnelID int64, speedID interface{
 		SpeedID:       nullInt64FromInterface(speedID),
 		Num:           num,
 		Flow:          flow,
+		FlowMiB:       optionalFlowMiB(flowMiB),
 		InFlow:        0,
 		OutFlow:       0,
 		FlowResetTime: flowResetTime,
@@ -663,7 +734,7 @@ func (r *Repository) InsertUserTunnel(userID, tunnelID int64, speedID interface{
 	return r.db.Create(&ut).Error
 }
 
-func (r *Repository) UpdateUserTunnelFields(id int64, speedID interface{}, flow int64, num int, expTime, flowResetTime int64, status int) error {
+func (r *Repository) UpdateUserTunnelFields(id int64, speedID interface{}, flow int64, num int, expTime, flowResetTime int64, status int, flowMiB ...int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
@@ -672,6 +743,7 @@ func (r *Repository) UpdateUserTunnelFields(id int64, speedID interface{}, flow 
 		Updates(map[string]interface{}{
 			"speed_id":        nullInt64FromInterface(speedID),
 			"flow":            flow,
+			"flow_mib":        optionalFlowMiB(flowMiB),
 			"num":             num,
 			"exp_time":        expTime,
 			"flow_reset_time": flowResetTime,
@@ -691,19 +763,26 @@ func (r *Repository) GetMinForwardPort(forwardID int64) sql.NullInt64 {
 	return p
 }
 
-func (r *Repository) UpdateForward(id int64, name string, tunnelID int64, remoteAddr, strategy string, now int64, speedID interface{}) error {
+func (r *Repository) UpdateForward(id int64, name string, tunnelID int64, remoteAddr, strategy string, now int64, speedID interface{}, maxConn int, ipMaxConn int, ipSpeedID interface{}, proxyProtocol int, proxyProtocolReceive int, proxyProtocolSend int) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
+	_, proxyProtocolSend = normalizeForwardProxyProtocol(proxyProtocol, proxyProtocolReceive, proxyProtocolSend)
 	return r.db.Model(&model.Forward{}).
 		Where("id = ?", id).
 		Updates(map[string]interface{}{
-			"name":         name,
-			"tunnel_id":    tunnelID,
-			"remote_addr":  remoteAddr,
-			"strategy":     strategy,
-			"speed_id":     nullInt64FromInterface(speedID),
-			"updated_time": now,
+			"name":                   name,
+			"tunnel_id":              tunnelID,
+			"remote_addr":            remoteAddr,
+			"strategy":               strategy,
+			"speed_id":               nullInt64FromInterface(speedID),
+			"max_conn":               maxConn,
+			"ip_max_conn":            ipMaxConn,
+			"ip_speed_id":            nullInt64FromInterface(ipSpeedID),
+			"proxy_protocol":         proxyProtocol,
+			"proxy_protocol_receive": proxyProtocolReceive,
+			"proxy_protocol_send":    proxyProtocolSend,
+			"updated_time":           now,
 		}).Error
 }
 
@@ -730,6 +809,9 @@ func (r *Repository) DeleteForwardCascade(forwardID int64) error {
 		return errors.New("repository not initialized")
 	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("forward_id = ?", forwardID).Delete(&model.NftCounterState{}).Error; err != nil {
+			return err
+		}
 		if err := tx.Where("forward_id = ?", forwardID).Delete(&model.ForwardPort{}).Error; err != nil {
 			return err
 		}
@@ -777,22 +859,29 @@ func (r *Repository) UpdateForwardPortBindIP(forwardID, nodeID int64, port int, 
 		Update("in_ip", sql.NullString{String: inIP, Valid: strings.TrimSpace(inIP) != ""}).Error
 }
 
-func (r *Repository) RollbackForwardFields(id, userID int64, userName, name string, tunnelID int64, remoteAddr, strategy string, status int, speedID interface{}, now int64) {
+func (r *Repository) RollbackForwardFields(id, userID int64, userName, name string, tunnelID int64, remoteAddr, strategy string, status int, speedID interface{}, maxConn int, ipMaxConn int, ipSpeedID interface{}, proxyProtocol int, proxyProtocolReceive int, proxyProtocolSend int, now int64) {
 	if r == nil || r.db == nil {
 		return
 	}
+	_, proxyProtocolSend = normalizeForwardProxyProtocol(proxyProtocol, proxyProtocolReceive, proxyProtocolSend)
 	_ = r.db.Model(&model.Forward{}).
 		Where("id = ?", id).
 		Updates(map[string]interface{}{
-			"user_id":      userID,
-			"user_name":    userName,
-			"name":         name,
-			"tunnel_id":    tunnelID,
-			"remote_addr":  remoteAddr,
-			"strategy":     strategy,
-			"status":       status,
-			"speed_id":     nullInt64FromInterface(speedID),
-			"updated_time": now,
+			"user_id":                userID,
+			"user_name":              userName,
+			"name":                   name,
+			"tunnel_id":              tunnelID,
+			"remote_addr":            remoteAddr,
+			"strategy":               strategy,
+			"status":                 status,
+			"speed_id":               nullInt64FromInterface(speedID),
+			"max_conn":               maxConn,
+			"ip_max_conn":            ipMaxConn,
+			"ip_speed_id":            nullInt64FromInterface(ipSpeedID),
+			"proxy_protocol":         proxyProtocol,
+			"proxy_protocol_receive": proxyProtocolReceive,
+			"proxy_protocol_send":    proxyProtocolSend,
+			"updated_time":           now,
 		}).Error
 }
 
@@ -1228,7 +1317,7 @@ func (r *Repository) EnsureUserTunnelGrant(userID, tunnelID int64) (int64, bool,
 		return 0, false, err
 	}
 	var user model.User
-	if err := r.db.Select("flow, num, exp_time, flow_reset_time").Where("id = ?", userID).First(&user).Error; err != nil {
+	if err := r.db.Select("flow, flow_mib, num, exp_time, flow_reset_time").Where("id = ?", userID).First(&user).Error; err != nil {
 		return 0, false, err
 	}
 	flow := user.Flow
@@ -1240,6 +1329,7 @@ func (r *Repository) EnsureUserTunnelGrant(userID, tunnelID int64) (int64, bool,
 		TunnelID:      tunnelID,
 		Num:           num,
 		Flow:          flow,
+		FlowMiB:       user.FlowMiB,
 		InFlow:        0,
 		OutFlow:       0,
 		FlowResetTime: flowReset,
@@ -1252,26 +1342,33 @@ func (r *Repository) EnsureUserTunnelGrant(userID, tunnelID int64) (int64, bool,
 	return ut.ID, true, nil
 }
 
-func (r *Repository) CreateForwardTx(userID int64, userName, name string, tunnelID int64, remoteAddr, strategy string, now int64, inx int, entryNodeIDs []int64, port int, inIp string, speedID interface{}) (int64, error) {
+func (r *Repository) CreateForwardTx(userID int64, userName, name string, tunnelID int64, remoteAddr, strategy string, now int64, inx int, entryNodeIDs []int64, port int, inIp string, speedID interface{}, maxConn int, ipMaxConn int, ipSpeedID interface{}, proxyProtocol int, proxyProtocolReceive int, proxyProtocolSend int) (int64, error) {
 	if r == nil || r.db == nil {
 		return 0, errors.New("repository not initialized")
 	}
+	_, proxyProtocolSend = normalizeForwardProxyProtocol(proxyProtocol, proxyProtocolReceive, proxyProtocolSend)
 	var forwardID int64
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		fwd := model.Forward{
-			UserID:      userID,
-			UserName:    userName,
-			Name:        name,
-			TunnelID:    tunnelID,
-			RemoteAddr:  remoteAddr,
-			Strategy:    strategy,
-			InFlow:      0,
-			OutFlow:     0,
-			CreatedTime: now,
-			UpdatedTime: now,
-			Status:      1,
-			Inx:         inx,
-			SpeedID:     nullInt64FromInterface(speedID),
+			UserID:               userID,
+			UserName:             userName,
+			Name:                 name,
+			TunnelID:             tunnelID,
+			RemoteAddr:           remoteAddr,
+			Strategy:             strategy,
+			InFlow:               0,
+			OutFlow:              0,
+			CreatedTime:          now,
+			UpdatedTime:          now,
+			Status:               1,
+			Inx:                  inx,
+			MaxConn:              maxConn,
+			SpeedID:              nullInt64FromInterface(speedID),
+			IPMaxConn:            ipMaxConn,
+			IPSpeedID:            nullInt64FromInterface(ipSpeedID),
+			ProxyProtocol:        proxyProtocol,
+			ProxyProtocolReceive: proxyProtocolReceive,
+			ProxyProtocolSend:    proxyProtocolSend,
 		}
 		if err := tx.Create(&fwd).Error; err != nil {
 			return err
@@ -1310,20 +1407,22 @@ func (r *Repository) BatchUpdateForwardStatus(ids []int64, status int) (int, int
 	return s, f
 }
 
-func (r *Repository) CreateTunnelTx(tx *gorm.DB, name string, trafficRatio float64, typeVal int, flow int64, now int64, status int, inIP interface{}, inx int, ipPreference string) (int64, error) {
+func (r *Repository) CreateTunnelTx(tx *gorm.DB, name string, trafficRatio float64, typeVal int, flow int64, now int64, status int, inIP interface{}, inx int, ipPreference string, probeTargetHost string, probeTargetPort int) (int64, error) {
 	inIPVal := nullStringFromInterface(inIP)
 	tunnel := model.Tunnel{
-		Name:         name,
-		TrafficRatio: trafficRatio,
-		Type:         typeVal,
-		Protocol:     "tls",
-		Flow:         flow,
-		CreatedTime:  now,
-		UpdatedTime:  now,
-		Status:       status,
-		InIP:         inIPVal,
-		Inx:          inx,
-		IPPreference: ipPreference,
+		Name:            name,
+		TrafficRatio:    trafficRatio,
+		Type:            typeVal,
+		Protocol:        "tls",
+		Flow:            flow,
+		CreatedTime:     now,
+		UpdatedTime:     now,
+		Status:          status,
+		InIP:            inIPVal,
+		Inx:             inx,
+		IPPreference:    ipPreference,
+		ProbeTargetHost: probeTargetHost,
+		ProbeTargetPort: probeTargetPort,
 	}
 	if err := tx.Create(&tunnel).Error; err != nil {
 		return 0, err

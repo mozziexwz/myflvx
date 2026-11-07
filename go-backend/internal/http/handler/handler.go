@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -20,33 +21,47 @@ import (
 	"go-backend/internal/http/middleware"
 	"go-backend/internal/http/response"
 	"go-backend/internal/metrics"
+	"go-backend/internal/monitoring"
+	runtimenft "go-backend/internal/runtime/nftables"
 	"go-backend/internal/security"
 	"go-backend/internal/store/repo"
 	"go-backend/internal/ws"
+
 )
 
 type Handler struct {
-	repo        *repo.Repository
-	jwtSecret   string
-	wsServer    *ws.Server
-	metrics     *metrics.IngestionService
-	healthCheck *health.Checker
+	repo            *repo.Repository
+	jwtSecret       string
+	wsServer        *ws.Server
+	metrics         *metrics.IngestionService
+	healthCheck     *health.Checker
+	nftablesManager nftablesRuntimeManager
 
-	captchaMu     sync.Mutex
-	captchaTokens map[string]int64
+	peerResourceMu sync.Mutex
+	captchaMu      sync.Mutex
+	captchaTokens  map[string]int64
+	passkeyMu      sync.Mutex
+	passkeyPending map[string]passkeyCeremony
 
-	jobsMu      sync.Mutex
-	jobsCancel  context.CancelFunc
-	jobsStarted bool
-	jobsWG      sync.WaitGroup
+	jobsMu              sync.Mutex
+	jobsCancel          context.CancelFunc
+	jobsStarted         bool
+	jobsWG              sync.WaitGroup
 
-	upgradeMu              sync.Mutex
-	pendingUpgradeRedeploy map[int64]struct{}
+	upgradeMu                   sync.Mutex
+	systemUpgradeMu             sync.Mutex
+	pendingUpgradeRedeploy      map[int64]struct{}
+	nodeOnlineRedeployAt        map[int64]time.Time
+	nodeOnlineRedeployQueued    map[int64]struct{}
+	nodeOnlineRedeploying       map[int64]struct{}
+	nodeLocalRuntimeRetryQueued map[int64]struct{}
 
 	qualityProber *tunnelQualityProber
+	bestExit      *bestExitManager
 }
 
 const monitorTunnelQualityEnabledConfigKey = "monitor_tunnel_quality_enabled"
+const allowLocalRemoteAddrConfigKey = "allow_local_remote_addr"
 
 type loginRequest struct {
 	Username  string `json:"username"`
@@ -88,13 +103,19 @@ const (
 
 func New(repo *repo.Repository, jwtSecret string) *Handler {
 	h := &Handler{
-		repo:                   repo,
-		jwtSecret:              jwtSecret,
-		wsServer:               ws.NewServer(repo, jwtSecret),
-		metrics:                metrics.NewIngestionService(repo),
-		healthCheck:            nil,
-		captchaTokens:          make(map[string]int64),
-		pendingUpgradeRedeploy: make(map[int64]struct{}),
+		repo:                     repo,
+		jwtSecret:                jwtSecret,
+		wsServer:                 ws.NewServer(repo, jwtSecret),
+		metrics:                  metrics.NewIngestionService(repo),
+		healthCheck:              nil,
+		nftablesManager:          runtimenft.NewManager(nil),
+		captchaTokens:            make(map[string]int64),
+		passkeyPending:           make(map[string]passkeyCeremony),
+		pendingUpgradeRedeploy:   make(map[int64]struct{}),
+		nodeOnlineRedeployAt:     make(map[int64]time.Time),
+		nodeOnlineRedeployQueued: make(map[int64]struct{}),
+		nodeOnlineRedeploying:    make(map[int64]struct{}),
+		bestExit:                 newBestExitManager(),
 	}
 	h.healthCheck = health.NewChecker(repo, h.wsServer)
 	h.qualityProber = newTunnelQualityProber(h)
@@ -117,6 +138,7 @@ func New(repo *repo.Repository, jwtSecret string) *Handler {
 		}
 		h.metrics.RecordNodeMetric(nodeID, metricInfo)
 	})
+	h.wsServer.SetUserAuthStateLookup(h.GetUserAuthState)
 	return h
 }
 
@@ -124,8 +146,19 @@ func (h *Handler) WebSocketHandler() http.Handler {
 	return h.wsServer
 }
 
+func (h *Handler) GetUserAuthState(userID int64) (*auth.UserAuthState, error) {
+	return h.repo.GetUserAuthState(userID)
+}
+
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/user/login", h.login)
+	mux.HandleFunc("/api/v1/user/passkey/status", h.passkeyStatus)
+	mux.HandleFunc("/api/v1/user/passkey/login/begin", h.passkeyLoginBegin)
+	mux.HandleFunc("/api/v1/user/passkey/login/finish", h.passkeyLoginFinish)
+	mux.HandleFunc("/api/v1/user/passkey/register/begin", h.passkeyRegisterBegin)
+	mux.HandleFunc("/api/v1/user/passkey/register/finish", h.passkeyRegisterFinish)
+	mux.HandleFunc("/api/v1/user/passkey/list", h.passkeyList)
+	mux.HandleFunc("/api/v1/user/passkey/delete", h.passkeyDelete)
 	mux.HandleFunc("/api/v1/user/list", h.userList)
 	mux.HandleFunc("/api/v1/user/create", h.userCreate)
 	mux.HandleFunc("/api/v1/user/update", h.userUpdate)
@@ -133,10 +166,15 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/user/reset", h.userResetFlow)
 	mux.HandleFunc("/api/v1/user/quota/reset", h.userQuotaReset)
 	mux.HandleFunc("/api/v1/user/groups", h.userGroups)
+	mux.HandleFunc("/api/v1/public/config/get", h.getPublicConfigByName)
 	mux.HandleFunc("/api/v1/config/get", h.getConfigByName)
 	mux.HandleFunc("/api/v1/config/list", h.getConfigs)
 	mux.HandleFunc("/api/v1/config/update", h.updateConfigs)
 	mux.HandleFunc("/api/v1/config/update-single", h.updateSingleConfig)
+	mux.HandleFunc("/api/v1/system/storage", h.storageSummary)
+	mux.HandleFunc("/api/v1/system/version", h.systemVersion)
+	mux.HandleFunc("/api/v1/system/check-updates", h.systemCheckUpdates)
+	mux.HandleFunc("/api/v1/system/upgrade", h.systemUpgrade)
 	mux.HandleFunc("/api/v1/backup/export", h.backupExport)
 	mux.HandleFunc("/api/v1/backup/import", h.backupImport)
 	mux.HandleFunc("/api/v1/backup/restore", h.backupImport)
@@ -160,6 +198,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/node/batch-upgrade", h.nodeBatchUpgrade)
 	mux.HandleFunc("/api/v1/node/rollback", h.nodeRollback)
 	mux.HandleFunc("/api/v1/node/releases", h.listReleases)
+	mux.HandleFunc("/api/v1/node/nftables/test", h.nodeNftablesTest)
+	mux.HandleFunc("/api/v1/node/nftables/reconcile", h.nodeNftablesReconcile)
+	mux.HandleFunc("/api/v1/node/nftables/clear", h.nodeNftablesClear)
 	mux.HandleFunc("/api/v1/tunnel/list", h.tunnelList)
 	mux.HandleFunc("/api/v1/tunnel/create", h.tunnelCreate)
 	mux.HandleFunc("/api/v1/tunnel/get", h.tunnelGet)
@@ -185,6 +226,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/forward/force-delete", h.forwardForceDelete)
 	mux.HandleFunc("/api/v1/forward/pause", h.forwardPause)
 	mux.HandleFunc("/api/v1/forward/resume", h.forwardResume)
+	mux.HandleFunc("/api/v1/forward/reset-flow", h.forwardResetFlow)
 	mux.HandleFunc("/api/v1/forward/diagnose", h.forwardDiagnose)
 	mux.HandleFunc("/api/v1/forward/diagnose/stream", h.forwardDiagnoseStream)
 	mux.HandleFunc("/api/v1/forward/update-order", h.forwardUpdateOrder)
@@ -310,7 +352,8 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("账号或密码错误"))
 		return
 	}
-	if user.Pwd != security.MD5(req.Password) {
+	passwordMatched, passwordWasLegacy := security.VerifyPassword(user.Pwd, req.Password)
+	if !passwordMatched {
 		response.WriteJSON(w, response.ErrDefault("账号或密码错误"))
 		return
 	}
@@ -318,8 +361,20 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("账号被停用"))
 		return
 	}
+	issueAt := time.Now()
+	if passwordWasLegacy {
+		updatedAt := time.Now().UnixMilli()
+		hashedPassword, err := security.HashPassword(req.Password)
+		if err != nil {
+			log.Printf("legacy password rehash skipped user_id=%d path=login err=%v", user.ID, err)
+		} else if err := h.repo.UpdateUserPassword(user.ID, hashedPassword, updatedAt); err != nil {
+			log.Printf("legacy password rehash update skipped user_id=%d path=login err=%v", user.ID, err)
+		} else {
+			issueAt = time.UnixMilli(updatedAt + 1)
+		}
+	}
 
-	token, err := auth.GenerateToken(user.ID, user.User, user.RoleID, h.jwtSecret)
+	token, err := auth.GenerateTokenAt(user.ID, user.User, user.RoleID, h.jwtSecret, issueAt)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -349,8 +404,22 @@ func (h *Handler) getConfigByName(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
 		return
 	}
+	configName := strings.ToLower(strings.TrimSpace(req.Name))
+	if configName == "license_key" || configName == "license_machine_id" || configName == "machine_fingerprint" {
+		response.WriteJSON(w, response.Err(403, "禁止访问系统授权凭据"))
+		return
+	}
+	if repo.IsSensitiveConfigKey(configName) && !isAdminRequest(r) {
+		response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
+		return
+	}
 
-	cfg, err := h.repo.GetConfigByName(req.Name)
+	if _, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims); !ok && !repo.IsPublicConfigKey(configName) {
+		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
+		return
+	}
+
+	cfg, err := h.repo.GetConfigByName(configName)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -374,6 +443,14 @@ func (h *Handler) getConfigs(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	ctxClaims := r.Context().Value(middleware.ClaimsContextKey)
+	claims, isAdmin := ctxClaims.(auth.Claims)
+	if !isAdmin || claims.RoleID != 0 {
+		cfgMap = repo.FilterSensitiveConfigs(cfgMap)
+	}
+	delete(cfgMap, "license_key")
+	delete(cfgMap, "license_machine_id")
+	delete(cfgMap, "machine_fingerprint")
 	response.WriteJSON(w, response.OK(cfgMap))
 }
 
@@ -443,6 +520,7 @@ func (h *Handler) tunnelList(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	h.attachBestExitStates(items)
 	response.WriteJSON(w, response.OK(items))
 }
 
@@ -520,9 +598,26 @@ func (h *Handler) openAPISubStore(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
-	if user == nil || user.Pwd != security.MD5(password) {
+	if user == nil {
 		response.WriteJSON(w, response.ErrDefault("鉴权失败"))
 		return
+	}
+	passwordMatched, passwordWasLegacy := security.VerifyPassword(user.Pwd, password)
+	if !passwordMatched {
+		response.WriteJSON(w, response.ErrDefault("鉴权失败"))
+		return
+	}
+	if user.Status == 0 {
+		response.WriteJSON(w, response.ErrDefault("账号被停用"))
+		return
+	}
+	if passwordWasLegacy {
+		hashedPassword, err := security.HashPassword(password)
+		if err != nil {
+			log.Printf("legacy password rehash skipped user_id=%d path=sub_store err=%v", user.ID, err)
+		} else if err := h.repo.UpdateUserPassword(user.ID, hashedPassword, time.Now().UnixMilli()); err != nil {
+			log.Printf("legacy password rehash update skipped user_id=%d path=sub_store err=%v", user.ID, err)
+		}
 	}
 
 	const giga = int64(1024 * 1024 * 1024)
@@ -627,6 +722,7 @@ func (h *Handler) userTunnelList(w http.ResponseWriter, r *http.Request) {
 			"tunnelName":     t.TunnelName,
 			"status":         t.Status,
 			"flow":           t.Flow,
+			"flowMiB":        t.FlowMiB,
 			"num":            t.Num,
 			"expTime":        t.ExpTime,
 			"flowResetTime":  t.FlowResetTime,
@@ -776,11 +872,16 @@ func (h *Handler) flowUpload(w http.ResponseWriter, r *http.Request) {
 	if err == nil && strings.TrimSpace(raw) != "" {
 		var items []flowItem
 		if json.Unmarshal([]byte(raw), &items) == nil {
-			nowMs := time.Now().UnixMilli()
-			h.recordTunnelMetricsFromFlowItems(node.ID, items, nowMs)
-			for _, item := range items {
-				h.processFlowItem(node.ID, item)
+			now := time.Now()
+			forwardIDs := collectFlowUploadForwardIDs(items)
+			metas, metaErr := h.repo.GetFlowUploadForwardMetas(forwardIDs)
+			if metaErr != nil {
+				log.Printf("flow upload metadata lookup failed node_id=%d err=%v", node.ID, metaErr)
+				metas = map[int64]repo.FlowUploadForwardMeta{}
 			}
+			batch := h.buildNodeFlowUploadBatch(node.ID, items, metas)
+			h.recordTunnelMetricsFromForwardBatch(node.ID, batch.forwardTraffic, metas, now.UnixMilli())
+			h.applyFlowUploadBatch(node.ID, batch, now)
 		}
 	}
 
@@ -810,6 +911,14 @@ func (h *Handler) updateConfigs(w http.ResponseWriter, r *http.Request) {
 		if key == "" {
 			continue
 		}
+		if repo.IsSensitiveConfigKey(key) && !isAdminRequest(r) {
+			response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
+			return
+		}
+		if repo.IsSystemManagedConfigKey(key) {
+			response.WriteJSON(w, response.ErrDefault("该配置由系统管理"))
+			return
+		}
 
 		value, err := normalizeAndValidateConfigValue(key, v)
 		if err != nil {
@@ -821,6 +930,7 @@ func (h *Handler) updateConfigs(w http.ResponseWriter, r *http.Request) {
 			response.WriteJSON(w, response.Err(-2, err.Error()))
 			return
 		}
+		h.notifyTunnelQualityConfigChanged(key)
 	}
 
 	response.WriteJSON(w, response.OKEmpty())
@@ -842,6 +952,14 @@ func (h *Handler) updateSingleConfig(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("配置名称不能为空"))
 		return
 	}
+	if repo.IsSensitiveConfigKey(name) && !isAdminRequest(r) {
+		response.WriteJSON(w, response.Err(403, "禁止访问敏感配置"))
+		return
+	}
+	if repo.IsSystemManagedConfigKey(name) {
+		response.WriteJSON(w, response.ErrDefault("该配置由系统管理"))
+		return
+	}
 
 	value, err := normalizeAndValidateConfigValue(name, req.Value)
 	if err != nil {
@@ -858,8 +976,17 @@ func (h *Handler) updateSingleConfig(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	h.notifyTunnelQualityConfigChanged(name)
 
 	response.WriteJSON(w, response.OKEmpty())
+}
+
+func isAdminRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	claims, ok := r.Context().Value(middleware.ClaimsContextKey).(auth.Claims)
+	return ok && claims.RoleID == 0
 }
 
 func normalizeAndValidateConfigValue(key, value string) (string, error) {
@@ -896,8 +1023,22 @@ func normalizeAndValidateConfigValue(key, value string) (string, error) {
 		default:
 			return "", fmt.Errorf("隧道质量检测开关配置值无效")
 		}
+	case monitoring.ConfigMonitorRetentionDays:
+		return monitoring.NormalizeMonitoringRetentionDays(value)
+	case monitoring.ConfigTunnelQualityProbeIntervalSec:
+		return monitoring.NormalizeTunnelQualityProbeIntervalSeconds(value)
 	default:
 		return value, nil
+	}
+}
+
+func (h *Handler) notifyTunnelQualityConfigChanged(key string) {
+	if h == nil || h.qualityProber == nil {
+		return
+	}
+	switch strings.TrimSpace(key) {
+	case monitorTunnelQualityEnabledConfigKey, monitoring.ConfigTunnelQualityProbeIntervalSec:
+		h.qualityProber.NotifyConfigChanged()
 	}
 }
 
@@ -912,6 +1053,19 @@ func (h *Handler) isTunnelQualityMonitoringEnabled() bool {
 	}
 
 	return strings.TrimSpace(strings.ToLower(cfg.Value)) != "false"
+}
+
+func (h *Handler) allowLocalRemoteAddr() bool {
+	if h == nil || h.repo == nil {
+		return false
+	}
+
+	cfg, err := h.repo.GetConfigByName(allowLocalRemoteAddrConfigKey)
+	if err != nil || cfg == nil {
+		return false
+	}
+
+	return strings.TrimSpace(strings.ToLower(cfg.Value)) == "true"
 }
 
 func (h *Handler) userPackage(w http.ResponseWriter, r *http.Request) {
@@ -971,6 +1125,7 @@ func (h *Handler) userPackage(w http.ResponseWriter, r *http.Request) {
 			"tunnelName":     t.TunnelName,
 			"tunnelFlow":     t.TunnelFlow,
 			"flow":           t.Flow,
+			"flowMiB":        t.FlowMiB,
 			"inFlow":         t.InFlow,
 			"outFlow":        t.OutFlow,
 			"num":            t.Num,
@@ -1020,6 +1175,7 @@ func (h *Handler) userPackage(w http.ResponseWriter, r *http.Request) {
 			"user":          user.User,
 			"status":        user.Status,
 			"flow":          user.Flow,
+			"flowMiB":       user.FlowMiB,
 			"inFlow":        user.InFlow,
 			"outFlow":       user.OutFlow,
 			"num":           user.Num,
@@ -1091,7 +1247,8 @@ func (h *Handler) updatePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if user.Pwd != security.MD5(req.CurrentPassword) {
+	passwordMatched, _ := security.VerifyPassword(user.Pwd, req.CurrentPassword)
+	if !passwordMatched {
 		response.WriteJSON(w, response.ErrDefault("当前密码错误"))
 		return
 	}
@@ -1106,7 +1263,12 @@ func (h *Handler) updatePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.repo.UpdateUserNameAndPassword(userID, req.NewUsername, security.MD5(req.NewPassword), time.Now().UnixMilli()); err != nil {
+	hashedPassword, err := security.HashPassword(req.NewPassword)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.repo.UpdateUserNameAndPassword(userID, req.NewUsername, hashedPassword, time.Now().UnixMilli()); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -1423,15 +1585,22 @@ func (h *Handler) getAnnouncement(w http.ResponseWriter, r *http.Request) {
 
 	if ann == nil {
 		response.WriteJSON(w, response.OK(map[string]interface{}{
-			"content": "",
-			"enabled": 0,
+			"content":     "",
+			"enabled":     0,
+			"update_time": 0,
 		}))
 		return
 	}
 
+	updateTime := ann.CreatedTime
+	if ann.UpdatedTime.Valid {
+		updateTime = ann.UpdatedTime.Int64
+	}
+
 	response.WriteJSON(w, response.OK(map[string]interface{}{
-		"content": ann.Content,
-		"enabled": ann.Enabled,
+		"content":     ann.Content,
+		"enabled":     ann.Enabled,
+		"update_time": updateTime,
 	}))
 }
 

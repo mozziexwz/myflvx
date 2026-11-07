@@ -40,7 +40,7 @@ var (
 		SnmpLog:      "",
 		SnmpPeriod:   60,
 		Signal:       false,
-		TCP:          false,
+		TCP:          false, // default UDP mode (use tcpraw when true)
 	}
 )
 
@@ -87,6 +87,15 @@ func ParseFromFile(filename string) (*Config, error) {
 		return nil, err
 	}
 	return config, nil
+}
+
+// Clone returns a deep copy of the Config.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	clone := *c
+	return &clone
 }
 
 // Init initializes the KCP config.

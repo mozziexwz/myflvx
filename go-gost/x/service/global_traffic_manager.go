@@ -5,15 +5,17 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/go-gost/x/registry"
 )
 
 // GlobalTrafficManager 全局流量管理器（所有服务共享）
 type GlobalTrafficManager struct {
-	mu            sync.RWMutex
+	mu             sync.RWMutex
 	serviceTraffic map[string]*ServiceTraffic // key: 服务名, value: 流量数据
-	ctx           context.Context
-	cancel        context.CancelFunc
-	reportTicker  *time.Ticker
+	ctx            context.Context
+	cancel         context.CancelFunc
+	reportTicker   *time.Ticker
 }
 
 // ServiceTraffic 单个服务的流量累积
@@ -50,6 +52,9 @@ func (m *GlobalTrafficManager) AddTraffic(serviceName string, upBytes, downBytes
 	if upBytes == 0 && downBytes == 0 {
 		return
 	}
+	if !registry.ServiceRegistry().IsRegistered(serviceName) {
+		return
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -70,6 +75,51 @@ func (m *GlobalTrafficManager) AddTraffic(serviceName string, upBytes, downBytes
 	traffic.mu.Unlock()
 }
 
+// RemoveServices drops cached traffic counters for services that no longer exist.
+func (m *GlobalTrafficManager) RemoveServices(serviceNames ...string) {
+	if m == nil || len(serviceNames) == 0 {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, name := range serviceNames {
+		if m.isTrafficEmptyLocked(name) {
+			delete(m.serviceTraffic, name)
+		}
+	}
+}
+
+// RetainServices removes traffic counters for every service not in activeNames.
+func (m *GlobalTrafficManager) RetainServices(activeNames map[string]struct{}) {
+	if m == nil {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for name := range m.serviceTraffic {
+		if _, ok := activeNames[name]; !ok {
+			if m.isTrafficEmptyLocked(name) {
+				delete(m.serviceTraffic, name)
+			}
+		}
+	}
+}
+
+func (m *GlobalTrafficManager) isTrafficEmptyLocked(name string) bool {
+	traffic, ok := m.serviceTraffic[name]
+	if !ok {
+		return true
+	}
+
+	traffic.mu.Lock()
+	defer traffic.mu.Unlock()
+	return traffic.UpBytes == 0 && traffic.DownBytes == 0
+}
+
 // startReporting 启动定时上报协程（每5秒执行一次）
 func (m *GlobalTrafficManager) startReporting() {
 
@@ -88,56 +138,49 @@ func (m *GlobalTrafficManager) startReporting() {
 // collectAndReport 收集所有服务流量并合并上报
 func (m *GlobalTrafficManager) collectAndReport() {
 	m.mu.Lock()
-	
-	// 如果没有流量，直接返回
+
 	if len(m.serviceTraffic) == 0 {
 		m.mu.Unlock()
 		return
 	}
 
-	// 复制当前所有流量数据（避免长时间持锁）
-	trafficSnapshot := make(map[string]*ServiceTraffic)
-	reportData := make(map[string]struct {
-		up   int64
-		down int64
-	})
+	reportItems := make([]TrafficReportItem, 0, len(m.serviceTraffic))
 
 	for name, traffic := range m.serviceTraffic {
 		traffic.mu.Lock()
-		if traffic.UpBytes > 0 || traffic.DownBytes > 0 {
-			trafficSnapshot[name] = traffic
-			reportData[name] = struct {
-				up   int64
-				down int64
-			}{
-				up:   traffic.UpBytes,
-				down: traffic.DownBytes,
-			}
+		up := traffic.UpBytes
+		down := traffic.DownBytes
+		if up > 0 || down > 0 {
+			traffic.UpBytes = 0
+			traffic.DownBytes = 0
 		}
 		traffic.mu.Unlock()
+		isStale := !registry.ServiceRegistry().IsRegistered(name)
+
+		if up > 0 || down > 0 {
+			reportItems = append(reportItems, TrafficReportItem{
+				N: name,
+				U: up,
+				D: down,
+			})
+		}
+		if isStale {
+			delete(m.serviceTraffic, name)
+		}
 	}
+
 	m.mu.Unlock()
 
-	// 如果没有需要上报的流量，返回
-	if len(reportData) == 0 {
+	if len(reportItems) == 0 {
 		return
 	}
 
-	// 构建上报数据数组（保持每个服务独立）
-	reportItems := make([]TrafficReportItem, 0, len(reportData))
 	var totalUp, totalDown int64
-	
-	for serviceName, data := range reportData {
-		reportItems = append(reportItems, TrafficReportItem{
-			N: serviceName, // 保持服务名不变
-			U: data.up,
-			D: data.down,
-		})
-		totalUp += data.up
-		totalDown += data.down
+	for _, item := range reportItems {
+		totalUp += item.U
+		totalDown += item.D
 	}
 
-	// 批量发送上报请求（一次HTTP请求包含所有服务）
 	success, err := sendBatchTrafficReport(m.ctx, reportItems)
 	if err != nil {
 		fmt.Printf("❌ 全局流量上报失败: %v (总流量: ↑%d ↓%d, %d个服务)\n", err, totalUp, totalDown, len(reportItems))
@@ -146,36 +189,6 @@ func (m *GlobalTrafficManager) collectAndReport() {
 
 	if !success {
 		fmt.Printf("⚠️ 全局流量上报未成功 (总流量: ↑%d ↓%d, %d个服务)\n", totalUp, totalDown, len(reportItems))
-		return
-	}
-
-	// 上报成功，清空已上报的流量
-	m.clearReportedTraffic(reportData)
-}
-
-// clearReportedTraffic 清空已成功上报的流量
-func (m *GlobalTrafficManager) clearReportedTraffic(reportedData map[string]struct {
-	up   int64
-	down int64
-}) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for serviceName, reported := range reportedData {
-		if traffic, exists := m.serviceTraffic[serviceName]; exists {
-			traffic.mu.Lock()
-			// 减去已上报的流量
-			traffic.UpBytes -= reported.up
-			traffic.DownBytes -= reported.down
-
-			// 如果流量归零，从map中删除该服务记录（避免内存泄漏）
-			if traffic.UpBytes <= 0 && traffic.DownBytes <= 0 {
-				traffic.mu.Unlock()
-				delete(m.serviceTraffic, serviceName)
-			} else {
-				traffic.mu.Unlock()
-			}
-		}
 	}
 }
 
@@ -203,4 +216,3 @@ func (m *GlobalTrafficManager) GetServiceTraffic(serviceName string) (upBytes, d
 	}
 	return
 }
-

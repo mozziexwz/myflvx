@@ -1,46 +1,30 @@
-# GO-GOST SERVICE KNOWLEDGE BASE
+# go-gost
 
-**Generated:** Fri Mar 20 2026
-**Commit:** f45f960
-**Branch:** main
-**Tag:** 2.1.9-beta6
+Forwarding agent (forked GOST v3). Uses local `x/` module via `replace github.com/go-gost/x => ./x`.
 
-## OVERVIEW
-Forwarding agent built on GOST v3 with a local fork of `github.com/go-gost/x` under `x/`.
-**Stack:** Go 1.23, github.com/go-gost/core v0.3.1, local `go-gost/x` module.
+## Structure
 
-## STRUCTURE
-```
-go-gost/
-├── main.go           # Entry; reads panel config.json; starts svc.Run(program)
-├── config.go         # Panel config.json loader (addr/secret + ports)
-├── program.go        # GOST runtime: parse config, run/reload services
-├── x/                # Local fork of github.com/go-gost/x (has its own go.mod)
-└── go.mod            # replace github.com/go-gost/x => ./x
-```
+| File | Role |
+|------|------|
+| `main.go` | Entry point, reads `config.json`, starts reporter + service |
+| `config.go` | Panel integration config loader (addr, secret, ports) |
+| `program.go` | GOST runtime: parse config, run/reload services (SIGHUP) |
+| `x/` | Local fork of `github.com/go-gost/x` (own `go.mod`) |
 
-## WHERE TO LOOK
-| Task | Location | Notes |
-|------|----------|-------|
-| **Panel integration config** | `go-gost/config.go` | Expects `config.json` in cwd by default |
-| **Service lifecycle/reload** | `go-gost/program.go` | Parses config; handles SIGHUP reload |
-| **WebSocket reporting** | `go-gost/main.go` | Starts reporter + sets HTTP report URL |
-| **Protocol behaviors** | `go-gost/x/` | Handlers/listeners/dialers live here |
-| **Build** | `go-gost/Makefile` | Cross-compile targets for amd64/arm64 |
+## Conventions
 
-## CONVENTIONS
-- Two configs exist: panel integration uses `config.json`; forwarding services use GOST config (defaults to `gost.{json,yaml}` via viper search paths).
-- `go-gost/x/` is the primary extension surface; avoid editing vendored deps.
-- Agent communicates with panel via WebSocket (real-time commands) + HTTP (batch traffic reports).
+- Two config files: panel integration uses `config.json`; forwarding uses GOST config (`gost.{json,yaml}`).
+- `x/` is the extension surface — add handlers/listeners/dialers there, not in vendored deps.
+- Agent→panel: WebSocket (real-time commands) + HTTP (batch traffic reports).
 - All panel communication uses AES encryption with node `secret` as PSK.
-- CI builds with `CGO_ENABLED=0` for static binaries, then compresses with UPX.
 
-## ANTI-PATTERNS
-- **DO NOT EDIT** generated protobuf in `x/internal/util/grpc/proto/`.
+## Anti-patterns
 
-## COMMANDS
+- Don't edit `x/internal/util/grpc/proto/*.pb.go` (generated protobuf).
+
+## Commands
+
 ```bash
-cd go-gost
 go run .
 go test ./...
 go build .

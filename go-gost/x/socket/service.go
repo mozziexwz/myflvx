@@ -3,6 +3,7 @@ package socket
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -11,7 +12,13 @@ import (
 	parser "github.com/go-gost/x/config/parsing/service"
 	kill "github.com/go-gost/x/internal/util/port"
 	"github.com/go-gost/x/registry"
+	xservice "github.com/go-gost/x/service"
 )
+
+type serviceReplacement struct {
+	config    config.ServiceConfig
+	oldConfig *config.ServiceConfig
+}
 
 func createServices(req createServicesRequest) error {
 
@@ -53,9 +60,8 @@ func createServices(req createServicesRequest) error {
 		if err := registry.ServiceRegistry().Register(ps.config.Name, ps.service); err != nil {
 			// 如果注册失败，回滚已注册的服务
 			for _, regName := range registeredServices {
-				if svc := registry.ServiceRegistry().Get(regName); svc != nil {
+				if registry.ServiceRegistry().Get(regName) != nil {
 					registry.ServiceRegistry().Unregister(regName)
-					svc.Close()
 				}
 			}
 			return errors.New("service " + ps.config.Name + " already exists")
@@ -71,14 +77,12 @@ func createServices(req createServicesRequest) error {
 	}
 
 	// 第四阶段：更新配置
-	config.OnUpdate(func(c *config.Config) error {
+	return config.OnUpdate(func(c *config.Config) error {
 		for _, ps := range parsedServices {
 			c.Services = append(c.Services, &ps.config)
 		}
 		return nil
 	})
-
-	return nil
 }
 
 func updateServices(req updateServicesRequest) error {
@@ -96,42 +100,70 @@ func updateServices(req updateServicesRequest) error {
 		req.Data[i].Name = name
 	}
 
-	// 第二阶段：逐个更新服务（Upsert模式：存在则更新，不存在则创建）
+	// 第二阶段：逐个更新服务（Upsert模式：存在则更新，不存在则创建）。
+	// 配置变更命令由 WebSocket reporter 串行调度，但这里仍保留完整回滚，
+	// 避免新配置解析或监听失败后旧服务永久消失。
+	originalConfig := config.Global()
+	changedServices := make([]serviceReplacement, 0, len(req.Data))
 	for i := range req.Data {
 		serviceConfig := &req.Data[i]
 		name := serviceConfig.Name
+		if registry.ServiceRegistry().Get(name) != nil && serviceConfigUnchanged(name, *serviceConfig) {
+			continue
+		}
 
-		// 1. 获取旧服务
-		old := registry.ServiceRegistry().Get(name)
+		var oldConfig *config.ServiceConfig
+		if originalConfig != nil {
+			for _, current := range originalConfig.Services {
+				if current != nil && strings.TrimSpace(current.Name) == name {
+					oldConfig = current
+					break
+				}
+			}
+		}
 
-		// 2. 关闭旧服务 (如果存在)
-		if old != nil {
-			old.Close()
-			// 3. 从注册表移除旧服务
+		// 1. 关闭并移除旧服务（如果存在）。同名监听必须先释放端口，
+		// 才能创建新 listener。
+		if registry.ServiceRegistry().Get(name) != nil {
 			registry.ServiceRegistry().Unregister(name)
 		}
 
-		// 4. 解析新服务配置
+		// 2. 解析新服务配置。
 		svc, err := parser.ParseService(serviceConfig)
 		if err != nil {
+			rollbackErr := restoreServiceRuntime(name, oldConfig)
+			rollbackErr = errors.Join(rollbackErr, rollbackServiceReplacements(changedServices))
+			if rollbackErr != nil {
+				return fmt.Errorf("create service %s failed: %v; restore previous service failed: %w", name, err, rollbackErr)
+			}
 			return errors.New("create service " + name + " failed: " + err.Error())
 		}
 
-		// 5. 注册新服务
+		// 3. 注册并启动新服务。
 		if err := registry.ServiceRegistry().Register(name, svc); err != nil {
 			svc.Close()
+			rollbackErr := restoreServiceRuntime(name, oldConfig)
+			rollbackErr = errors.Join(rollbackErr, rollbackServiceReplacements(changedServices))
+			if rollbackErr != nil {
+				return fmt.Errorf("service %s already exists; restore previous service failed: %w", name, rollbackErr)
+			}
 			return errors.New("service " + name + " already exists")
 		}
-
-		// 6. 启动新服务
 		go svc.Serve()
+		changedServices = append(changedServices, serviceReplacement{
+			config:    *serviceConfig,
+			oldConfig: oldConfig,
+		})
+	}
+	if len(changedServices) == 0 {
+		return nil
 	}
 
 	// 第三阶段：更新配置
-	config.OnUpdate(func(c *config.Config) error {
-		for i := range req.Data {
+	if err := config.OnUpdate(func(c *config.Config) error {
+		for i := range changedServices {
 			// 创建副本以确保指针安全
-			cfgCopy := req.Data[i]
+			cfgCopy := changedServices[i].config
 			found := false
 			for j := range c.Services {
 				if c.Services[j].Name == cfgCopy.Name {
@@ -145,9 +177,72 @@ func updateServices(req updateServicesRequest) error {
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		config.Set(originalConfig)
+		if rollbackErr := rollbackServiceReplacements(changedServices); rollbackErr != nil {
+			return fmt.Errorf("%w; restore previous services failed: %v", err, rollbackErr)
+		}
+		return err
+	}
 
 	return nil
+}
+
+func restoreServiceRuntime(name string, serviceConfig *config.ServiceConfig) error {
+	name = strings.TrimSpace(name)
+	if name == "" || serviceConfig == nil {
+		return nil
+	}
+	if registry.ServiceRegistry().Get(name) != nil {
+		registry.ServiceRegistry().Unregister(name)
+	}
+
+	cfgCopy := *serviceConfig
+	cfgCopy.Name = name
+	svc, err := parser.ParseService(&cfgCopy)
+	if err != nil {
+		return err
+	}
+	if err := registry.ServiceRegistry().Register(name, svc); err != nil {
+		svc.Close()
+		return err
+	}
+	go svc.Serve()
+	return nil
+}
+
+func rollbackServiceReplacements(replacements []serviceReplacement) error {
+	var rollbackErr error
+	for i := len(replacements) - 1; i >= 0; i-- {
+		name := strings.TrimSpace(replacements[i].config.Name)
+		if name == "" {
+			continue
+		}
+		if registry.ServiceRegistry().Get(name) != nil {
+			registry.ServiceRegistry().Unregister(name)
+		}
+		if err := restoreServiceRuntime(name, replacements[i].oldConfig); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore service %s: %w", name, err))
+		}
+	}
+	return rollbackErr
+}
+
+func serviceConfigUnchanged(name string, next config.ServiceConfig) bool {
+	cfg := config.Global()
+	if cfg == nil {
+		return false
+	}
+	next.Status = nil
+	for _, current := range cfg.Services {
+		if current == nil || strings.TrimSpace(current.Name) != name {
+			continue
+		}
+		currentCopy := *current
+		currentCopy.Status = nil
+		return reflect.DeepEqual(currentCopy, next)
+	}
+	return false
 }
 
 func deleteServices(req deleteServicesRequest) error {
@@ -182,7 +277,6 @@ func deleteServices(req deleteServicesRequest) error {
 	// 第二阶段：删除所有服务
 	for _, std := range servicesToDelete {
 		registry.ServiceRegistry().Unregister(std.name)
-		std.service.Close()
 	}
 	// 确保所有请求删除的服务都从注册表中移除（即使之前未找到实例）
 	for _, name := range namesToRemove {
@@ -192,7 +286,7 @@ func deleteServices(req deleteServicesRequest) error {
 	}
 
 	// 第三阶段：更新配置
-	config.OnUpdate(func(c *config.Config) error {
+	err := config.OnUpdate(func(c *config.Config) error {
 		services := c.Services
 		c.Services = nil
 		for _, s := range services {
@@ -209,8 +303,8 @@ func deleteServices(req deleteServicesRequest) error {
 		}
 		return nil
 	})
-
-	return nil
+	xservice.GetGlobalTrafficManager().RemoveServices(namesToRemove...)
+	return err
 }
 
 func pauseServices(req pauseServicesRequest) error {

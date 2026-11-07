@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"go-backend/internal/auth"
@@ -14,7 +15,8 @@ type contextKey string
 const ClaimsContextKey contextKey = "claims"
 
 type AuthOptions struct {
-	JWTSecret string
+	JWTSecret        string
+	GetUserAuthState func(userID int64) (*auth.UserAuthState, error)
 }
 
 func JWT(opts AuthOptions) func(http.Handler) http.Handler {
@@ -32,14 +34,43 @@ func JWT(opts AuthOptions) func(http.Handler) http.Handler {
 
 			token := strings.TrimSpace(r.Header.Get("Authorization"))
 			if token == "" {
+				if allowsOptionalAuth(r.URL.Path) {
+					next.ServeHTTP(w, r)
+					return
+				}
 				response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
 				return
 			}
 
 			claims, ok := auth.ValidateToken(token, opts.JWTSecret)
 			if !ok {
+				if allowsOptionalAuth(r.URL.Path) {
+					next.ServeHTTP(w, r)
+					return
+				}
 				response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
 				return
+			}
+
+			if opts.GetUserAuthState != nil {
+				userID, err := strconv.ParseInt(claims.Sub, 10, 64)
+				if err != nil {
+					if allowsOptionalAuth(r.URL.Path) {
+						next.ServeHTTP(w, r)
+						return
+					}
+					response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+					return
+				}
+				state, err := opts.GetUserAuthState(userID)
+				if err != nil || state == nil || state.Status != 1 || state.RoleID != claims.RoleID || claims.IatMs <= state.PasswordChangedAt {
+					if allowsOptionalAuth(r.URL.Path) {
+						next.ServeHTTP(w, r)
+						return
+					}
+					response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+					return
+				}
 			}
 
 			if requiresAdmin(r.URL.Path) && claims.RoleID != 0 {
@@ -69,6 +100,10 @@ func RequireAdmin(next http.Handler) http.Handler {
 	})
 }
 
+func allowsOptionalAuth(path string) bool {
+	return path == "/api/v1/config/get"
+}
+
 func shouldSkip(path string) bool {
 	switch {
 	case strings.HasPrefix(path, "/flow/"):
@@ -78,8 +113,12 @@ func shouldSkip(path string) bool {
 	case strings.HasPrefix(path, "/api/v1/captcha/"):
 		return true
 	case path == "/api/v1/config/get":
-		return true
+		return false
 	case path == "/api/v1/user/login":
+		return true
+	case path == "/api/v1/user/passkey/status" || path == "/api/v1/user/passkey/login/begin" || path == "/api/v1/user/passkey/login/finish":
+		return true
+	case path == "/api/v1/public/config/get":
 		return true
 	case path == "/api/v1/federation/connect":
 		return true
@@ -105,11 +144,15 @@ func requiresAdmin(path string) bool {
 		return true
 	}
 
+	if strings.HasPrefix(path, "/api/v1/system/") {
+		return true
+	}
+
 	if strings.HasPrefix(path, "/api/v1/group/") {
 		return true
 	}
 
-	if strings.HasPrefix(path, "/api/v1/federation/share/") {
+	if strings.HasPrefix(path, "/api/v1/federation/share/") || strings.HasPrefix(path, "/api/v1/federation/node/") {
 		return true
 	}
 

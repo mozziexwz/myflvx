@@ -8,6 +8,7 @@ import (
 	"github.com/go-gost/x/config/loader"
 	"github.com/go-gost/x/config/parsing/parser"
 	"github.com/go-gost/x/registry"
+	xservice "github.com/go-gost/x/service"
 )
 
 // swagger:parameters reloadConfigRequest
@@ -36,19 +37,22 @@ func reloadConfig(ctx *gin.Context) {
 		return
 	}
 
-	config.Set(cfg)
-
-	if err := loader.Load(cfg); err != nil {
+	if err := loader.Reload(cfg, func(*config.Config) error {
+		for _, svc := range registry.ServiceRegistry().GetAll() {
+			go svc.Serve()
+		}
+		return nil
+	}); err != nil {
 		writeError(ctx, NewError(http.StatusBadRequest, ErrCodeInvalid, err.Error()))
 		return
 	}
-
-	for _, svc := range registry.ServiceRegistry().GetAll() {
-		svc := svc
-		go func() {
-			svc.Serve()
-		}()
+	activeServices := make(map[string]struct{}, len(cfg.Services))
+	for _, svc := range cfg.Services {
+		if svc != nil {
+			activeServices[svc.Name] = struct{}{}
+		}
 	}
+	xservice.GetGlobalTrafficManager().RetainServices(activeServices)
 
 	ctx.JSON(http.StatusOK, Response{
 		Msg: "OK",

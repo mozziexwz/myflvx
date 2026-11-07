@@ -9,6 +9,97 @@ import (
 	"go-backend/internal/store/model"
 )
 
+type FlowUploadForwardMeta struct {
+	ForwardID    int64
+	UserID       int64
+	UserTunnelID int64
+	TunnelID     int64
+	TrafficRatio float64
+	TunnelFlow   int64
+}
+
+const flowUploadForwardMetaChunkSize = 500
+
+func chunkFlowUploadForwardIDs(ids []int64) [][]int64 {
+	if len(ids) == 0 {
+		return nil
+	}
+	chunks := make([][]int64, 0, (len(ids)+flowUploadForwardMetaChunkSize-1)/flowUploadForwardMetaChunkSize)
+	for start := 0; start < len(ids); start += flowUploadForwardMetaChunkSize {
+		end := start + flowUploadForwardMetaChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunks = append(chunks, ids[start:end])
+	}
+	return chunks
+}
+
+func (r *Repository) GetFlowUploadForwardMetas(forwardIDs []int64) (map[int64]FlowUploadForwardMeta, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	if len(forwardIDs) == 0 {
+		return map[int64]FlowUploadForwardMeta{}, nil
+	}
+
+	ids := make([]int64, 0, len(forwardIDs))
+	seen := make(map[int64]struct{}, len(forwardIDs))
+	for _, id := range forwardIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return map[int64]FlowUploadForwardMeta{}, nil
+	}
+
+	type row struct {
+		ForwardID    int64   `gorm:"column:forward_id"`
+		UserID       int64   `gorm:"column:user_id"`
+		UserTunnelID int64   `gorm:"column:user_tunnel_id"`
+		TunnelID     int64   `gorm:"column:tunnel_id"`
+		TrafficRatio float64 `gorm:"column:traffic_ratio"`
+		TunnelFlow   int64   `gorm:"column:tunnel_flow"`
+	}
+
+	out := make(map[int64]FlowUploadForwardMeta, len(ids))
+	for _, chunk := range chunkFlowUploadForwardIDs(ids) {
+		var rows []row
+		err := r.db.Table("forward AS f").
+			Select("f.id AS forward_id, f.user_id AS user_id, COALESCE(ut.id, 0) AS user_tunnel_id, f.tunnel_id AS tunnel_id, t.traffic_ratio AS traffic_ratio, t.flow AS tunnel_flow").
+			Joins("LEFT JOIN tunnel t ON t.id = f.tunnel_id").
+			Joins("LEFT JOIN user_tunnel ut ON ut.user_id = f.user_id AND ut.tunnel_id = f.tunnel_id").
+			Where("f.id IN ?", chunk).
+			Scan(&rows).Error
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			if row.TunnelFlow <= 0 {
+				row.TunnelFlow = 1
+			}
+			if row.TrafficRatio <= 0 {
+				row.TrafficRatio = 1
+			}
+			out[row.ForwardID] = FlowUploadForwardMeta{
+				ForwardID:    row.ForwardID,
+				UserID:       row.UserID,
+				UserTunnelID: row.UserTunnelID,
+				TunnelID:     row.TunnelID,
+				TrafficRatio: row.TrafficRatio,
+				TunnelFlow:   row.TunnelFlow,
+			}
+		}
+	}
+	return out, nil
+}
+
 func (r *Repository) UpdateForwardStatus(forwardID int64, status int, now int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
@@ -29,16 +120,23 @@ func (r *Repository) ListActiveForwardsByUser(userID int64) ([]model.ForwardReco
 	}
 	rows := make([]model.ForwardRecord, 0, len(forwards))
 	for _, f := range forwards {
+		proxyProtocolReceive, proxyProtocolSend := normalizeForwardProxyProtocol(f.ProxyProtocol, f.ProxyProtocolReceive, f.ProxyProtocolSend)
 		rows = append(rows, model.ForwardRecord{
-			ID:         f.ID,
-			UserID:     f.UserID,
-			UserName:   f.UserName,
-			Name:       f.Name,
-			TunnelID:   f.TunnelID,
-			RemoteAddr: f.RemoteAddr,
-			Strategy:   f.Strategy,
-			Status:     f.Status,
-			SpeedID:    f.SpeedID,
+			ID:                   f.ID,
+			UserID:               f.UserID,
+			UserName:             f.UserName,
+			Name:                 f.Name,
+			TunnelID:             f.TunnelID,
+			RemoteAddr:           f.RemoteAddr,
+			Strategy:             f.Strategy,
+			Status:               f.Status,
+			SpeedID:              f.SpeedID,
+			MaxConn:              f.MaxConn,
+			IPMaxConn:            f.IPMaxConn,
+			IPSpeedID:            f.IPSpeedID,
+			ProxyProtocol:        f.ProxyProtocol,
+			ProxyProtocolReceive: proxyProtocolReceive,
+			ProxyProtocolSend:    proxyProtocolSend,
 		})
 	}
 	for i := range rows {
@@ -60,16 +158,23 @@ func (r *Repository) ListActiveForwardsByUserTunnel(userID, tunnelID int64) ([]m
 	}
 	rows := make([]model.ForwardRecord, 0, len(forwards))
 	for _, f := range forwards {
+		proxyProtocolReceive, proxyProtocolSend := normalizeForwardProxyProtocol(f.ProxyProtocol, f.ProxyProtocolReceive, f.ProxyProtocolSend)
 		rows = append(rows, model.ForwardRecord{
-			ID:         f.ID,
-			UserID:     f.UserID,
-			UserName:   f.UserName,
-			Name:       f.Name,
-			TunnelID:   f.TunnelID,
-			RemoteAddr: f.RemoteAddr,
-			Strategy:   f.Strategy,
-			Status:     f.Status,
-			SpeedID:    f.SpeedID,
+			ID:                   f.ID,
+			UserID:               f.UserID,
+			UserName:             f.UserName,
+			Name:                 f.Name,
+			TunnelID:             f.TunnelID,
+			RemoteAddr:           f.RemoteAddr,
+			Strategy:             f.Strategy,
+			Status:               f.Status,
+			SpeedID:              f.SpeedID,
+			MaxConn:              f.MaxConn,
+			IPMaxConn:            f.IPMaxConn,
+			IPSpeedID:            f.IPSpeedID,
+			ProxyProtocol:        f.ProxyProtocol,
+			ProxyProtocolReceive: proxyProtocolReceive,
+			ProxyProtocolSend:    proxyProtocolSend,
 		})
 	}
 	for i := range rows {
@@ -91,16 +196,23 @@ func (r *Repository) ListForwardsByUserAndTunnel(userID, tunnelID int64) ([]mode
 	}
 	rows := make([]model.ForwardRecord, 0, len(forwards))
 	for _, f := range forwards {
+		proxyProtocolReceive, proxyProtocolSend := normalizeForwardProxyProtocol(f.ProxyProtocol, f.ProxyProtocolReceive, f.ProxyProtocolSend)
 		rows = append(rows, model.ForwardRecord{
-			ID:         f.ID,
-			UserID:     f.UserID,
-			UserName:   f.UserName,
-			Name:       f.Name,
-			TunnelID:   f.TunnelID,
-			RemoteAddr: f.RemoteAddr,
-			Strategy:   f.Strategy,
-			Status:     f.Status,
-			SpeedID:    f.SpeedID,
+			ID:                   f.ID,
+			UserID:               f.UserID,
+			UserName:             f.UserName,
+			Name:                 f.Name,
+			TunnelID:             f.TunnelID,
+			RemoteAddr:           f.RemoteAddr,
+			Strategy:             f.Strategy,
+			Status:               f.Status,
+			SpeedID:              f.SpeedID,
+			MaxConn:              f.MaxConn,
+			IPMaxConn:            f.IPMaxConn,
+			IPSpeedID:            f.IPSpeedID,
+			ProxyProtocol:        f.ProxyProtocol,
+			ProxyProtocolReceive: proxyProtocolReceive,
+			ProxyProtocolSend:    proxyProtocolSend,
 		})
 	}
 	for i := range rows {
@@ -123,16 +235,23 @@ func (r *Repository) GetForwardRecord(forwardID int64) (*model.ForwardRecord, er
 		}
 		return nil, err
 	}
+	proxyProtocolReceive, proxyProtocolSend := normalizeForwardProxyProtocol(f.ProxyProtocol, f.ProxyProtocolReceive, f.ProxyProtocolSend)
 	fr := model.ForwardRecord{
-		ID:         f.ID,
-		UserID:     f.UserID,
-		UserName:   f.UserName,
-		Name:       f.Name,
-		TunnelID:   f.TunnelID,
-		RemoteAddr: f.RemoteAddr,
-		Strategy:   f.Strategy,
-		Status:     f.Status,
-		SpeedID:    f.SpeedID,
+		ID:                   f.ID,
+		UserID:               f.UserID,
+		UserName:             f.UserName,
+		Name:                 f.Name,
+		TunnelID:             f.TunnelID,
+		RemoteAddr:           f.RemoteAddr,
+		Strategy:             f.Strategy,
+		Status:               f.Status,
+		SpeedID:              f.SpeedID,
+		MaxConn:              f.MaxConn,
+		IPMaxConn:            f.IPMaxConn,
+		IPSpeedID:            f.IPSpeedID,
+		ProxyProtocol:        f.ProxyProtocol,
+		ProxyProtocolReceive: proxyProtocolReceive,
+		ProxyProtocolSend:    proxyProtocolSend,
 	}
 	if strings.TrimSpace(fr.Strategy) == "" {
 		fr.Strategy = "fifo"
@@ -153,11 +272,14 @@ func (r *Repository) GetTunnelRecord(tunnelID int64) (*model.TunnelRecord, error
 		return nil, err
 	}
 	tr := model.TunnelRecord{
-		ID:           t.ID,
-		Type:         t.Type,
-		Status:       t.Status,
-		Flow:         t.Flow,
-		TrafficRatio: t.TrafficRatio,
+		ID:              t.ID,
+		Type:            t.Type,
+		Status:          t.Status,
+		Flow:            t.Flow,
+		TrafficRatio:    t.TrafficRatio,
+		Protocol:        t.Protocol,
+		ProbeTargetHost: t.ProbeTargetHost,
+		ProbeTargetPort: t.ProbeTargetPort,
 	}
 	if tr.Flow <= 0 {
 		tr.Flow = 1

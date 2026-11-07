@@ -3,6 +3,7 @@ package repo
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -253,6 +254,68 @@ func (r *Repository) AddUserQuotaUsage(userID int64, usedBytes int64, now time.T
 		return nil, err
 	}
 	return normalizeUserQuotaView(result, now), nil
+}
+
+func (r *Repository) AddUserQuotaUsageBatch(usages map[int64]int64, now time.Time) (map[int64]*model.UserQuotaView, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	if len(usages) == 0 {
+		return map[int64]*model.UserQuotaView{}, nil
+	}
+
+	var result map[int64]*model.UserQuotaView
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var err error
+		result, err = r.addUserQuotaUsageBatchTx(tx, usages, now)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (r *Repository) addUserQuotaUsageBatchTx(tx *gorm.DB, usages map[int64]int64, now time.Time) (map[int64]*model.UserQuotaView, error) {
+	if tx == nil {
+		return nil, errors.New("database unavailable")
+	}
+	if len(usages) == 0 {
+		return map[int64]*model.UserQuotaView{}, nil
+	}
+
+	result := make(map[int64]*model.UserQuotaView, len(usages))
+	userIDs := make([]int64, 0, len(usages))
+	for userID := range usages {
+		if userID > 0 {
+			userIDs = append(userIDs, userID)
+		}
+	}
+	sort.Slice(userIDs, func(i, j int) bool { return userIDs[i] < userIDs[j] })
+
+	for _, userID := range userIDs {
+		q, err := r.loadOrCreateUserQuotaTx(tx, userID, now)
+		if err != nil {
+			return nil, err
+		}
+		applyUserQuotaWindowRoll(q, now)
+		if usages[userID] > 0 {
+			q.DailyUsedBytes += usages[userID]
+			q.MonthlyUsedBytes += usages[userID]
+		}
+		q.UpdatedTime = now.UnixMilli()
+		if err := tx.Model(&model.UserQuota{}).Where("user_id = ?", userID).Updates(map[string]interface{}{
+			"daily_used_bytes":   q.DailyUsedBytes,
+			"monthly_used_bytes": q.MonthlyUsedBytes,
+			"day_key":            q.DayKey,
+			"month_key":          q.MonthKey,
+			"updated_time":       q.UpdatedTime,
+		}).Error; err != nil {
+			return nil, err
+		}
+		result[userID] = normalizeUserQuotaView(cloneUserQuotaView(*q), now)
+	}
+	return result, nil
 }
 
 func (r *Repository) MarkUserQuotaDisabled(userID int64, pausedForwardIDs []int64, now int64) error {

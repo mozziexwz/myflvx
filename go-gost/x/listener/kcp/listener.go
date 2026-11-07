@@ -15,6 +15,7 @@ import (
 	limiter_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
 	metrics "github.com/go-gost/x/metrics/wrapper"
 	stats "github.com/go-gost/x/observer/stats/wrapper"
+	mdutil "github.com/go-gost/x/metadata/util"
 	"github.com/go-gost/x/registry"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
@@ -53,6 +54,9 @@ func (l *kcpListener) Init(md md.Metadata) (err error) {
 
 	config := l.md.config
 	config.Init()
+	if md != nil && md.IsExists("kcp.nc") {
+		config.NoCongestion = mdutil.GetInt(md, "kcp.nc")
+	}
 
 	var conn net.PacketConn
 	if config.TCP {
