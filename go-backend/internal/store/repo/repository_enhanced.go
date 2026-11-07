@@ -327,8 +327,10 @@ func (r *Repository) ListUserBriefs() ([]map[string]interface{}, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("repository not initialized")
 	}
+	// Load whole rows: an unquoted `user` in a select list is the current_user
+	// function on PostgreSQL, so selecting individual columns would break there.
 	var users []model.User
-	if err := r.db.Select("id, user, role_id, status").Order("id ASC").Find(&users).Error; err != nil {
+	if err := r.db.Order("id ASC").Find(&users).Error; err != nil {
 		return nil, err
 	}
 	out := make([]map[string]interface{}, 0, len(users))
