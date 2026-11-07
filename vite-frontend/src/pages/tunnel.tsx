@@ -2140,16 +2140,27 @@ export default function TunnelPage() {
                   <h3 className="text-lg font-semibold">入口配置</h3>
 
                   <div className="space-y-2">
-                    <Select
-                      disabledKeys={[
-                        ...nodes
-                          .filter((node) => node.status !== 1)
-                          .map((node) => node.id.toString()),
-                        ...(form.outNodeId || []).map((ct) =>
-                          ct.nodeId.toString(),
-                        ),
-                        ...getSelectedChainNodeIds().map((id) => id.toString()),
-                      ]}
+                      <Select
+                        disabledKeys={[
+                          ...nodes
+                            .filter(
+                              (node) =>
+                                node.status !== 1 &&
+                                !(
+                                  isEdit &&
+                                  form.inNodeId.some(
+                                    (ct) => ct.nodeId === node.id,
+                                  )
+                                ),
+                            )
+                            .map((node) => node.id.toString()),
+                          ...(form.outNodeId || []).map((ct) =>
+                            ct.nodeId.toString(),
+                          ),
+                          ...getSelectedChainNodeIds().map((id) =>
+                            id.toString(),
+                          ),
+                        ]}
                       errorMessage={errors.inNodeId}
                       isInvalid={!!errors.inNodeId}
                       label="入口节点"
@@ -2321,7 +2332,18 @@ export default function TunnelPage() {
                                       }}
                                       disabledKeys={[
                                         ...nodes
-                                          .filter((node) => node.status !== 1)
+                                          .filter(
+                                            (node) =>
+                                              node.status !== 1 &&
+                                              !(
+                                                isEdit &&
+                                                groupNodes.some(
+                                                  (ct) =>
+                                                    ct.nodeId === node.id &&
+                                                    ct.nodeId !== -1,
+                                                )
+                                              ),
+                                          )
                                           .map((node) => node.id.toString()),
                                         ...form.inNodeId.map((ct) =>
                                           ct.nodeId.toString(),
@@ -2581,7 +2603,18 @@ export default function TunnelPage() {
                                   }}
                                   disabledKeys={[
                                     ...nodes
-                                      .filter((node) => node.status !== 1)
+                                      .filter(
+                                        (node) =>
+                                          node.status !== 1 &&
+                                          !(
+                                            isEdit &&
+                                            (form.outNodeId || []).some(
+                                              (ct) =>
+                                                ct.nodeId === node.id &&
+                                                ct.nodeId !== -1,
+                                            )
+                                          ),
+                                      )
                                       .map((node) => node.id.toString()),
                                     ...form.inNodeId.map((ct) =>
                                       ct.nodeId.toString(),
