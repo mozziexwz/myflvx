@@ -1,5 +1,5 @@
-# 多阶段构建 - 构建阶段
-FROM node:20.19.0 AS builder
+# 多阶段构建 - 构建阶段（在构建机原生平台编译静态资源；使用已修复 CVE-2026-111497 的 Node.js）
+FROM --platform=$BUILDPLATFORM node:22.23.4-alpine AS builder
 
 WORKDIR /app
 
