@@ -1,21 +1,26 @@
-# FLVX
+# myflvx（FLVX 增强版）
 
-> **联系我们**: [Telegram群组](https://t.me/flvxpanel)
+基于 [FLVX](https://github.com/Sagit-chu/flvx) `2.2.0-alpha4` 界面的增强版：保留 alpha4 的 UI，后端与节点端同步上游最新版本的修复，并加入「订阅」与「部署节点」功能。
 
+## 和原版的区别
 
-## 特性
+- **界面**：沿用 `2.2.0-alpha4` 的界面（不使用之后的液态玻璃新界面）。
+- **修复**：`go-backend`、`go-gost`（节点端）同步到上游最新代码（3.0.1-rc7 之后），包含 UDP/KCP、流量统计、运行时恢复、认证与 WebSocket 加固、SSRF、依赖漏洞等修复；与新界面无关的前端修复也已移植。
+- **不包含**：上游的商业授权（keygen 校验、品牌设置付费锁定），品牌设置与 alpha4 一样免费可用。
+- **新增：代理节点（节点管理）**：手动添加、粘贴分享链接、导入机场订阅（链接 / base64 / Clash YAML / 订阅地址）、标签、批量操作、复制分享链接。
+- **新增：隧道中转**：在节点上选择隧道，面板自动创建转发（目标为节点地址）并按转发入口生成中转节点；转发端口或源节点变更后中转节点自动跟随；也可以关联已有转发。
+- **新增：订阅管理 / 生成订阅**：上传 Clash/mihomo 配置、从订阅地址导入，或从节点生成订阅（内置极简 / 常用分流 / 全局模板，可视化代理组编辑与自定义规则），分配给用户。
+- **新增：订阅下载**：用户在面板内（携带登录凭据）下载 Clash/mihomo YAML、Base64 文件或复制分享链接，**不生成公网订阅链接**，配置不会暴露在公网。
+- **新增：部署节点**：使用 [mihomo_script](https://github.com/mozziexwz/mihomo_script) 一键部署 **Shadowsocks 2022 / mieru / Sudoku**。端口、密码、密钥由面板生成；可以复制一键命令到服务器执行，也可以填写 SSH 由面板代为执行（凭据只用于本次，不保存），完成后自动生成代理节点。
 
-- 支持按 **隧道账号级别** 管理流量转发数量，可用于用户/隧道配额控制
-- 支持 **TCP** 和 **UDP** 协议的转发
-- 支持两种转发模式：**端口转发** 与 **隧道转发**
-- 可针对 **指定用户的指定隧道进行限速** 设置
-- 支持配置 **单向或双向流量计费方式**，灵活适配不同计费模型
-- 提供灵活的转发策略配置，适用于多种网络场景
-- 面板分享，支持将节点分享给其他人，面板对接面板
-- 支持分组权限管理，隧道分组、用户分组
-- 支持批量功能，可以批量下发配置，启停等
-- 支持隧道修改配置、转发修改隧道
+## 备份恢复兼容
 
+- **原版 → 增强版**：原版（2.2.0-alpha4 ~ 3.x）导出的备份可以直接导入。
+  - alpha4 及更早版本的备份里密码是 MD5：上游新版导入时会把这些用户禁用并重置密码，增强版改为保留原密码，用户首次登录时自动升级为 bcrypt。
+- **增强版 → 原版**：导出时选择格式：
+  - **兼容原版 FLVX 3.x**：结构与上游一致，不含增强版数据；
+  - **兼容原版 FLVX 2.2.0-alpha4**：同时去掉 alpha4 不认识的字段（alpha4 的导入会拒绝未知字段）。
+- 增强版数据（代理节点、订阅、部署记录）是单独的备份类型，只有勾选时才会写入备份文件。
 
 ## 部署流程
 ---
@@ -23,23 +28,25 @@
 #### 快速部署（安装最新版）
 面板端：
 ```bash
-curl -L https://raw.githubusercontent.com/Sagit-chu/flux-panel/main/panel_install.sh -o panel_install.sh && chmod +x panel_install.sh && ./panel_install.sh
+curl -L https://raw.githubusercontent.com/mozziexwz/myflvx/main/panel_install.sh -o panel_install.sh && chmod +x panel_install.sh && ./panel_install.sh
 ```
 节点端：
 ```bash
-curl -L https://raw.githubusercontent.com/Sagit-chu/flux-panel/main/install.sh -o install.sh && chmod +x install.sh && ./install.sh
+curl -L https://raw.githubusercontent.com/mozziexwz/myflvx/main/install.sh -o install.sh && chmod +x install.sh && ./install.sh
 ```
+
+> 镜像与节点端二进制由本仓库的 GitHub Actions 在推送版本 tag（如 `2.2.1`）时构建，发布到 `ghcr.io/mozziexwz/flux-panel-backend`、`ghcr.io/mozziexwz/vite-frontend` 和本仓库的 Releases。首次使用前需要先发布一个版本，并在 GitHub 的 Packages 设置中把镜像设为 Public（或在服务器上 `docker login ghcr.io`）。
 
 #### 安装特定版本
-从 [Releases](https://github.com/Sagit-chu/flux-panel/releases) 页面复制对应版本的安装命令，脚本会自动安装该版本而非最新版。
+从 [Releases](https://github.com/mozziexwz/myflvx/releases) 页面复制对应版本的安装命令，脚本会自动安装该版本而非最新版。
 
-面板端（以 2.1.9-beta6 为例）：
+面板端（以 2.2.1 为例）：
 ```bash
-curl -L https://github.com/Sagit-chu/flux-panel/releases/download/2.1.9-beta6/panel_install.sh -o panel_install.sh && chmod +x panel_install.sh && ./panel_install.sh
+curl -L https://github.com/mozziexwz/myflvx/releases/download/2.2.1/panel_install.sh -o panel_install.sh && chmod +x panel_install.sh && ./panel_install.sh
 ```
-节点端（以 2.1.9-beta6 为例）：
+节点端（以 2.2.1 为例）：
 ```bash
-curl -L https://github.com/Sagit-chu/flux-panel/releases/download/2.1.9-beta6/install.sh -o install.sh && chmod +x install.sh && ./install.sh
+curl -L https://github.com/mozziexwz/myflvx/releases/download/2.2.1/install.sh -o install.sh && chmod +x install.sh && ./install.sh
 ```
 
 #### PostgreSQL 部署（Docker Compose）
@@ -123,6 +130,15 @@ docker compose up -d
 > ⚠️ 首次登录后请立即修改默认密码！
 
 ---
+## 致谢与第三方组件
+
+- [FLVX](https://github.com/Sagit-chu/flvx)（GPLv3）：本项目的上游，面板、后端与节点端均来自 FLVX。
+- [妙妙屋 miaomiaowu](https://github.com/iluobei/miaomiaowu)（MIT）：节点管理、订阅管理、生成订阅、订阅链接的功能设计；分享链接解析使用其开源模块 [proxyparser](https://github.com/MMWOrg/mmwX-plugins)（MIT）。
+- [mihomo_script](https://github.com/mozziexwz/mihomo_script)：部署节点使用的一键脚本（Shadowsocks 2022 / mieru / Sudoku）。
+- [mihomo](https://github.com/MetaCubeX/mihomo)：节点服务端与客户端内核。
+
+本项目沿用 FLVX 的许可证（GPLv3，原 flux-panel 部分为 Apache 2.0），见 `LICENSE`、`LICENSE-APACHE` 与 `NOTICE`。
+
 ## Original Project
 - **Name**: flux-panel
 - **Source**: https://github.com/bqlpfy/flux-panel
@@ -180,7 +196,7 @@ This fork (FLVX) is no longer a light patch on top of the upstream project. It h
 请务必在合法、合规、安全的前提下使用本项目。
 
 ---
-## ⭐ 喝杯咖啡！（USDT）
+## ⭐ 支持原作者（FLVX）：喝杯咖啡！（USDT）
 
 | 网络       | 地址                                                                 |
 |------------|----------------------------------------------------------------------|

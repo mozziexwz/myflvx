@@ -8,7 +8,9 @@ RUN go mod download
 COPY . .
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} env ${TARGETARCH:+GOARCH=${TARGETARCH}} go build -trimpath -ldflags="-s -w" -o /out/paneld ./cmd/paneld
+# GitHub repository that hosts this build's agent binaries and install scripts.
+ARG GITHUB_REPO=mozziexwz/myflvx
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} env ${TARGETARCH:+GOARCH=${TARGETARCH}} go build -trimpath -ldflags="-s -w -X 'go-backend/internal/http/handler.githubRepo=${GITHUB_REPO}'" -o /out/paneld ./cmd/paneld
 
 FROM docker:27-cli AS dockercli
 

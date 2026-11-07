@@ -20,8 +20,13 @@ type failedForward struct {
 	err     error
 }
 
+// githubRepo hosts the agent binaries, install scripts and panel releases used
+// by node install / upgrade. myflvx releases are built from its own repository;
+// override at build time with
+// -ldflags "-X go-backend/internal/http/handler.githubRepo=owner/repo".
+var githubRepo = "mozziexwz/myflvx"
+
 const (
-	githubRepo     = "Sagit-chu/flvx"
 	githubAPIBase  = "https://api.github.com"
 	githubHTMLBase = "https://github.com"
 	upgradeTimeout = 5 * time.Minute

@@ -7,6 +7,18 @@ on:
     branches: ['**']
 
 jobs:
+  install-scripts:
+    name: Test Installer Scripts (systemd and Alpine OpenRC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run installer regression tests
+        run: bash test-install-scripts-proxy.sh
+
+      - name: Test Alpine bootstrap and OpenRC lifecycle
+        run: docker run --rm -v "$PWD:/workspace:ro" alpine:3.22 sh /workspace/test-install-scripts-alpine.sh
+
   frontend:
     name: Build Frontend
     runs-on: ubuntu-latest
@@ -19,10 +31,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20.19.0'
+          node-version-file: '.node-version'
 
+      # myflvx keeps the npm-based alpha4 frontend (upstream later moved to pnpm)
       - name: Install dependencies
-        run: npm install --legacy-peer-deps
+        run: npm install --legacy-peer-deps --no-audit --no-fund
 
       - name: Build
         run: npm run build
@@ -39,7 +52,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: 'go-backend/go.mod'
           cache-dependency-path: go-backend/go.sum
 
       - name: Download dependencies
@@ -47,6 +60,30 @@ jobs:
 
       - name: Build
         run: go build -v ./...
+
+  myflvx-tests:
+    name: myflvx Feature Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go-backend/go.mod'
+          cache-dependency-path: go-backend/go.sum
+
+      - name: Vet
+        run: go vet ./internal/proxykit/... ./internal/http/... ./internal/store/...
+
+      - name: Subscription, relay, deploy and backup tests
+        run: |
+          go test -count=1 ./internal/proxykit/...
+          go test -count=1 ./internal/store/repo/ -run 'Backup|Import'
+          go test -count=1 ./tests/contract/ -run 'TestMyflvx'
 
   backend-postgres-contract:
     name: Go Backend PostgreSQL Contract
@@ -74,7 +111,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: 'go-backend/go.mod'
           cache-dependency-path: go-backend/go.sum
 
       - name: Download dependencies
@@ -97,7 +134,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: 'go-gost/go.mod'
           cache-dependency-path: go-gost/go.sum
 
       - name: Download dependencies

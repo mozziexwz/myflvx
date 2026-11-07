@@ -79,7 +79,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: 'go-gost/go.mod'
 
       - name: Cache Go modules
         uses: actions/cache@v4
@@ -197,7 +197,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version-file: 'go-backend/go.mod'
 
       - name: Cache Go dependencies
         uses: actions/cache@v4
@@ -229,6 +229,7 @@ jobs:
 
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
+            --build-arg GITHUB_REPO=${{ github.repository }} \
             --push \
             -t ${{ env.REGISTRY }}/${OWNER}/flux-panel-backend:latest \
             -t ${{ env.REGISTRY }}/${OWNER}/flux-panel-backend:${VERSION} \
@@ -296,12 +297,18 @@ jobs:
           # 替换仓库地址和版本号
           sed -i "s|bqlpfy/flux-panel|${REPO}|g" ./artifacts/install.sh
           sed -i "s|bqlpfy/flux-panel|${REPO}|g" ./artifacts/panel_install.sh
+          # myflvx: 安装脚本默认从当前仓库的 Release 下载
+          sed -i "s|^REPO=\".*\"|REPO=\"${REPO}\"|" ./artifacts/install.sh
+          sed -i "s|^REPO=\".*\"|REPO=\"${REPO}\"|" ./artifacts/panel_install.sh
           sed -i "s|2.0.7-beta|${VERSION}|g" ./artifacts/install.sh
           sed -i "s|2.0.7-beta|${VERSION}|g" ./artifacts/panel_install.sh
 
           # 注入固定版本号，使从 Release 页下载的脚本只安装该版本
           sed -i "s|^PINNED_VERSION=\"\"|PINNED_VERSION=\"${VERSION}\"|" ./artifacts/install.sh
           sed -i "s|^PINNED_VERSION=\"\"|PINNED_VERSION=\"${VERSION}\"|" ./artifacts/panel_install.sh
+
+      - name: Verify release installer on Alpine OpenRC
+        run: docker run --rm -v "$PWD:/workspace:ro" alpine:3.22 sh /workspace/test-install-scripts-alpine.sh /workspace/artifacts/install.sh
 
       - name: Create Release
         env:
@@ -431,4 +438,3 @@ jobs:
           gh release upload "${VERSION}" ./artifacts/gost-arm64.sha256 --clobber
 
           echo "✅ GOST 二进制文件更新完成"
-
