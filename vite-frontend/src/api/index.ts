@@ -134,7 +134,7 @@ export const getTunnelList = () =>
 export const getTunnelById = (id: number) =>
   Network.post<TunnelApiItem>("/tunnel/get", { id });
 export const updateTunnel = (data: TunnelMutationPayload) =>
-  Network.post("/tunnel/update", data);
+  Network.post("/tunnel/update", data, { timeout: 120_000 });
 export const deleteTunnel = (id: number) =>
   Network.post("/tunnel/delete", { id });
 export const previewTunnelDelete = (id: number) =>
@@ -246,6 +246,9 @@ export const getConfigs = () =>
   Network.post<Record<string, string>>("/config/list");
 export const getConfigByName = (name: string) =>
   Network.post<{ name: string; value: string }>("/config/get", { name });
+// 未登录时读取公开配置（品牌、验证码 site key 等）
+export const getPublicConfigByName = (name: string) =>
+  Network.post<{ name: string; value: string }>("/public/config/get", { name });
 export const updateConfigs = (configMap: Record<string, string>) =>
   Network.post("/config/update", configMap);
 export const updateConfig = (name: string, value: string) =>

@@ -221,6 +221,9 @@ export default function UserPage() {
     flowResetTime: 0,
   });
   const [userFormLoading, setUserFormLoading] = useState(false);
+  const [userSubmitWarning, setUserSubmitWarning] = useState<string | null>(
+    null,
+  );
   const [quotaResetLoading, setQuotaResetLoading] = useState(false);
 
   const editingUser = useMemo(
@@ -507,6 +510,7 @@ export default function UserPage() {
   };
 
   const handleAdd = () => {
+    setUserSubmitWarning(null);
     setIsEdit(false);
     setUserForm({
       user: "",
@@ -524,6 +528,7 @@ export default function UserPage() {
   };
 
   const handleEdit = async (user: User) => {
+    setUserSubmitWarning(null);
     setIsEdit(true);
     let currentGroupIds: number[] = [];
 
@@ -592,6 +597,7 @@ export default function UserPage() {
     }
 
     setUserFormLoading(true);
+    setUserSubmitWarning(null);
     try {
       const submitData: any = {
         ...userForm,
@@ -631,7 +637,19 @@ export default function UserPage() {
           await loadUsers();
         }
       } else {
-        toast.error(response.msg || (isEdit ? "更新失败" : "创建失败"));
+        const userDisabled =
+          isEdit &&
+          response.data !== null &&
+          typeof response.data === "object" &&
+          "userDisabled" in response.data &&
+          response.data.userDisabled === true;
+
+        if (userDisabled) {
+          setUserSubmitWarning(response.msg);
+          await loadUsers();
+        } else {
+          toast.error(response.msg || (isEdit ? "更新失败" : "创建失败"));
+        }
       }
     } catch {
       toast.error(isEdit ? "更新失败" : "创建失败");
@@ -1462,6 +1480,14 @@ export default function UserPage() {
         <ModalContent>
           <ModalHeader>{isEdit ? "编辑用户" : "新增用户"}</ModalHeader>
           <ModalBody>
+            {userSubmitWarning ? (
+              <div
+                className="whitespace-pre-wrap break-words rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-100"
+                role="alert"
+              >
+                {userSubmitWarning}
+              </div>
+            ) : null}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Input
                 isRequired

@@ -1,4 +1,5 @@
-import { getConfigByName, getConfigs } from "@/api";
+import { getConfigByName, getConfigs, getPublicConfigByName } from "@/api";
+import { isLoggedIn } from "@/utils/auth";
 
 export type SiteConfig = typeof siteConfig;
 
@@ -8,8 +9,38 @@ const VERSION = import.meta.env.VITE_APP_VERSION || "dev";
 const APP_VERSION = "1.0.3";
 const DEFAULT_FAVICON = "/favicon.ico";
 const FAVICON_LINK_ID = "app-favicon";
+// 未登录时只能通过 /public/config/get 读取的品牌配置
+const PUBLIC_BRAND_CONFIG_KEYS = ["app_name", "app_logo", "app_favicon"] as const;
+const PUBLIC_CONFIG_KEYS = new Set<string>([
+  ...PUBLIC_BRAND_CONFIG_KEYS,
+  "app_bg_image",
+  "cloudflare_site_key",
+  "hide_footer_brand",
+]);
+// 敏感配置绝不写入浏览器缓存
+const SENSITIVE_CONFIG_KEYS = new Set([
+  "jwt_secret",
+  "license_key",
+  "license_machine_id",
+  "machine_fingerprint",
+  "cloudflare_secret_key",
+]);
 const GITHUB_REPO =
-  import.meta.env.VITE_GITHUB_REPO || "https://github.com/Sagit-chu/flux-panel";
+  import.meta.env.VITE_GITHUB_REPO || "https://github.com/mozziexwz/myflvx";
+
+const normalizeConfigKey = (key: string) => key.trim().toLowerCase();
+
+const shouldPersistConfigKey = (key: string) =>
+  !SENSITIVE_CONFIG_KEYS.has(normalizeConfigKey(key));
+
+const purgeSensitiveConfigCache = () => {
+  if (typeof window === "undefined") {
+    return;
+  }
+  SENSITIVE_CONFIG_KEYS.forEach((key) => {
+    localStorage.removeItem(CACHE_PREFIX + key);
+  });
+};
 
 const getInitialConfig = () => {
   if (typeof window === "undefined") {
@@ -60,11 +91,17 @@ export const configCache = {
     return localStorage.getItem(cacheKey);
   },
 
-  // 设置缓存的配置
+  // 设置缓存的配置（敏感配置不缓存）
   set: (key: string, value: string): void => {
-    const cacheKey = CACHE_PREFIX + key;
+    const normalizedKey = normalizeConfigKey(key);
 
-    localStorage.setItem(cacheKey, value);
+    if (!shouldPersistConfigKey(normalizedKey)) {
+      localStorage.removeItem(CACHE_PREFIX + normalizedKey);
+
+      return;
+    }
+
+    localStorage.setItem(CACHE_PREFIX + normalizedKey, value);
   },
 
   // 删除指定配置的缓存
@@ -95,7 +132,11 @@ export const getCachedConfig = async (key: string): Promise<string | null> => {
     return cachedValue;
   }
 
-  const response = await getConfigByName(key);
+  const normalizedKey = normalizeConfigKey(key);
+  const response =
+    !isLoggedIn() && PUBLIC_CONFIG_KEYS.has(normalizedKey)
+      ? await getPublicConfigByName(normalizedKey)
+      : await getConfigByName(normalizedKey);
 
   if (
     response.code === 0 &&
@@ -104,7 +145,7 @@ export const getCachedConfig = async (key: string): Promise<string | null> => {
   ) {
     const value = response.data.value;
 
-    configCache.set(key, value);
+    configCache.set(normalizedKey, value);
 
     return value;
   }
@@ -115,7 +156,7 @@ export const getCachedConfig = async (key: string): Promise<string | null> => {
 // 获取所有配置（优先从缓存）
 export const getCachedConfigs = async (): Promise<Record<string, string>> => {
   // 尝试从缓存获取所有配置
-  const configKeys = ["app_name", "app_logo", "app_favicon"];
+  const configKeys: readonly string[] = PUBLIC_BRAND_CONFIG_KEYS;
   const cachedConfigs: Record<string, string> = {};
   let hasCachedData = false;
 
@@ -134,7 +175,7 @@ export const getCachedConfigs = async (): Promise<Record<string, string>> => {
     await Promise.all(
       configKeys.map(async (key) => {
         try {
-          const response = await getConfigByName(key);
+          const response = await getPublicConfigByName(key);
 
           if (
             response.code === 0 &&
@@ -154,6 +195,17 @@ export const getCachedConfigs = async (): Promise<Record<string, string>> => {
 
     return publicConfigMap;
   };
+
+  // 未登录：只能读取公开的品牌配置
+  if (!isLoggedIn()) {
+    const publicConfigs = await fetchPublicConfigs();
+
+    if (Object.keys(publicConfigs).length > 0) {
+      return { ...cachedConfigs, ...publicConfigs };
+    }
+
+    return cachedConfigs;
+  }
 
   // 从API获取最新配置
   try {
@@ -242,6 +294,7 @@ export const updateSiteConfig = async (configMap?: Record<string, string>) => {
   Object.entries(resolvedConfigMap).forEach(([key, value]) => {
     configCache.set(key, String(value));
   });
+  purgeSensitiveConfigCache();
 
   const hasAppName = Object.prototype.hasOwnProperty.call(
     resolvedConfigMap,
@@ -291,6 +344,7 @@ export const clearConfigCache = (keys?: string[]) => {
 
 // 在页面加载时异步更新配置（如果有更新的话）
 if (typeof window !== "undefined") {
+  purgeSensitiveConfigCache();
   if (typeof document !== "undefined") {
     document.title = siteConfig.name;
   }

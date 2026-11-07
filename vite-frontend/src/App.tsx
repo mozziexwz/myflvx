@@ -1,5 +1,5 @@
-import { Route, Routes, useNavigate } from "react-router-dom";
-import { useEffect } from "react";
+import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { useEffect, useState } from "react";
 
 import IndexPage from "@/pages/index";
 import ChangePasswordPage from "@/pages/change-password";
@@ -21,6 +21,7 @@ import H5SimpleLayout from "@/layouts/h5-simple";
 import { isLoggedIn } from "@/utils/auth";
 import { siteConfig, updateSiteConfig } from "@/config/site";
 import { useH5Mode } from "@/hooks/useH5Mode";
+import { SESSION_UPDATED_EVENT } from "@/utils/session";
 
 // 简化的路由保护组件 - 使用 React Router 导航避免循环
 const ProtectedRoute = ({
@@ -32,23 +33,31 @@ const ProtectedRoute = ({
   useSimpleLayout?: boolean;
   skipLayout?: boolean;
 }) => {
-  const authenticated = isLoggedIn();
   const isH5 = useH5Mode();
   const navigate = useNavigate();
+  const [authenticated, setAuthenticated] = useState(() => isLoggedIn());
 
+  // 监听会话变化：退出登录（或会话被清除）后立即回到登录页
   useEffect(() => {
-    if (!authenticated) {
-      // 使用 React Router 导航，避免无限跳转
-      navigate("/", { replace: true });
-    }
-  }, [authenticated, navigate]);
+    const handleSessionChange = () => {
+      const loggedIn = isLoggedIn();
+
+      setAuthenticated(loggedIn);
+
+      if (!loggedIn) {
+        navigate("/", { replace: true });
+      }
+    };
+
+    window.addEventListener(SESSION_UPDATED_EVENT, handleSessionChange);
+
+    return () => {
+      window.removeEventListener(SESSION_UPDATED_EVENT, handleSessionChange);
+    };
+  }, [navigate]);
 
   if (!authenticated) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-white dark:bg-black">
-        <div className="text-lg text-gray-700 dark:text-gray-200" />
-      </div>
-    );
+    return <Navigate replace to="/" />;
   }
 
   // 如果跳过布局，直接返回子组件
@@ -76,11 +85,7 @@ const LoginRoute = () => {
   }, [authenticated, navigate]);
 
   if (authenticated) {
-    return (
-      <div className="flex items-center justify-center min-h-screen bg-gray-100 dark:bg-black">
-        <div className="text-lg text-gray-700 dark:text-gray-200" />
-      </div>
-    );
+    return <Navigate replace to="/dashboard" />;
   }
 
   return <IndexPage />;

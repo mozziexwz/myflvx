@@ -1868,10 +1868,7 @@ export default function NodePage() {
                             className="h-6 px-2 min-w-0 text-xs bg-amber-50 text-amber-600 hover:bg-amber-100 dark:bg-amber-950/30 dark:text-amber-400"
                             isDisabled={node.connectionStatus !== "online"}
                             isLoading={node.upgradeLoading}
-                            onPress={() => {
-                              setUpgradeTargetNodeId(node.id);
-                              openUpgradeModal("single");
-                            }}
+                            onPress={() => openUpgradeModal("single", node.id)}
                           >
                             升级
                           </Button>
