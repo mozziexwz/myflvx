@@ -294,6 +294,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/flow/config", h.flowConfig)
 	mux.HandleFunc("/flow/upload", h.flowUpload)
 	mux.HandleFunc("/error", h.errorPage)
+
+	// myflvx: 节点管理 / 订阅 / 部署节点
+	h.registerEnhancedRoutes(mux)
 }
 
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
@@ -1492,6 +1495,9 @@ func (h *Handler) verifyCloudflareTurnstile(token, secretKey string) bool {
 
 type backupExportRequest struct {
 	Types []string `json:"types"`
+	// myflvx: "" / "full" (default), "upstream" (importable by upstream FLVX 3.x)
+	// or "alpha4" (importable by FLVX 2.2.0-alpha4).
+	Format string `json:"format,omitempty"`
 }
 
 func (h *Handler) backupExport(w http.ResponseWriter, r *http.Request) {
@@ -1506,15 +1512,21 @@ func (h *Handler) backupExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var backup interface{}
+	var data *repo.BackupData
 	var err error
 
 	if len(req.Types) == 0 {
-		backup, err = h.repo.ExportAll()
+		data, err = h.repo.ExportAll()
 	} else {
-		backup, err = h.repo.ExportPartial(req.Types)
+		data, err = h.repo.ExportPartial(req.Types)
 	}
 
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+
+	backup, err := convertBackupFormat(data, req.Format)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return

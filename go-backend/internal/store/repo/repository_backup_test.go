@@ -175,7 +175,9 @@ func TestImportIgnoresSensitiveConfigs(t *testing.T) {
 	assertConfigValue(t, r, "cloudflare_secret_key", "cloudflare-before")
 }
 
-func TestImportUsersDoesNotStoreLegacyMD5Passwords(t *testing.T) {
+// myflvx keeps legacy MD5 hashes on import so 2.2.0-alpha4 backups restore
+// working accounts; the hash is upgraded to bcrypt on the next login.
+func TestImportUsersKeepsLegacyMD5PasswordsUsable(t *testing.T) {
 	r, err := Open(filepath.Join(t.TempDir(), "legacy-user-import.db"))
 	if err != nil {
 		t.Fatalf("open repo: %v", err)
@@ -217,14 +219,11 @@ func TestImportUsersDoesNotStoreLegacyMD5Passwords(t *testing.T) {
 	if user == nil {
 		t.Fatal("expected imported user")
 	}
-	if security.IsLegacyPasswordHash(user.Pwd) {
-		t.Fatalf("imported password remained legacy MD5: %q", user.Pwd)
+	if ok, legacy := security.VerifyPassword(user.Pwd, "admin_user"); !ok || !legacy {
+		t.Fatalf("legacy imported password should stay usable (ok=%v legacy=%v)", ok, legacy)
 	}
-	if ok, _ := security.VerifyPassword(user.Pwd, "admin_user"); ok {
-		t.Fatal("legacy imported password should not remain usable")
-	}
-	if user.Status != 0 {
-		t.Fatalf("legacy imported user status = %d, want disabled status 0", user.Status)
+	if user.Status != 1 {
+		t.Fatalf("legacy imported user status = %d, want 1", user.Status)
 	}
 	if user.PasswordChangedAt <= 0 {
 		t.Fatalf("PasswordChangedAt = %d, want import revocation timestamp", user.PasswordChangedAt)

@@ -411,6 +411,13 @@ type BackupData struct {
 	UserGroups   []UserGroupBackup   `json:"userGroups,omitempty"`
 	Permissions  []PermissionBackup  `json:"permissions,omitempty"`
 	Configs      map[string]string   `json:"configs,omitempty"`
+
+	// myflvx enhanced data. Each section is only written when its type is
+	// selected, so a backup without them stays importable by upstream FLVX
+	// (whose importer rejects unknown fields).
+	ProxyNodes    []ProxyNodeBackup   `json:"proxyNodes,omitempty"`
+	Subscriptions []SubFileBackup     `json:"subscriptions,omitempty"`
+	ProxyDeploys  []ProxyDeployBackup `json:"proxyDeploys,omitempty"`
 }
 
 type UserBackup struct {
@@ -594,6 +601,10 @@ type ImportResult struct {
 	UserGroupsImported   int         `json:"userGroupsImported"`
 	PermissionsImported  int         `json:"permissionsImported"`
 	ConfigsImported      int         `json:"configsImported"`
+	// myflvx enhanced data
+	ProxyNodesImported    int         `json:"proxyNodesImported,omitempty"`
+	SubscriptionsImported int         `json:"subscriptionsImported,omitempty"`
+	ProxyDeploysImported  int         `json:"proxyDeploysImported,omitempty"`
 	AutoBackup           *BackupData `json:"autoBackup,omitempty"`
 }
 

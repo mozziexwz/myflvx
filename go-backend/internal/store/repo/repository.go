@@ -321,6 +321,11 @@ func autoMigrateAll(db *gorm.DB) error {
 		&model.ServiceMonitor{},
 		&model.ServiceMonitorResult{},
 		&model.TunnelQuality{},
+		// myflvx enhanced tables
+		&model.ProxyNode{},
+		&model.SubFile{},
+		&model.SubFileUser{},
+		&model.ProxyDeploy{},
 	}
 
 	if db.Dialector.Name() != "sqlite" {
@@ -1988,6 +1993,10 @@ func (r *Repository) ExportAll() (*model.BackupData, error) {
 	}
 	backup.Configs = FilterBackupConfigs(configs)
 
+	if err := r.exportEnhanced(backup, map[string]bool{"proxyNodes": true, "subscriptions": true, "proxyDeploys": true}); err != nil {
+		return nil, err
+	}
+
 	return backup, nil
 }
 
@@ -2067,6 +2076,9 @@ func (r *Repository) ExportPartial(types []string) (*model.BackupData, error) {
 			return nil, fmt.Errorf("export configs failed: %w", err)
 		}
 		backup.Configs = FilterBackupConfigs(v)
+	}
+	if err := r.exportEnhanced(backup, typeSet); err != nil {
+		return nil, err
 	}
 	return backup, nil
 }
@@ -2439,10 +2451,17 @@ func (r *Repository) Import(backup *model.BackupData, types []string) (*model.Im
 			}
 			result.ConfigsImported = count
 		}
-		return nil
+		return importEnhanced(tx, backup, typeSet, now, result)
 	})
 	if err != nil {
 		return nil, err
+	}
+	// Rows are restored with their original ids; move PostgreSQL sequences past
+	// them so later inserts do not collide (SQLite needs no repair).
+	if r.db.Dialector.Name() == "postgres" {
+		if err := ensurePostgresIDDefaultsFn(r.db); err != nil {
+			log.Printf("postgres id sequence repair after import failed: %v", err)
+		}
 	}
 	return result, nil
 }
@@ -2524,7 +2543,14 @@ func normalizeImportedUserPassword(password string, status int) (string, int, er
 	if strings.HasPrefix(password, "$2") {
 		return password, status, nil
 	}
-	if security.IsLegacyPasswordHash(password) || password == "" {
+	if security.IsLegacyPasswordHash(password) {
+		// myflvx: keep MD5 hashes from older FLVX backups (2.2.0-alpha4 and
+		// earlier store passwords this way) so restored accounts keep working.
+		// Login verifies the legacy hash and upgrades it to bcrypt, exactly as
+		// for a database upgraded in place.
+		return strings.ToLower(password), status, nil
+	}
+	if password == "" {
 		replacement, err := randomPasswordHash()
 		if err != nil {
 			return "", status, err

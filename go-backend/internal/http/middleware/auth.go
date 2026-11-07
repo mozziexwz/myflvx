@@ -144,6 +144,14 @@ func requiresAdmin(path string) bool {
 		return true
 	}
 
+	// myflvx: 节点管理、部署节点和订阅管理仅管理员可用；订阅下载（/subscription/my/）对所有登录用户开放。
+	if strings.HasPrefix(path, "/api/v1/proxy-node/") || strings.HasPrefix(path, "/api/v1/deploy/") {
+		return true
+	}
+	if strings.HasPrefix(path, "/api/v1/subscription/") {
+		return !strings.HasPrefix(path, "/api/v1/subscription/my/")
+	}
+
 	if strings.HasPrefix(path, "/api/v1/system/") {
 		return true
 	}
