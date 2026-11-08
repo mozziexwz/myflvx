@@ -1,14 +1,22 @@
 import type { NodeApiItem } from "@/api/types";
+import type { DragEndEvent } from "@dnd-kit/core";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom";
+import { DndContext, closestCenter } from "@dnd-kit/core";
+import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
 
+import { AnimatedPage } from "@/components/animated-page";
 import {
-  AnimatedPage,
-  StaggerItem,
-  StaggerList,
-} from "@/components/animated-page";
+  DragHandle,
+  SortableCard,
+  applyOrder,
+  draggedIds,
+  orderItems,
+  reorderIds,
+  useSortSensors,
+} from "@/components/sortable";
 import { PageLoadingState } from "@/components/page-state";
 import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
@@ -40,6 +48,7 @@ import {
   runDeployments,
   syncDeployNodes,
   uninstallDeployment,
+  updateDeployOrder,
   updateDeployment,
   type DeployParams,
   type DeploySettings,
@@ -253,6 +262,29 @@ export default function DeployPage() {
 
     return map;
   }, [flvxNodes]);
+
+  // ─── 拖拽排序 ─────────────────────────────────────────────
+
+  const sortSensors = useSortSensors();
+
+  const handleDragEnd = async (event: DragEndEvent) => {
+    const ids = draggedIds(event);
+
+    if (!ids) return;
+    const allIds = items.map((d) => d.id);
+    const order = reorderIds(allIds, allIds, ids[0], ids[1]);
+
+    if (!order) return;
+    const previous = items;
+
+    setItems(applyOrder(items, order));
+    const res = await updateDeployOrder(orderItems(order));
+
+    if (res.code !== 0) {
+      toast.error(res.msg || "保存排序失败");
+      setItems(previous);
+    }
+  };
 
   const showWarnings = (warnings?: string[]) =>
     (warnings || []).forEach((w) => toast(w, { icon: "⚠️", duration: 8000 }));
@@ -676,146 +708,173 @@ export default function DeployPage() {
           </CardBody>
         </Card>
       ) : (
-        <StaggerList className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4">
-          {items.map((item) => {
-            const chip = statusChip(item);
-            const running = item.status === "running";
-            const busy = busyId === item.id;
+        <DndContext
+          collisionDetection={closestCenter}
+          sensors={sortSensors}
+          onDragEnd={handleDragEnd}
+        >
+          <SortableContext
+            items={items.map((d) => d.id)}
+            strategy={rectSortingStrategy}
+          >
+            <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4">
+              {items.map((item) => {
+                const chip = statusChip(item);
+                const running = item.status === "running";
+                const busy = busyId === item.id;
 
-            return (
-              <StaggerItem key={item.id}>
-                <Card className="shadow-sm border border-gray-200 dark:border-gray-700 h-full">
-                  <CardHeader className="pb-2">
-                    <div className="flex justify-between items-start w-full gap-2">
-                      <div className="min-w-0">
-                        <h3 className="font-semibold truncate">{item.name}</h3>
-                        <p className="flex items-center gap-1.5 text-xs text-default-500">
-                          <span
-                            className={`h-2 w-2 shrink-0 rounded-full ${item.nodeOnline ? "bg-success" : "bg-default-300"}`}
-                          />
-                          <span className="truncate">
-                            {item.nodeName || `节点 #${item.nodeId}`}
-                            {item.nodeOnline ? "" : "（离线）"}
-                          </span>
-                          <span className="font-mono">· {item.host}</span>
-                        </p>
-                      </div>
-                      <Chip color={chip.color} size="sm" variant="flat">
-                        {chip.label}
-                      </Chip>
-                    </div>
-                  </CardHeader>
-                  <CardBody className="pt-0 space-y-3">
-                    <div className="flex flex-wrap gap-1">
-                      {item.protocols.map((proto) => (
-                        <Chip key={proto} size="sm" variant="flat">
-                          {proto === "ss"
-                            ? `SS ${item.params.ssPort}`
-                            : proto === "mieru"
-                              ? `mieru ${item.params.mieruPort}`
-                              : `Sudoku ${item.params.sudokuPort}`}
-                        </Chip>
-                      ))}
-                    </div>
-                    <div className="text-xs text-default-500">
-                      代理节点 {item.proxyNodes} 个 · 上次执行{" "}
-                      {formatDateTime(item.lastRunTime)}
-                      {item.remark ? ` · ${item.remark}` : ""}
-                    </div>
-                    <div className="flex flex-wrap gap-1.5">
-                      <Button
-                        color="primary"
-                        isDisabled={running}
-                        isLoading={busy}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => runOp(item, "install")}
-                      >
-                        {item.status === "pending" ? "部署" : "重新部署"}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="flat"
-                        onPress={() => {
-                          setLogItem(item);
-                          setLogId(item.id);
-                        }}
-                      >
-                        日志
-                      </Button>
-                      <Button
-                        isDisabled={running || busy}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => runOp(item, "info")}
-                      >
-                        刷新状态
-                      </Button>
-                      <Button
-                        isDisabled={running}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => openCopy(item)}
-                      >
-                        复制到其他节点
-                      </Button>
-                    </div>
-                    <div className="flex flex-wrap gap-1.5 border-t border-divider pt-2">
-                      <Button
-                        className="h-7 min-w-0 px-2 text-xs"
-                        isDisabled={running}
-                        size="sm"
-                        variant="light"
-                        onPress={() => openEdit(item)}
-                      >
-                        编辑参数
-                      </Button>
-                      <Button
-                        className="h-7 min-w-0 px-2 text-xs"
-                        size="sm"
-                        variant="light"
-                        onPress={() => generateNodes(item)}
-                      >
-                        重新生成代理节点
-                      </Button>
-                      <Button
-                        className="h-7 min-w-0 px-2 text-xs"
-                        size="sm"
-                        variant="light"
-                        onPress={() => openCommand(item)}
-                      >
-                        复制安装命令
-                      </Button>
-                      <Button
-                        className="h-7 min-w-0 px-2 text-xs"
-                        color="warning"
-                        isDisabled={running || item.status === "uninstalled"}
-                        size="sm"
-                        variant="light"
-                        onPress={() => setUninstallItem(item)}
-                      >
-                        卸载
-                      </Button>
-                      <Button
-                        className="h-7 min-w-0 px-2 text-xs"
-                        color="danger"
-                        isDisabled={running}
-                        size="sm"
-                        variant="light"
-                        onPress={() => {
-                          setDeleteNodes(true);
-                          setDeleteItem(item);
-                        }}
-                      >
-                        删除记录
-                      </Button>
-                    </div>
-                  </CardBody>
-                </Card>
-              </StaggerItem>
-            );
-          })}
-        </StaggerList>
+                return (
+                  <SortableCard key={item.id} id={item.id}>
+                    {(handle) => (
+                      <Card className="shadow-sm border border-gray-200 dark:border-gray-700 h-full">
+                        <CardHeader className="pb-2">
+                          <div className="flex justify-between items-start w-full gap-2">
+                            <div className="flex min-w-0 flex-1 items-start gap-1.5">
+                              <DragHandle className="-ml-1.5" handle={handle} />
+                              <div className="min-w-0 flex-1">
+                                <h3 className="font-semibold truncate">
+                                  {item.name}
+                                </h3>
+                                <p className="flex min-w-0 items-center gap-1.5 text-xs text-default-500">
+                                  <span
+                                    className={`h-2 w-2 shrink-0 rounded-full ${item.nodeOnline ? "bg-success" : "bg-default-300"}`}
+                                  />
+                                  <span className="min-w-0 truncate">
+                                    {item.nodeName || `节点 #${item.nodeId}`}
+                                    {item.nodeOnline ? "" : "（离线）"}
+                                  </span>
+                                  <span className="shrink-0 whitespace-nowrap font-mono">
+                                    · {item.host}
+                                  </span>
+                                </p>
+                              </div>
+                            </div>
+                            <Chip
+                              className="shrink-0 whitespace-nowrap"
+                              color={chip.color}
+                              size="sm"
+                              variant="flat"
+                            >
+                              {chip.label}
+                            </Chip>
+                          </div>
+                        </CardHeader>
+                        <CardBody className="pt-0 space-y-3">
+                          <div className="flex flex-wrap gap-1">
+                            {item.protocols.map((proto) => (
+                              <Chip key={proto} size="sm" variant="flat">
+                                {proto === "ss"
+                                  ? `SS ${item.params.ssPort}`
+                                  : proto === "mieru"
+                                    ? `mieru ${item.params.mieruPort}`
+                                    : `Sudoku ${item.params.sudokuPort}`}
+                              </Chip>
+                            ))}
+                          </div>
+                          <div className="text-xs text-default-500">
+                            代理节点 {item.proxyNodes} 个 · 上次执行{" "}
+                            {formatDateTime(item.lastRunTime)}
+                            {item.remark ? ` · ${item.remark}` : ""}
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            <Button
+                              color="primary"
+                              isDisabled={running}
+                              isLoading={busy}
+                              size="sm"
+                              variant="flat"
+                              onPress={() => runOp(item, "install")}
+                            >
+                              {item.status === "pending" ? "部署" : "重新部署"}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="flat"
+                              onPress={() => {
+                                setLogItem(item);
+                                setLogId(item.id);
+                              }}
+                            >
+                              日志
+                            </Button>
+                            <Button
+                              isDisabled={running || busy}
+                              size="sm"
+                              variant="flat"
+                              onPress={() => runOp(item, "info")}
+                            >
+                              刷新状态
+                            </Button>
+                            <Button
+                              isDisabled={running}
+                              size="sm"
+                              variant="flat"
+                              onPress={() => openCopy(item)}
+                            >
+                              复制到其他节点
+                            </Button>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5 border-t border-divider pt-2">
+                            <Button
+                              className="h-7 min-w-0 px-2 text-xs"
+                              isDisabled={running}
+                              size="sm"
+                              variant="light"
+                              onPress={() => openEdit(item)}
+                            >
+                              编辑参数
+                            </Button>
+                            <Button
+                              className="h-7 min-w-0 px-2 text-xs"
+                              size="sm"
+                              variant="light"
+                              onPress={() => generateNodes(item)}
+                            >
+                              重新生成代理节点
+                            </Button>
+                            <Button
+                              className="h-7 min-w-0 px-2 text-xs"
+                              size="sm"
+                              variant="light"
+                              onPress={() => openCommand(item)}
+                            >
+                              复制安装命令
+                            </Button>
+                            <Button
+                              className="h-7 min-w-0 px-2 text-xs"
+                              color="warning"
+                              isDisabled={
+                                running || item.status === "uninstalled"
+                              }
+                              size="sm"
+                              variant="light"
+                              onPress={() => setUninstallItem(item)}
+                            >
+                              卸载
+                            </Button>
+                            <Button
+                              className="h-7 min-w-0 px-2 text-xs"
+                              color="danger"
+                              isDisabled={running}
+                              size="sm"
+                              variant="light"
+                              onPress={() => {
+                                setDeleteNodes(true);
+                                setDeleteItem(item);
+                              }}
+                            >
+                              删除记录
+                            </Button>
+                          </div>
+                        </CardBody>
+                      </Card>
+                    )}
+                  </SortableCard>
+                );
+              })}
+            </div>
+          </SortableContext>
+        </DndContext>
       )}
 
       {/* 新建 / 编辑 */}

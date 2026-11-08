@@ -316,6 +316,7 @@ export interface Deployment {
   lastLog?: string;
   lastRunTime: number;
   remark: string;
+  inx: number;
   createdTime: number;
   updatedTime: number;
   proxyNodes: number;
@@ -374,6 +375,8 @@ export const refreshDeployment = (id: number) =>
   Network.post<DeployStartResult>("/deploy/refresh", { id }, deployTimeout);
 export const uninstallDeployment = (id: number) =>
   Network.post<DeployStartResult>("/deploy/uninstall", { id }, deployTimeout);
+export const updateDeployOrder = (items: { id: number; inx: number }[]) =>
+  Network.post("/deploy/update-order", { items });
 export const getDeployCommand = (id: number) =>
   Network.post<{ command: string; scriptUrl: string }>("/deploy/command", {
     id,

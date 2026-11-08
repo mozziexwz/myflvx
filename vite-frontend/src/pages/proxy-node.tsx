@@ -1,10 +1,25 @@
 import type { UserTunnelApiItem } from "@/api/types";
+import type { DragEndEvent } from "@dnd-kit/core";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom";
+import { DndContext, closestCenter } from "@dnd-kit/core";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
 
 import { AnimatedPage } from "@/components/animated-page";
+import {
+  DragHandle,
+  SortableTableRow,
+  applyOrder,
+  draggedIds,
+  orderItems,
+  reorderIds,
+  useSortSensors,
+} from "@/components/sortable";
 import { SearchBar } from "@/components/search-bar";
 import { PageLoadingState } from "@/components/page-state";
 import { PageIntro } from "@/components/page-intro";
@@ -29,7 +44,6 @@ import {
   TableHeader,
   TableColumn,
   TableBody,
-  TableRow,
   TableCell,
 } from "@/shadcn-bridge/heroui/table";
 import { userTunnel } from "@/api";
@@ -46,6 +60,7 @@ import {
   setProxyNodeTags,
   toggleProxyNodes,
   updateProxyNode,
+  updateProxyNodeOrder,
   type ParsedProxyBrief,
   type ProxyNode,
   type RelayCandidate,
@@ -396,6 +411,33 @@ export default function ProxyNodePage() {
     }
   };
 
+  // ─── 拖拽排序 ─────────────────────────────────────────────
+
+  const sortSensors = useSortSensors();
+
+  const handleDragEnd = async (event: DragEndEvent) => {
+    const ids = draggedIds(event);
+
+    if (!ids) return;
+    const order = reorderIds(
+      nodes.map((n) => n.id),
+      filteredNodes.map((n) => n.id),
+      ids[0],
+      ids[1],
+    );
+
+    if (!order) return;
+    const previous = nodes;
+
+    setNodes(applyOrder(nodes, order));
+    const res = await updateProxyNodeOrder(orderItems(order));
+
+    if (res.code !== 0) {
+      toast.error(res.msg || "保存排序失败");
+      setNodes(previous);
+    }
+  };
+
   // ─── 批量操作 ─────────────────────────────────────────────
 
   const selectedIds = Array.from(selected);
@@ -717,140 +759,161 @@ export default function ProxyNodePage() {
         </Card>
       ) : (
         <Card>
-          <Table
-            aria-label="节点列表"
-            className="overflow-x-auto min-w-full"
-            classNames={{
-              th: "bg-default-100/50 text-default-600 font-semibold text-sm border-b border-divider py-3 whitespace-nowrap",
-              td: "py-3 border-b border-divider/50 group-data-[last=true]:border-b-0",
-              tr: "hover:bg-default-50/50 transition-colors",
-            }}
+          <DndContext
+            collisionDetection={closestCenter}
+            sensors={sortSensors}
+            onDragEnd={handleDragEnd}
           >
-            <TableHeader>
-              <TableColumn className="w-10">
-                <Checkbox
-                  isSelected={allFilteredSelected}
-                  onValueChange={toggleSelectAll}
-                />
-              </TableColumn>
-              <TableColumn>节点</TableColumn>
-              <TableColumn>协议</TableColumn>
-              <TableColumn>地址</TableColumn>
-              <TableColumn>来源</TableColumn>
-              <TableColumn>标签</TableColumn>
-              <TableColumn>启用</TableColumn>
-              <TableColumn>操作</TableColumn>
-            </TableHeader>
-            <TableBody items={filteredNodes}>
-              {(node: ProxyNode) => (
-                <TableRow key={node.id}>
-                  <TableCell>
+            <SortableContext
+              items={filteredNodes.map((n) => n.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <Table
+                aria-label="节点列表"
+                className="overflow-x-auto min-w-full"
+                classNames={{
+                  th: "bg-default-100/50 text-default-600 font-semibold text-sm border-b border-divider py-3 whitespace-nowrap",
+                  td: "py-3 border-b border-divider/50 group-data-[last=true]:border-b-0",
+                  tr: "hover:bg-default-50/50 transition-colors",
+                }}
+              >
+                <TableHeader>
+                  <TableColumn className="w-10">
                     <Checkbox
-                      isSelected={selected.has(node.id)}
-                      onValueChange={() => toggleSelect(node.id)}
+                      isSelected={allFilteredSelected}
+                      onValueChange={toggleSelectAll}
                     />
-                  </TableCell>
-                  <TableCell>
-                    <div className="min-w-[160px]">
-                      <div className="font-medium text-sm text-foreground">
-                        {node.name}
-                      </div>
-                      {node.source === "relay" && (
-                        <div className="text-xs text-default-500 mt-0.5">
-                          源节点：{node.parentName || "-"} · 隧道：
-                          {node.tunnelName || "-"}
-                          {node.relayStatus === "forward_missing" && (
-                            <span className="text-danger ml-1">
-                              （转发已删除）
+                  </TableColumn>
+                  <TableColumn className="w-12">排序</TableColumn>
+                  <TableColumn>节点</TableColumn>
+                  <TableColumn>协议</TableColumn>
+                  <TableColumn>地址</TableColumn>
+                  <TableColumn>来源</TableColumn>
+                  <TableColumn>标签</TableColumn>
+                  <TableColumn>启用</TableColumn>
+                  <TableColumn>操作</TableColumn>
+                </TableHeader>
+                <TableBody items={filteredNodes}>
+                  {(node: ProxyNode) => (
+                    <SortableTableRow id={node.id}>
+                      {(handle) => (
+                        <>
+                          <TableCell>
+                            <Checkbox
+                              isSelected={selected.has(node.id)}
+                              onValueChange={() => toggleSelect(node.id)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <DragHandle handle={handle} />
+                          </TableCell>
+                          <TableCell>
+                            <div className="min-w-[160px]">
+                              <div className="font-medium text-sm text-foreground">
+                                {node.name}
+                              </div>
+                              {node.source === "relay" && (
+                                <div className="text-xs text-default-500 mt-0.5">
+                                  源节点：{node.parentName || "-"} · 隧道：
+                                  {node.tunnelName || "-"}
+                                  {node.relayStatus === "forward_missing" && (
+                                    <span className="text-danger ml-1">
+                                      （转发已删除）
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                              {node.remark && (
+                                <div className="text-xs text-default-400 mt-0.5">
+                                  {node.remark}
+                                </div>
+                              )}
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            <Chip size="sm" variant="flat">
+                              {protocolLabel(node.protocol)}
+                            </Chip>
+                          </TableCell>
+                          <TableCell>
+                            <span className="font-mono text-xs text-default-600 whitespace-nowrap">
+                              {hostPort(node.server, node.port)}
                             </span>
-                          )}
-                        </div>
+                          </TableCell>
+                          <TableCell>
+                            <Chip
+                              color={sourceColor(node.source)}
+                              size="sm"
+                              variant="flat"
+                            >
+                              {sourceLabel(node.source)}
+                            </Chip>
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex flex-wrap gap-1 max-w-[180px]">
+                              {node.tags.map((t) => (
+                                <Chip key={t} size="sm" variant="flat">
+                                  {t}
+                                </Chip>
+                              ))}
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            <Switch
+                              isSelected={node.enabled}
+                              size="sm"
+                              onValueChange={(v) => toggleOne(node, v)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex flex-wrap items-center gap-1.5 min-w-max">
+                              <Button
+                                className="h-6 px-2 min-w-0 text-xs"
+                                isDisabled={!node.shareLink}
+                                size="sm"
+                                variant="flat"
+                                onPress={() =>
+                                  copyText(node.shareLink, "分享链接")
+                                }
+                              >
+                                复制链接
+                              </Button>
+                              {node.source !== "relay" && (
+                                <Button
+                                  className="h-6 px-2 min-w-0 text-xs bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:text-emerald-400"
+                                  size="sm"
+                                  variant="flat"
+                                  onPress={() => openRelay(node)}
+                                >
+                                  隧道中转
+                                </Button>
+                              )}
+                              <Button
+                                className="h-6 px-2 min-w-0 text-xs bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-950/30 dark:text-indigo-400"
+                                size="sm"
+                                variant="flat"
+                                onPress={() => openEdit(node)}
+                              >
+                                编辑
+                              </Button>
+                              <Button
+                                className="h-6 px-2 min-w-0 text-xs bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-950/30 dark:text-rose-400"
+                                size="sm"
+                                variant="flat"
+                                onPress={() => openDelete([node.id])}
+                              >
+                                删除
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </>
                       )}
-                      {node.remark && (
-                        <div className="text-xs text-default-400 mt-0.5">
-                          {node.remark}
-                        </div>
-                      )}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <Chip size="sm" variant="flat">
-                      {protocolLabel(node.protocol)}
-                    </Chip>
-                  </TableCell>
-                  <TableCell>
-                    <span className="font-mono text-xs text-default-600 whitespace-nowrap">
-                      {hostPort(node.server, node.port)}
-                    </span>
-                  </TableCell>
-                  <TableCell>
-                    <Chip
-                      color={sourceColor(node.source)}
-                      size="sm"
-                      variant="flat"
-                    >
-                      {sourceLabel(node.source)}
-                    </Chip>
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap gap-1 max-w-[180px]">
-                      {node.tags.map((t) => (
-                        <Chip key={t} size="sm" variant="flat">
-                          {t}
-                        </Chip>
-                      ))}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <Switch
-                      isSelected={node.enabled}
-                      size="sm"
-                      onValueChange={(v) => toggleOne(node, v)}
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap items-center gap-1.5 min-w-max">
-                      <Button
-                        className="h-6 px-2 min-w-0 text-xs"
-                        isDisabled={!node.shareLink}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => copyText(node.shareLink, "分享链接")}
-                      >
-                        复制链接
-                      </Button>
-                      {node.source !== "relay" && (
-                        <Button
-                          className="h-6 px-2 min-w-0 text-xs bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:text-emerald-400"
-                          size="sm"
-                          variant="flat"
-                          onPress={() => openRelay(node)}
-                        >
-                          隧道中转
-                        </Button>
-                      )}
-                      <Button
-                        className="h-6 px-2 min-w-0 text-xs bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-950/30 dark:text-indigo-400"
-                        size="sm"
-                        variant="flat"
-                        onPress={() => openEdit(node)}
-                      >
-                        编辑
-                      </Button>
-                      <Button
-                        className="h-6 px-2 min-w-0 text-xs bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-950/30 dark:text-rose-400"
-                        size="sm"
-                        variant="flat"
-                        onPress={() => openDelete([node.id])}
-                      >
-                        删除
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
+                    </SortableTableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </SortableContext>
+          </DndContext>
         </Card>
       )}
 

@@ -1,8 +1,24 @@
+import type { DragEndEvent } from "@dnd-kit/core";
+
 import { useCallback, useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom";
+import { DndContext, closestCenter } from "@dnd-kit/core";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
 
 import { AnimatedPage } from "@/components/animated-page";
+import {
+  DragHandle,
+  SortableTableRow,
+  applyOrder,
+  draggedIds,
+  orderItems,
+  reorderIds,
+  useSortSensors,
+} from "@/components/sortable";
 import { PageLoadingState } from "@/components/page-state";
 import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
@@ -23,7 +39,6 @@ import {
   TableHeader,
   TableColumn,
   TableBody,
-  TableRow,
   TableCell,
 } from "@/shadcn-bridge/heroui/table";
 import {
@@ -34,6 +49,7 @@ import {
   getSubscriptions,
   refreshSubscription,
   updateSubscription,
+  updateSubscriptionOrder,
   type Subscription,
   type SubscriptionMutation,
 } from "@/api/enhanced";
@@ -260,6 +276,28 @@ export default function SubscriptionPage() {
     }
   };
 
+  // 拖拽排序（与「订阅下载」页共用同一个顺序）
+  const sortSensors = useSortSensors();
+
+  const handleDragEnd = async (event: DragEndEvent) => {
+    const ids = draggedIds(event);
+
+    if (!ids) return;
+    const allIds = items.map((s) => s.id);
+    const order = reorderIds(allIds, allIds, ids[0], ids[1]);
+
+    if (!order) return;
+    const previous = items;
+
+    setItems(applyOrder(items, order));
+    const res = await updateSubscriptionOrder(orderItems(order));
+
+    if (res.code !== 0) {
+      toast.error(res.msg || "保存排序失败");
+      setItems(previous);
+    }
+  };
+
   const toggleEnabled = async (item: Subscription, enabled: boolean) => {
     const base: SubscriptionMutation = {
       id: item.id,
@@ -337,120 +375,150 @@ export default function SubscriptionPage() {
         </Card>
       ) : (
         <Card>
-          <Table
-            aria-label="订阅列表"
-            className="overflow-x-auto min-w-full"
-            classNames={{
-              th: "bg-default-100/50 text-default-600 font-semibold text-sm border-b border-divider py-3 whitespace-nowrap",
-              td: "py-3 border-b border-divider/50 group-data-[last=true]:border-b-0",
-              tr: "hover:bg-default-50/50 transition-colors",
-            }}
+          <DndContext
+            collisionDetection={closestCenter}
+            sensors={sortSensors}
+            onDragEnd={handleDragEnd}
           >
-            <TableHeader>
-              <TableColumn>订阅</TableColumn>
-              <TableColumn>类型</TableColumn>
-              <TableColumn>节点</TableColumn>
-              <TableColumn>流量 / 到期</TableColumn>
-              <TableColumn>更新时间</TableColumn>
-              <TableColumn>启用</TableColumn>
-              <TableColumn>操作</TableColumn>
-            </TableHeader>
-            <TableBody items={items}>
-              {(item: Subscription) => (
-                <TableRow key={item.id}>
-                  <TableCell>
-                    <div className="min-w-[140px]">
-                      <div className="font-medium text-sm">{item.name}</div>
-                      <div className="text-xs text-default-400">
-                        {item.fileName}
-                        {item.remark ? ` · ${item.remark}` : ""}
-                      </div>
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <Chip color={typeColor(item.type)} size="sm" variant="flat">
-                      {typeLabel(item.type)}
-                    </Chip>
-                  </TableCell>
-                  <TableCell>
-                    <span className="text-sm">
-                      {item.nodeCount < 0 ? "全部启用节点" : item.nodeCount}
-                    </span>
-                  </TableCell>
-                  <TableCell>
-                    <div className="text-xs text-default-500 whitespace-nowrap">
-                      {item.subInfo && item.subInfo.total > 0 && (
-                        <div>
-                          {formatBytes(
-                            item.subInfo.upload + item.subInfo.download,
-                          )}{" "}
-                          / {formatBytes(item.subInfo.total)}
-                        </div>
+            <SortableContext
+              items={items.map((s) => s.id)}
+              strategy={verticalListSortingStrategy}
+            >
+              <Table
+                aria-label="订阅列表"
+                className="overflow-x-auto min-w-full"
+                classNames={{
+                  th: "bg-default-100/50 text-default-600 font-semibold text-sm border-b border-divider py-3 whitespace-nowrap",
+                  td: "py-3 border-b border-divider/50 group-data-[last=true]:border-b-0",
+                  tr: "hover:bg-default-50/50 transition-colors",
+                }}
+              >
+                <TableHeader>
+                  <TableColumn className="w-12">排序</TableColumn>
+                  <TableColumn>订阅</TableColumn>
+                  <TableColumn>类型</TableColumn>
+                  <TableColumn>节点</TableColumn>
+                  <TableColumn>流量 / 到期</TableColumn>
+                  <TableColumn>更新时间</TableColumn>
+                  <TableColumn>启用</TableColumn>
+                  <TableColumn>操作</TableColumn>
+                </TableHeader>
+                <TableBody items={items}>
+                  {(item: Subscription) => (
+                    <SortableTableRow id={item.id}>
+                      {(handle) => (
+                        <>
+                          <TableCell>
+                            <DragHandle handle={handle} />
+                          </TableCell>
+                          <TableCell>
+                            <div className="min-w-[140px]">
+                              <div className="font-medium text-sm">
+                                {item.name}
+                              </div>
+                              <div className="text-xs text-default-400">
+                                {item.fileName}
+                                {item.remark ? ` · ${item.remark}` : ""}
+                              </div>
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            <Chip
+                              color={typeColor(item.type)}
+                              size="sm"
+                              variant="flat"
+                            >
+                              {typeLabel(item.type)}
+                            </Chip>
+                          </TableCell>
+                          <TableCell>
+                            <span className="text-sm">
+                              {item.nodeCount < 0
+                                ? "全部启用节点"
+                                : item.nodeCount}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <div className="text-xs text-default-500 whitespace-nowrap">
+                              {item.subInfo && item.subInfo.total > 0 && (
+                                <div>
+                                  {formatBytes(
+                                    item.subInfo.upload + item.subInfo.download,
+                                  )}{" "}
+                                  / {formatBytes(item.subInfo.total)}
+                                </div>
+                              )}
+                              {item.subInfo?.expire ? (
+                                <div>
+                                  机场到期{" "}
+                                  {formatDate(item.subInfo.expire * 1000)}
+                                </div>
+                              ) : null}
+                              {!item.subInfo && "-"}
+                            </div>
+                          </TableCell>
+                          <TableCell>
+                            <span className="text-xs text-default-500 whitespace-nowrap">
+                              {formatDateTime(
+                                item.lastSyncTime || item.updatedTime,
+                              )}
+                            </span>
+                          </TableCell>
+                          <TableCell>
+                            <Switch
+                              isSelected={item.enabled}
+                              size="sm"
+                              onValueChange={(v) => toggleEnabled(item, v)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex flex-wrap items-center gap-1.5 min-w-max">
+                              <Button
+                                className="h-6 px-2 min-w-0 text-xs"
+                                isLoading={busyId === item.id}
+                                size="sm"
+                                variant="flat"
+                                onPress={() => download(item)}
+                              >
+                                下载
+                              </Button>
+                              {item.type !== "upload" && (
+                                <Button
+                                  className="h-6 px-2 min-w-0 text-xs"
+                                  isDisabled={busyId === item.id}
+                                  size="sm"
+                                  variant="flat"
+                                  onPress={() => refresh(item)}
+                                >
+                                  {item.type === "import" ? "拉取" : "重新生成"}
+                                </Button>
+                              )}
+                              <Button
+                                className="h-6 px-2 min-w-0 text-xs bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-950/30 dark:text-indigo-400"
+                                size="sm"
+                                variant="flat"
+                                onPress={() => openEdit(item)}
+                              >
+                                编辑
+                              </Button>
+                              <Button
+                                className="h-6 px-2 min-w-0 text-xs bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-950/30 dark:text-rose-400"
+                                size="sm"
+                                variant="flat"
+                                onPress={() => setDeleteTarget(item)}
+                              >
+                                删除
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </>
                       )}
-                      {item.subInfo?.expire ? (
-                        <div>
-                          机场到期 {formatDate(item.subInfo.expire * 1000)}
-                        </div>
-                      ) : null}
-                      {!item.subInfo && "-"}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <span className="text-xs text-default-500 whitespace-nowrap">
-                      {formatDateTime(item.lastSyncTime || item.updatedTime)}
-                    </span>
-                  </TableCell>
-                  <TableCell>
-                    <Switch
-                      isSelected={item.enabled}
-                      size="sm"
-                      onValueChange={(v) => toggleEnabled(item, v)}
-                    />
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap items-center gap-1.5 min-w-max">
-                      <Button
-                        className="h-6 px-2 min-w-0 text-xs"
-                        isLoading={busyId === item.id}
-                        size="sm"
-                        variant="flat"
-                        onPress={() => download(item)}
-                      >
-                        下载
-                      </Button>
-                      {item.type !== "upload" && (
-                        <Button
-                          className="h-6 px-2 min-w-0 text-xs"
-                          isDisabled={busyId === item.id}
-                          size="sm"
-                          variant="flat"
-                          onPress={() => refresh(item)}
-                        >
-                          {item.type === "import" ? "拉取" : "重新生成"}
-                        </Button>
-                      )}
-                      <Button
-                        className="h-6 px-2 min-w-0 text-xs bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-950/30 dark:text-indigo-400"
-                        size="sm"
-                        variant="flat"
-                        onPress={() => openEdit(item)}
-                      >
-                        编辑
-                      </Button>
-                      <Button
-                        className="h-6 px-2 min-w-0 text-xs bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-950/30 dark:text-rose-400"
-                        size="sm"
-                        variant="flat"
-                        onPress={() => setDeleteTarget(item)}
-                      >
-                        删除
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
+                    </SortableTableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </SortableContext>
+          </DndContext>
         </Card>
       )}
 
