@@ -79,6 +79,7 @@ type ProxyDeploy struct {
 	LastLog     string `gorm:"column:last_log;type:text;not null"`
 	LastRunTime int64  `gorm:"column:last_run_time;not null;default:0"`
 	Remark      string `gorm:"type:text;not null;default:''"`
+	Inx         int    `gorm:"not null;default:0"`
 	CreatedTime int64  `gorm:"column:created_time;not null"`
 	UpdatedTime int64  `gorm:"column:updated_time;not null"`
 }
@@ -146,6 +147,7 @@ type ProxyDeployBackup struct {
 	Status      string `json:"status"`
 	LastRunTime int64  `json:"lastRunTime,omitempty"`
 	Remark      string `json:"remark,omitempty"`
+	Inx         int    `json:"inx,omitempty"`
 	CreatedTime int64  `json:"createdTime"`
 	UpdatedTime int64  `json:"updatedTime"`
 }

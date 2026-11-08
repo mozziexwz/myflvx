@@ -60,6 +60,7 @@ type deployView struct {
 	LastLog     string                `json:"lastLog,omitempty"`
 	LastRunTime int64                 `json:"lastRunTime"`
 	Remark      string                `json:"remark"`
+	Inx         int                   `json:"inx"`
 	CreatedTime int64                 `json:"createdTime"`
 	UpdatedTime int64                 `json:"updatedTime"`
 	ProxyNodes  int                   `json:"proxyNodes"`
@@ -145,7 +146,7 @@ func (h *Handler) deployToView(d model.ProxyDeploy, withLog bool, nodes map[int6
 	}
 	v := deployView{
 		ID: d.ID, Name: d.Name, NodeID: d.NodeID, Host: d.Host, Protocols: params.Protocols, Params: params,
-		Status: status, LastRunTime: d.LastRunTime, Remark: d.Remark, CreatedTime: d.CreatedTime, UpdatedTime: d.UpdatedTime,
+		Status: status, LastRunTime: d.LastRunTime, Remark: d.Remark, Inx: d.Inx, CreatedTime: d.CreatedTime, UpdatedTime: d.UpdatedTime,
 	}
 	if status == deployStatusRunning {
 		v.TaskOp = d.TaskOp
@@ -918,6 +919,23 @@ func (h *Handler) deploySyncNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.WriteJSON(w, response.OK(map[string]interface{}{"nodes": count, "warnings": warnings}))
+}
+
+// deployUpdateOrder stores the drag-sorted order of the deployment list.
+func (h *Handler) deployUpdateOrder(w http.ResponseWriter, r *http.Request) {
+	var req orderRequest
+	if !decodeEnhancedBody(w, r, &req) {
+		return
+	}
+	order := map[int64]int{}
+	for _, item := range req.Items {
+		order[item.ID] = item.Inx
+	}
+	if err := h.repo.UpdateProxyDeployOrder(order); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	response.WriteJSON(w, response.OKEmpty())
 }
 
 func (h *Handler) deploySettings(w http.ResponseWriter, r *http.Request) {

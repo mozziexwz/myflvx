@@ -62,6 +62,7 @@ func (h *Handler) registerEnhancedRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/deploy/uninstall", h.deployUninstall)
 	mux.HandleFunc("/api/v1/deploy/command", h.deployCommand)
 	mux.HandleFunc("/api/v1/deploy/sync-nodes", h.deploySyncNodes)
+	mux.HandleFunc("/api/v1/deploy/update-order", h.deployUpdateOrder)
 	mux.HandleFunc("/api/v1/deploy/settings", h.deploySettings)
 }
 

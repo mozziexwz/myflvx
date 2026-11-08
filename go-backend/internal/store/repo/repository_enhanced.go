@@ -334,8 +334,23 @@ func (r *Repository) ListProxyDeploys() ([]model.ProxyDeploy, error) {
 		return nil, errors.New("repository not initialized")
 	}
 	var items []model.ProxyDeploy
-	err := r.db.Order("id DESC").Find(&items).Error
+	err := r.db.Order("inx ASC, id ASC").Find(&items).Error
 	return items, err
+}
+
+// UpdateProxyDeployOrder sets inx for the given deployments (drag sorting).
+func (r *Repository) UpdateProxyDeployOrder(order map[int64]int) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		for id, inx := range order {
+			if err := tx.Model(&model.ProxyDeploy{}).Where("id = ?", id).Update("inx", inx).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (r *Repository) GetProxyDeploy(id int64) (*model.ProxyDeploy, error) {
@@ -353,11 +368,19 @@ func (r *Repository) GetProxyDeploy(id int64) (*model.ProxyDeploy, error) {
 	return &item, nil
 }
 
+// CreateProxyDeploy inserts a deployment after the existing ones.
 func (r *Repository) CreateProxyDeploy(item *model.ProxyDeploy) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
-	return r.db.Create(item).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var max sql.NullInt64
+		tx.Model(&model.ProxyDeploy{}).Select("MAX(inx)").Scan(&max)
+		if max.Valid {
+			item.Inx = int(max.Int64) + 1
+		}
+		return tx.Create(item).Error
+	})
 }
 
 func (r *Repository) SaveProxyDeploy(item *model.ProxyDeploy) error {
@@ -611,7 +634,7 @@ func (r *Repository) exportProxyDeploys() ([]model.ProxyDeployBackup, error) {
 		}
 		out = append(out, model.ProxyDeployBackup{
 			ID: d.ID, UserID: d.UserID, Name: d.Name, NodeID: d.NodeID, Host: d.Host, Protocols: d.Protocols, Params: d.Params,
-			Status: status, LastRunTime: d.LastRunTime, Remark: d.Remark, CreatedTime: d.CreatedTime, UpdatedTime: d.UpdatedTime,
+			Status: status, LastRunTime: d.LastRunTime, Remark: d.Remark, Inx: d.Inx, CreatedTime: d.CreatedTime, UpdatedTime: d.UpdatedTime,
 		})
 	}
 	return out, nil
@@ -687,7 +710,7 @@ func importEnhanced(tx *gorm.DB, backup *model.BackupData, typeSet map[string]bo
 		for _, d := range backup.ProxyDeploys {
 			item := model.ProxyDeploy{
 				ID: d.ID, UserID: d.UserID, Name: d.Name, NodeID: d.NodeID, Host: d.Host, Protocols: d.Protocols, Params: d.Params,
-				Status: d.Status, LastRunTime: d.LastRunTime, Remark: d.Remark, CreatedTime: d.CreatedTime, UpdatedTime: now,
+				Status: d.Status, LastRunTime: d.LastRunTime, Remark: d.Remark, Inx: d.Inx, CreatedTime: d.CreatedTime, UpdatedTime: now,
 			}
 			if item.Status == "" || item.Status == "running" {
 				item.Status = "pending"

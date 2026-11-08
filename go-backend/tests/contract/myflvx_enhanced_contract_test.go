@@ -764,3 +764,86 @@ func TestMyflvxTunnelRelayCreatesForwardAndRelayNode(t *testing.T) {
 		t.Fatalf("relay forward should be deleted")
 	}
 }
+
+func TestMyflvxDragSortOrders(t *testing.T) {
+	secret := "myflvx-order-secret"
+	router, r := setupContractRouter(t, secret)
+	seedContractUser(t, r, 2, "order_user", 1, 1)
+	admin := tokenFor(t, 1, "admin_user", 0, secret)
+	user := tokenFor(t, 2, "order_user", 1, secret)
+
+	nodeNames := func(token string) []string {
+		t.Helper()
+		var list proxyNodeListData
+		mustAPI(t, router, token, "/api/v1/proxy-node/list", map[string]interface{}{}, &list)
+		names := []string{}
+		for _, n := range list.Nodes {
+			names = append(names, n.Name)
+		}
+		return names
+	}
+	mustAPI(t, router, admin, "/api/v1/proxy-node/import", map[string]interface{}{"content": testShareLinks}, nil)
+	mustAPI(t, router, user, "/api/v1/proxy-node/import", map[string]interface{}{"content": testShareLinks}, nil)
+	var adminList proxyNodeListData
+	mustAPI(t, router, admin, "/api/v1/proxy-node/list", map[string]interface{}{}, &adminList)
+	if got := strings.Join(nodeNames(admin), ","); got != "Trojan-01,SS-01" {
+		t.Fatalf("unexpected initial order: %s", got)
+	}
+	first, second := adminList.Nodes[0].ID, adminList.Nodes[1].ID
+	reversed := map[string]interface{}{"items": []map[string]interface{}{{"id": second, "inx": 0}, {"id": first, "inx": 1}}}
+	mustAPI(t, router, admin, "/api/v1/proxy-node/update-order", reversed, nil)
+	if got := strings.Join(nodeNames(admin), ","); got != "SS-01,Trojan-01" {
+		t.Fatalf("admin order not saved: %s", got)
+	}
+	// Another user's order request must not touch the admin's nodes.
+	mustAPI(t, router, user, "/api/v1/proxy-node/update-order", map[string]interface{}{"items": []map[string]interface{}{{"id": first, "inx": 0}, {"id": second, "inx": 1}}}, nil)
+	if got := strings.Join(nodeNames(admin), ","); got != "SS-01,Trojan-01" {
+		t.Fatalf("another user changed the admin's order: %s", got)
+	}
+
+	// Subscriptions: 订阅管理 and 订阅下载 share the order.
+	var a, b struct {
+		ID int64 `json:"id"`
+	}
+	upload := "proxies:\n  - {name: up, type: socks5, server: 1.1.1.1, port: 1080}\n"
+	mustAPI(t, router, user, "/api/v1/subscription/create", map[string]interface{}{"name": "A", "type": "upload", "content": upload}, &a)
+	mustAPI(t, router, user, "/api/v1/subscription/create", map[string]interface{}{"name": "B", "type": "upload", "content": upload}, &b)
+	mustAPI(t, router, user, "/api/v1/subscription/update-order", map[string]interface{}{"items": []map[string]interface{}{{"id": b.ID, "inx": 0}, {"id": a.ID, "inx": 1}}}, nil)
+	for _, path := range []string{"/api/v1/subscription/list", "/api/v1/subscription/my/list"} {
+		var subs []struct {
+			Name string `json:"name"`
+		}
+		mustAPI(t, router, user, path, map[string]interface{}{}, &subs)
+		if len(subs) != 2 || subs[0].Name != "B" || subs[1].Name != "A" {
+			t.Fatalf("%s should follow the saved order: %+v", path, subs)
+		}
+	}
+
+	// Deployments: new ones are appended, update-order is admin-only.
+	nodeA := insertMyflvxNode(t, r, "排序A", "order-node-a", "198.51.100.40")
+	nodeB := insertMyflvxNode(t, r, "排序B", "order-node-b", "198.51.100.41")
+	var defaults struct {
+		Params map[string]interface{} `json:"params"`
+	}
+	mustAPI(t, router, admin, "/api/v1/deploy/defaults", map[string]interface{}{}, &defaults)
+	mustAPI(t, router, admin, "/api/v1/deploy/create", map[string]interface{}{"nodeIds": []int64{nodeA, nodeB}, "params": defaults.Params}, nil)
+	var deploys []deployViewData
+	mustAPI(t, router, admin, "/api/v1/deploy/list", map[string]interface{}{}, &deploys)
+	if len(deploys) != 2 || deploys[0].Name != "排序A" || deploys[1].Name != "排序B" {
+		t.Fatalf("unexpected initial deployment order: %+v", deploys)
+	}
+	order := map[string]interface{}{"items": []map[string]interface{}{{"id": deploys[1].ID, "inx": 0}, {"id": deploys[0].ID, "inx": 1}}}
+	if res := callAPI(t, router, user, "/api/v1/deploy/update-order", order); res.Code != 403 {
+		t.Fatalf("non-admin must not reorder deployments, got code=%d", res.Code)
+	}
+	mustAPI(t, router, admin, "/api/v1/deploy/update-order", order, nil)
+	mustAPI(t, router, admin, "/api/v1/deploy/list", map[string]interface{}{}, &deploys)
+	if deploys[0].Name != "排序B" || deploys[1].Name != "排序A" {
+		t.Fatalf("deployment order not saved: %+v", deploys)
+	}
+	mustAPI(t, router, admin, "/api/v1/deploy/create", map[string]interface{}{"nodeIds": []int64{nodeA}, "name": "新部署", "params": defaults.Params}, nil)
+	mustAPI(t, router, admin, "/api/v1/deploy/list", map[string]interface{}{}, &deploys)
+	if len(deploys) != 3 || deploys[2].Name != "新部署" {
+		t.Fatalf("a new deployment should be appended at the end: %+v", deploys)
+	}
+}
