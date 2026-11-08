@@ -1,6 +1,6 @@
 import type { NodeApiItem } from "@/api/types";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom";
 
@@ -10,11 +10,12 @@ import {
   StaggerList,
 } from "@/components/animated-page";
 import { PageLoadingState } from "@/components/page-state";
+import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
 import { SelectableCard } from "@/components/selectable-card";
 import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
 import { Button } from "@/shadcn-bridge/heroui/button";
-import { Input, Textarea } from "@/shadcn-bridge/heroui/input";
+import { Input } from "@/shadcn-bridge/heroui/input";
 import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
 import { Checkbox } from "@/shadcn-bridge/heroui/checkbox";
 import { Chip } from "@/shadcn-bridge/heroui/chip";
@@ -27,20 +28,22 @@ import {
 } from "@/shadcn-bridge/heroui/modal";
 import { getNodeList } from "@/api";
 import {
-  applyDeployOutput,
-  createDeployment,
+  copyDeployment,
+  createDeployments,
   deleteDeployment,
   deploySettings,
+  getDeployCommand,
   getDeployDefaults,
   getDeployment,
   getDeployments,
-  runDeployment,
+  refreshDeployment,
+  runDeployments,
   syncDeployNodes,
+  uninstallDeployment,
   updateDeployment,
   type DeployParams,
   type DeploySettings,
   type Deployment,
-  type SSHTarget,
 } from "@/api/enhanced";
 import { copyText, formatDateTime } from "@/utils/enhanced";
 
@@ -54,7 +57,7 @@ const PROTOCOLS = [
   {
     key: "sudoku",
     label: "Sudoku",
-    hint: "上行约 4×，下行 packed 约 1.4×，仅 TCP",
+    hint: "上行约 4×，下行 packed 约 1.33×，仅 TCP",
   },
 ];
 
@@ -82,14 +85,25 @@ const SUDOKU_TABLES = [
   { key: "up_entropy_down_ascii", label: "up_entropy_down_ascii" },
 ];
 
-const statusChip = (status: string) => {
-  switch (status) {
+const OP_LABEL: Record<string, string> = {
+  install: "部署中",
+  info: "刷新中",
+  uninstall: "卸载中",
+};
+
+const statusChip = (item: Pick<Deployment, "status" | "taskOp">) => {
+  switch (item.status) {
     case "success":
       return { color: "success" as const, label: "已部署" };
     case "running":
-      return { color: "primary" as const, label: "部署中" };
+      return {
+        color: "primary" as const,
+        label: OP_LABEL[item.taskOp || ""] || "执行中",
+      };
     case "failed":
       return { color: "danger" as const, label: "失败" };
+    case "uninstalled":
+      return { color: "warning" as const, label: "已卸载" };
     default:
       return { color: "default" as const, label: "待部署" };
   }
@@ -124,24 +138,36 @@ const randomUUID = () =>
     ? crypto.randomUUID()
     : `${randomHex(4)}-${randomHex(2)}-4${randomHex(2).slice(1)}-a${randomHex(2).slice(1)}-${randomHex(6)}`;
 
+// 新建 / 复制后的提示：每条未能开始的部署对应一条 warning
+const batchMessage = (
+  verb: string,
+  count: number,
+  run: boolean,
+  warnings: string[] = [],
+) => {
+  if (!run) return `${verb} ${count} 条部署`;
+  const started = Math.max(count - warnings.length, 0);
+
+  return started > 0
+    ? `${verb} ${count} 条部署，${started} 个节点开始部署`
+    : `${verb} ${count} 条部署，但都没有开始部署`;
+};
+
+const nodeAddress = (node: NodeApiItem) =>
+  String(node.serverIp || node.serverIpV4 || node.serverIpV6 || "");
+
+const isOnline = (node: NodeApiItem) => node.status === 1;
+
 interface DeployForm {
   id?: number;
+  nodeName?: string;
   name: string;
-  nodeId: string;
+  host: string;
+  nodeIds: number[];
   remark: string;
+  run: boolean;
   params: DeployParams;
 }
-
-const emptySSH: SSHTarget = {
-  host: "",
-  port: 22,
-  username: "root",
-  authType: "password",
-  password: "",
-  privateKey: "",
-  passphrase: "",
-  useSudo: false,
-};
 
 export default function DeployPage() {
   const navigate = useNavigate();
@@ -153,20 +179,20 @@ export default function DeployPage() {
   const [settingsUrl, setSettingsUrl] = useState("");
   const [settingsProxy, setSettingsProxy] = useState(false);
 
-  const [formOpen, setFormOpen] = useState(false);
   const [form, setForm] = useState<DeployForm | null>(null);
   const [saving, setSaving] = useState(false);
 
+  const [copyItem, setCopyItem] = useState<Deployment | null>(null);
+  const [copyNodeIds, setCopyNodeIds] = useState<number[]>([]);
+  const [copyRun, setCopyRun] = useState(true);
   const [commandItem, setCommandItem] = useState<Deployment | null>(null);
-  const [sshItem, setSshItem] = useState<Deployment | null>(null);
-  const [ssh, setSsh] = useState<SSHTarget>(emptySSH);
-  const [outputItem, setOutputItem] = useState<Deployment | null>(null);
-  const [outputText, setOutputText] = useState("");
+  const [commandText, setCommandText] = useState("");
+  const [logId, setLogId] = useState<number | null>(null);
   const [logItem, setLogItem] = useState<Deployment | null>(null);
+  const [uninstallItem, setUninstallItem] = useState<Deployment | null>(null);
   const [deleteItem, setDeleteItem] = useState<Deployment | null>(null);
   const [deleteNodes, setDeleteNodes] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const pollRef = useRef<number | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -178,7 +204,7 @@ export default function DeployPage() {
       ]);
 
       if (listRes.code === 0 && listRes.data) setItems(listRes.data);
-      else toast.error(listRes.msg || "加载部署记录失败");
+      else if (!silent) toast.error(listRes.msg || "加载部署记录失败");
       if (nodeRes.code === 0 && nodeRes.data) setFlvxNodes(nodeRes.data);
       if (settingsRes.code === 0 && settingsRes.data)
         setSettings(settingsRes.data);
@@ -189,11 +215,47 @@ export default function DeployPage() {
 
   useEffect(() => {
     void load();
+  }, [load]);
+
+  // 有任务在执行时定时刷新列表
+  const anyRunning = items.some((i) => i.status === "running");
+
+  useEffect(() => {
+    if (!anyRunning) return;
+    const timer = window.setInterval(() => void load(true), 3000);
+
+    return () => window.clearInterval(timer);
+  }, [anyRunning, load]);
+
+  // 日志窗口打开时跟踪日志
+  useEffect(() => {
+    if (logId === null) return;
+    let stopped = false;
+    const fetchLog = async () => {
+      const res = await getDeployment(logId);
+
+      if (!stopped && res.code === 0 && res.data) setLogItem(res.data);
+    };
+
+    void fetchLog();
+    const timer = window.setInterval(() => void fetchLog(), 2000);
 
     return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
+      stopped = true;
+      window.clearInterval(timer);
     };
-  }, [load]);
+  }, [logId]);
+
+  const nodeById = useMemo(() => {
+    const map = new Map<number, NodeApiItem>();
+
+    flvxNodes.forEach((n) => map.set(n.id, n));
+
+    return map;
+  }, [flvxNodes]);
+
+  const showWarnings = (warnings?: string[]) =>
+    (warnings || []).forEach((w) => toast(w, { icon: "⚠️", duration: 8000 }));
 
   // ─── 新建 / 编辑 ──────────────────────────────────────────
 
@@ -205,19 +267,27 @@ export default function DeployPage() {
 
       return;
     }
-    setForm({ name: "", nodeId: "", remark: "", params: res.data.params });
-    setFormOpen(true);
+    setForm({
+      name: "",
+      host: "",
+      nodeIds: [],
+      remark: "",
+      run: true,
+      params: res.data.params,
+    });
   };
 
   const openEdit = (item: Deployment) => {
     setForm({
       id: item.id,
+      nodeName: item.nodeName,
       name: item.name,
-      nodeId: item.nodeId ? String(item.nodeId) : "",
+      host: item.host,
+      nodeIds: [item.nodeId],
       remark: item.remark || "",
+      run: false,
       params: { ...item.params },
     });
-    setFormOpen(true);
   };
 
   const setParam = <K extends keyof DeployParams>(
@@ -229,13 +299,13 @@ export default function DeployPage() {
     );
   };
 
-  const toggleProtocol = (key: string, on: boolean) => {
+  const toggleProtocol = (key: string) => {
     setForm((prev) => {
       if (!prev) return prev;
       const set = new Set(prev.params.protocols);
 
-      if (on) set.add(key);
-      else set.delete(key);
+      if (set.has(key)) set.delete(key);
+      else set.add(key);
 
       return {
         ...prev,
@@ -247,26 +317,21 @@ export default function DeployPage() {
     });
   };
 
-  const pickFlvxNode = (nodeId: string) => {
+  const toggleFormNode = (id: number) => {
     setForm((prev) => {
       if (!prev) return prev;
-      const node = flvxNodes.find((n) => String(n.id) === nodeId);
-      const serverIp = node
-        ? String((node as Record<string, unknown>).serverIp || "")
-        : "";
+      const set = new Set(prev.nodeIds);
 
-      return {
-        ...prev,
-        nodeId,
-        name: prev.name || (node?.name ?? ""),
-        params: { ...prev.params, host: serverIp || prev.params.host },
-      };
+      if (set.has(id)) set.delete(id);
+      else set.add(id);
+
+      return { ...prev, nodeIds: Array.from(set) };
     });
   };
 
   const regenerate = async () => {
     if (!form) return;
-    const res = await getDeployDefaults(form.params.host);
+    const res = await getDeployDefaults();
 
     if (res.code === 0 && res.data) {
       setForm({
@@ -274,7 +339,9 @@ export default function DeployPage() {
         params: {
           ...res.data.params,
           protocols: form.params.protocols,
-          host: form.params.host,
+          ipVersion: form.params.ipVersion,
+          blockPrivate: form.params.blockPrivate,
+          mihomoVersion: form.params.mihomoVersion,
         },
       });
       toast.success("已重新生成端口和密钥");
@@ -283,131 +350,158 @@ export default function DeployPage() {
 
   const submitForm = async () => {
     if (!form) return;
-    if (!form.name.trim()) {
-      toast.error("请填写名称");
-
-      return;
-    }
-    if (!form.params.host.trim()) {
-      toast.error("请填写客户端连接地址");
-
-      return;
-    }
     if (form.params.protocols.length === 0) {
       toast.error("至少选择一个协议");
 
       return;
     }
+    const params: DeployParams = {
+      ...form.params,
+      ssPort: Number(form.params.ssPort) || 0,
+      mieruPort: Number(form.params.mieruPort) || 0,
+      sudokuPort: Number(form.params.sudokuPort) || 0,
+    };
+
     setSaving(true);
     try {
-      const payload = {
+      if (form.id) {
+        if (!form.name.trim()) {
+          toast.error("请填写名称");
+
+          return;
+        }
+        const res = await updateDeployment({
+          id: form.id,
+          name: form.name.trim(),
+          host: form.host.trim(),
+          params,
+          remark: form.remark,
+        });
+
+        if (res.code === 0) {
+          toast.success("已保存，重新部署后服务器上的配置才会更新");
+          setForm(null);
+          void load(true);
+        } else {
+          toast.error(res.msg || "保存失败");
+        }
+
+        return;
+      }
+      if (form.nodeIds.length === 0) {
+        toast.error("请选择要部署的 FLVX 节点");
+
+        return;
+      }
+      const res = await createDeployments({
+        nodeIds: form.nodeIds,
         name: form.name.trim(),
-        nodeId: form.nodeId ? Number(form.nodeId) : 0,
+        host: form.nodeIds.length === 1 ? form.host.trim() : "",
+        params,
         remark: form.remark,
-        params: {
-          ...form.params,
-          ssPort: Number(form.params.ssPort) || 0,
-          mieruPort: Number(form.params.mieruPort) || 0,
-          sudokuPort: Number(form.params.sudokuPort) || 0,
-        },
-      };
-      const res = form.id
-        ? await updateDeployment({ id: form.id, ...payload })
-        : await createDeployment(payload);
+        run: form.run,
+      });
 
       if (res.code === 0 && res.data) {
-        toast.success(form.id ? "已保存" : "已创建部署");
-        setFormOpen(false);
-        await load(true);
-        if (!form.id) setCommandItem(res.data);
+        toast.success(
+          batchMessage(
+            "已创建",
+            res.data.items.length,
+            form.run,
+            res.data.warnings,
+          ),
+        );
+        showWarnings(res.data.warnings);
+        setForm(null);
+        void load(true);
       } else {
-        toast.error(res.msg || "保存失败");
+        toast.error(res.msg || "创建失败");
       }
     } finally {
       setSaving(false);
     }
   };
 
-  // ─── 部署执行 ─────────────────────────────────────────────
+  // ─── 执行 ─────────────────────────────────────────────────
 
-  const startPolling = (id: number) => {
-    if (pollRef.current) window.clearInterval(pollRef.current);
-    pollRef.current = window.setInterval(async () => {
-      const res = await getDeployment(id);
-
-      if (res.code === 0 && res.data) {
-        setLogItem(res.data);
-        if (res.data.status !== "running") {
-          if (pollRef.current) window.clearInterval(pollRef.current);
-          pollRef.current = null;
-          if (res.data.status === "success")
-            toast.success("部署完成，节点已生成");
-          else toast.error("部署失败，请查看日志");
-          void load(true);
-        }
-      }
-    }, 2000);
-  };
-
-  const openSSH = (item: Deployment) => {
-    setSsh({ ...emptySSH, host: item.host });
-    setSshItem(item);
-  };
-
-  const submitSSH = async () => {
-    if (!sshItem) return;
-    setBusy(true);
+  const runOp = async (
+    item: Deployment,
+    op: "install" | "info" | "uninstall",
+  ) => {
+    setBusyId(item.id);
     try {
-      const res = await runDeployment(sshItem.id, {
-        ...ssh,
-        port: Number(ssh.port) || 22,
-      });
+      const res =
+        op === "install"
+          ? await runDeployments([item.id])
+          : op === "info"
+            ? await refreshDeployment(item.id)
+            : await uninstallDeployment(item.id);
 
       if (res.code === 0) {
-        const id = sshItem.id;
-
-        setSshItem(null);
-        const detail = await getDeployment(id);
-
-        if (detail.code === 0 && detail.data) setLogItem(detail.data);
-        startPolling(id);
+        toast.success(
+          op === "install"
+            ? "已下发部署任务"
+            : op === "info"
+              ? "正在读取服务器上的状态"
+              : "已下发卸载任务",
+        );
+        showWarnings(res.data?.warnings);
+        setLogItem(null);
+        setLogId(item.id);
+        void load(true);
       } else {
-        toast.error(res.msg || "启动部署失败");
+        toast.error(res.msg || "操作失败", { duration: 8000 });
       }
     } finally {
-      setBusy(false);
+      setBusyId(null);
     }
   };
 
-  const openLog = async (item: Deployment) => {
-    const res = await getDeployment(item.id);
-
-    if (res.code === 0 && res.data) {
-      setLogItem(res.data);
-      if (res.data.status === "running") startPolling(item.id);
-    }
+  const openCopy = (item: Deployment) => {
+    setCopyNodeIds([]);
+    setCopyRun(true);
+    setCopyItem(item);
   };
 
-  const submitOutput = async () => {
-    if (!outputItem) return;
-    setBusy(true);
+  const submitCopy = async () => {
+    if (!copyItem) return;
+    if (copyNodeIds.length === 0) {
+      toast.error("请选择目标节点");
+
+      return;
+    }
+    setSaving(true);
     try {
-      const res = await applyDeployOutput(outputItem.id, outputText);
+      const res = await copyDeployment(copyItem.id, copyNodeIds, copyRun);
 
       if (res.code === 0 && res.data) {
         toast.success(
-          `已读取 ${res.data.found.join("、")}，生成 ${res.data.nodes} 个节点`,
+          batchMessage(
+            "已复制",
+            res.data.items.length,
+            copyRun,
+            res.data.warnings,
+          ),
         );
-        (res.data.warnings || []).forEach((w) =>
-          toast(w, { icon: "⚠️", duration: 6000 }),
-        );
-        setOutputItem(null);
+        showWarnings(res.data.warnings);
+        setCopyItem(null);
         void load(true);
       } else {
-        toast.error(res.msg || "解析失败");
+        toast.error(res.msg || "复制失败");
       }
     } finally {
-      setBusy(false);
+      setSaving(false);
+    }
+  };
+
+  const openCommand = async (item: Deployment) => {
+    const res = await getDeployCommand(item.id);
+
+    if (res.code === 0 && res.data) {
+      setCommandText(res.data.command);
+      setCommandItem(item);
+    } else {
+      toast.error(res.msg || "生成命令失败");
     }
   };
 
@@ -415,14 +509,20 @@ export default function DeployPage() {
     const res = await syncDeployNodes(item.id);
 
     if (res.code === 0 && res.data) {
-      toast.success(`已生成 / 更新 ${res.data.nodes} 个节点`);
-      (res.data.warnings || []).forEach((w) =>
-        toast(w, { icon: "⚠️", duration: 6000 }),
-      );
+      toast.success(`已生成 / 更新 ${res.data.nodes} 个代理节点`);
+      showWarnings(res.data.warnings);
       void load(true);
     } else {
       toast.error(res.msg || "生成节点失败");
     }
+  };
+
+  const confirmUninstall = async () => {
+    if (!uninstallItem) return;
+    const item = uninstallItem;
+
+    setUninstallItem(null);
+    await runOp(item, "uninstall");
   };
 
   const confirmDelete = async () => {
@@ -448,7 +548,6 @@ export default function DeployPage() {
       setSettings(res.data);
       setSettingsOpen(false);
       toast.success("已保存");
-      void load(true);
     } else {
       toast.error(res.msg || "保存失败");
     }
@@ -459,25 +558,86 @@ export default function DeployPage() {
   }
 
   const p = form?.params;
+  const singleFormNode =
+    form && form.nodeIds.length === 1 ? nodeById.get(form.nodeIds[0]) : null;
+
+  const renderNodePicker = (
+    selectedIds: number[],
+    onToggle: (id: number) => void,
+    excludeId?: number,
+  ) => {
+    const list = flvxNodes.filter((n) => n.id !== excludeId);
+
+    if (list.length === 0) {
+      return (
+        <div className="rounded-lg border border-dashed border-divider py-6 text-center text-sm text-default-500">
+          还没有可用的 FLVX 节点，请先在
+          <button
+            className="mx-1 text-primary"
+            type="button"
+            onClick={() => navigate("/node")}
+          >
+            节点
+          </button>
+          页面添加并安装节点端。
+        </div>
+      );
+    }
+
+    return (
+      <div className="grid max-h-[260px] grid-cols-1 gap-2 overflow-auto pr-1 md:grid-cols-2">
+        {list.map((n) => (
+          <SelectableCard
+            key={n.id}
+            className="items-center"
+            selected={selectedIds.includes(n.id)}
+            onToggle={() => onToggle(n.id)}
+          >
+            <Checkbox
+              className="pointer-events-none"
+              isSelected={selectedIds.includes(n.id)}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1.5">
+                <span
+                  className={`h-2 w-2 shrink-0 rounded-full ${isOnline(n) ? "bg-success" : "bg-default-300"}`}
+                />
+                <span className="truncate text-sm font-medium">{n.name}</span>
+              </div>
+              <div className="truncate font-mono text-xs text-default-500">
+                {nodeAddress(n) || "-"}
+                {isOnline(n) ? "" : " · 离线"}
+              </div>
+            </div>
+          </SelectableCard>
+        ))}
+      </div>
+    );
+  };
 
   return (
     <AnimatedPage className="px-3 lg:px-6 py-8 space-y-4">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <p className="text-sm text-default-500 max-w-3xl">
-          使用{" "}
-          <a
-            className="text-primary"
-            href="https://github.com/mozziexwz/mihomo_script"
-            rel="noreferrer"
-            target="_blank"
-          >
-            mihomo_script
-          </a>{" "}
-          在服务器上部署 Shadowsocks 2022 / mieru /
-          Sudoku。参数由面板生成：复制一键命令到服务器执行，或填写 SSH
-          由面板代为执行（凭据只用于本次，不会保存）。部署完成后自动生成到「代理节点」。
-        </p>
-        <div className="flex gap-2">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+        <PageIntro
+          className=""
+          description={
+            <>
+              选择一台或多台 FLVX 节点，由面板通过节点端执行{" "}
+              <a
+                className="text-primary"
+                href="https://github.com/mozziexwz/mihomo_script"
+                rel="noreferrer"
+                target="_blank"
+              >
+                mihomo_script
+              </a>
+              ，一键部署 Shadowsocks 2022 / mieru /
+              Sudoku，不需要登录服务器。部署完成后自动在「代理节点」生成节点；部署参数可以复制到其他节点。仅管理员可用。
+            </>
+          }
+          title="部署节点"
+        />
+        <div className="flex shrink-0 flex-wrap gap-2">
           <Button
             size="sm"
             variant="flat"
@@ -509,15 +669,18 @@ export default function DeployPage() {
               暂无部署
             </h3>
             <p className="text-default-500 text-sm max-w-md mx-auto leading-relaxed">
-              点击「新建部署」，选择协议并生成参数。需要服务器为带 systemd 的
-              Debian / Ubuntu / RHEL 系，并使用 root（或免密 sudo）。
+              点击「新建部署」，选择 FLVX 节点和协议。节点需要是带 systemd 的
+              Debian / Ubuntu / RHEL 系服务器，节点端需升级到 myflvx 2.2.2
+              或更高版本。
             </p>
           </CardBody>
         </Card>
       ) : (
         <StaggerList className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4">
           {items.map((item) => {
-            const chip = statusChip(item.status);
+            const chip = statusChip(item);
+            const running = item.status === "running";
+            const busy = busyId === item.id;
 
             return (
               <StaggerItem key={item.id}>
@@ -526,9 +689,15 @@ export default function DeployPage() {
                     <div className="flex justify-between items-start w-full gap-2">
                       <div className="min-w-0">
                         <h3 className="font-semibold truncate">{item.name}</h3>
-                        <p className="text-xs text-default-500 font-mono">
-                          {item.host}
-                          {item.nodeName ? ` · 节点 ${item.nodeName}` : ""}
+                        <p className="flex items-center gap-1.5 text-xs text-default-500">
+                          <span
+                            className={`h-2 w-2 shrink-0 rounded-full ${item.nodeOnline ? "bg-success" : "bg-default-300"}`}
+                          />
+                          <span className="truncate">
+                            {item.nodeName || `节点 #${item.nodeId}`}
+                            {item.nodeOnline ? "" : "（离线）"}
+                          </span>
+                          <span className="font-mono">· {item.host}</span>
                         </p>
                       </div>
                       <Chip color={chip.color} size="sm" variant="flat">
@@ -549,69 +718,96 @@ export default function DeployPage() {
                       ))}
                     </div>
                     <div className="text-xs text-default-500">
-                      已生成节点 {item.proxyNodes} 个 · 上次执行{" "}
+                      代理节点 {item.proxyNodes} 个 · 上次执行{" "}
                       {formatDateTime(item.lastRunTime)}
+                      {item.remark ? ` · ${item.remark}` : ""}
                     </div>
                     <div className="flex flex-wrap gap-1.5">
                       <Button
-                        size="sm"
-                        variant="flat"
-                        onPress={() => setCommandItem(item)}
-                      >
-                        一键命令
-                      </Button>
-                      <Button
                         color="primary"
-                        isDisabled={item.status === "running"}
+                        isDisabled={running}
+                        isLoading={busy}
                         size="sm"
                         variant="flat"
-                        onPress={() => openSSH(item)}
+                        onPress={() => runOp(item, "install")}
                       >
-                        SSH 部署
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="flat"
-                        onPress={() => openLog(item)}
-                      >
-                        日志
+                        {item.status === "pending" ? "部署" : "重新部署"}
                       </Button>
                       <Button
                         size="sm"
                         variant="flat"
                         onPress={() => {
-                          setOutputText("");
-                          setOutputItem(item);
+                          setLogItem(item);
+                          setLogId(item.id);
                         }}
                       >
-                        粘贴部署输出
+                        日志
                       </Button>
                       <Button
+                        isDisabled={running || busy}
                         size="sm"
                         variant="flat"
-                        onPress={() => generateNodes(item)}
+                        onPress={() => runOp(item, "info")}
                       >
-                        生成节点
+                        刷新状态
                       </Button>
                       <Button
-                        isDisabled={item.status === "running"}
+                        isDisabled={running}
                         size="sm"
                         variant="flat"
+                        onPress={() => openCopy(item)}
+                      >
+                        复制到其他节点
+                      </Button>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 border-t border-divider pt-2">
+                      <Button
+                        className="h-7 min-w-0 px-2 text-xs"
+                        isDisabled={running}
+                        size="sm"
+                        variant="light"
                         onPress={() => openEdit(item)}
                       >
-                        编辑
+                        编辑参数
                       </Button>
                       <Button
-                        color="danger"
-                        isDisabled={item.status === "running"}
+                        className="h-7 min-w-0 px-2 text-xs"
                         size="sm"
-                        variant="flat"
+                        variant="light"
+                        onPress={() => generateNodes(item)}
+                      >
+                        重新生成代理节点
+                      </Button>
+                      <Button
+                        className="h-7 min-w-0 px-2 text-xs"
+                        size="sm"
+                        variant="light"
+                        onPress={() => openCommand(item)}
+                      >
+                        复制安装命令
+                      </Button>
+                      <Button
+                        className="h-7 min-w-0 px-2 text-xs"
+                        color="warning"
+                        isDisabled={running || item.status === "uninstalled"}
+                        size="sm"
+                        variant="light"
+                        onPress={() => setUninstallItem(item)}
+                      >
+                        卸载
+                      </Button>
+                      <Button
+                        className="h-7 min-w-0 px-2 text-xs"
+                        color="danger"
+                        isDisabled={running}
+                        size="sm"
+                        variant="light"
                         onPress={() => {
                           setDeleteNodes(true);
                           setDeleteItem(item);
                         }}
                       >
-                        删除
+                        删除记录
                       </Button>
                     </div>
                   </CardBody>
@@ -626,11 +822,11 @@ export default function DeployPage() {
       <Modal
         backdrop="blur"
         classNames={modalClassNames}
-        isOpen={formOpen && !!form}
+        isOpen={!!form}
         placement="center"
         scrollBehavior="inside"
         size="4xl"
-        onOpenChange={setFormOpen}
+        onOpenChange={(open) => !open && setForm(null)}
       >
         <ModalContent>
           {(onClose) =>
@@ -638,48 +834,91 @@ export default function DeployPage() {
               <>
                 <ModalHeader className="flex flex-col gap-1">
                   <h2 className="text-xl font-bold">
-                    {form.id ? "编辑部署" : "新建部署"}
+                    {form.id ? `编辑部署：${form.name}` : "新建部署"}
                   </h2>
                   <p className="text-small text-default-500">
-                    修改参数后需要重新执行部署（命令或
-                    SSH），服务器上的配置才会更新。
+                    {form.id
+                      ? "修改参数后点「重新部署」，服务器上的配置才会更新。"
+                      : "选中的节点使用同一组端口和密钥，各自使用自己的地址；保存后由面板通过节点端执行部署。"}
                   </p>
                 </ModalHeader>
                 <ModalBody>
                   <div className="space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <Input
-                        isRequired
-                        description="同时作为节点名前缀，如 HK-01 → HK-01-SS"
-                        label="名称"
-                        value={form.name}
-                        variant="bordered"
-                        onChange={(e) =>
-                          setForm({ ...form, name: e.target.value })
-                        }
-                      />
-                      <Select
-                        description="可选，自动填入节点地址"
-                        label="对应的 FLVX 节点"
-                        placeholder="不关联"
-                        selectedKeys={form.nodeId ? [form.nodeId] : []}
-                        onSelectionChange={(keys) =>
-                          pickFlvxNode(String(Array.from(keys)[0] ?? ""))
-                        }
-                      >
-                        {flvxNodes.map((n) => (
-                          <SelectItem key={String(n.id)}>{n.name}</SelectItem>
-                        ))}
-                      </Select>
-                      <Input
-                        isRequired
-                        description="客户端连接用的 IP 或域名"
-                        label="连接地址"
-                        value={p.host}
-                        variant="bordered"
-                        onChange={(e) => setParam("host", e.target.value)}
-                      />
-                    </div>
+                    {form.id ? (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <Input
+                          readOnly
+                          label="FLVX 节点"
+                          value={form.nodeName || `#${form.nodeIds[0]}`}
+                          variant="bordered"
+                        />
+                        <Input
+                          isRequired
+                          description="代理节点名前缀，如 HK-01 → HK-01-SS"
+                          label="名称"
+                          value={form.name}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm({ ...form, name: e.target.value })
+                          }
+                        />
+                        <Input
+                          description="客户端连接用的 IP 或域名"
+                          label="连接地址"
+                          value={form.host}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm({ ...form, host: e.target.value })
+                          }
+                        />
+                      </div>
+                    ) : (
+                      <>
+                        <div>
+                          <div className="mb-2 flex items-center justify-between">
+                            <span className="text-sm font-medium">
+                              选择 FLVX 节点（可多选）
+                            </span>
+                            <span className="text-xs text-default-500">
+                              已选 {form.nodeIds.length} 个
+                            </span>
+                          </div>
+                          {renderNodePicker(form.nodeIds, toggleFormNode)}
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          <Input
+                            description={
+                              form.nodeIds.length > 1
+                                ? "选择多个节点时生成「前缀-节点名」，留空使用节点名"
+                                : "代理节点名前缀，如 HK-01 → HK-01-SS；留空使用节点名"
+                            }
+                            label="名称前缀（可选）"
+                            value={form.name}
+                            variant="bordered"
+                            onChange={(e) =>
+                              setForm({ ...form, name: e.target.value })
+                            }
+                          />
+                          <Input
+                            description={
+                              form.nodeIds.length > 1
+                                ? "选择多个节点时各自使用节点地址"
+                                : "客户端连接用的 IP 或域名，留空使用节点地址"
+                            }
+                            isDisabled={form.nodeIds.length > 1}
+                            label="连接地址（可选）"
+                            placeholder={
+                              singleFormNode ? nodeAddress(singleFormNode) : ""
+                            }
+                            value={form.nodeIds.length > 1 ? "" : form.host}
+                            variant="bordered"
+                            onChange={(e) =>
+                              setForm({ ...form, host: e.target.value })
+                            }
+                          />
+                        </div>
+                      </>
+                    )}
 
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
                       {PROTOCOLS.map((proto) => (
@@ -687,12 +926,7 @@ export default function DeployPage() {
                           key={proto.key}
                           className="items-start"
                           selected={p.protocols.includes(proto.key)}
-                          onToggle={() =>
-                            toggleProtocol(
-                              proto.key,
-                              !p.protocols.includes(proto.key),
-                            )
-                          }
+                          onToggle={() => toggleProtocol(proto.key)}
                         >
                           <Checkbox
                             className="pointer-events-none"
@@ -736,7 +970,7 @@ export default function DeployPage() {
                         }
                       />
                       <LabeledSwitch
-                        description="拒绝访问 127/8、10/8、192.168/16、云元数据等地址"
+                        description="开启后不能经此节点访问服务器自身（含它的公网 IP）和内网地址"
                         isSelected={p.blockPrivate}
                         label="禁止经代理访问本机和内网"
                         onValueChange={(v) => setParam("blockPrivate", v)}
@@ -902,8 +1136,8 @@ export default function DeployPage() {
                             <Select
                               description={
                                 p.sudokuKeyMode === "pair"
-                                  ? "服务器生成 ED25519 密钥对；需要 SSH 部署或粘贴部署输出读取客户端密钥"
-                                  : "面板生成共享密钥，部署后即可直接生成节点"
+                                  ? "每台服务器生成自己的密钥对，部署完成后面板自动读取客户端密钥"
+                                  : "面板生成共享密钥，所有选中的节点使用同一个密钥"
                               }
                               label="密钥"
                               selectedKeys={[p.sudokuKeyMode || "psk"]}
@@ -1020,6 +1254,14 @@ export default function DeployPage() {
                         setForm({ ...form, remark: e.target.value })
                       }
                     />
+                    {!form.id && (
+                      <LabeledSwitch
+                        description="关闭后只保存部署记录，稍后在列表中点「部署」"
+                        isSelected={form.run}
+                        label="保存后立即部署"
+                        onValueChange={(v) => setForm({ ...form, run: v })}
+                      />
+                    )}
                   </div>
                 </ModalBody>
                 <ModalFooter>
@@ -1034,7 +1276,7 @@ export default function DeployPage() {
                     isLoading={saving}
                     onPress={submitForm}
                   >
-                    保存
+                    {form.id ? "保存" : form.run ? "保存并部署" : "保存"}
                   </Button>
                 </ModalFooter>
               </>
@@ -1043,7 +1285,60 @@ export default function DeployPage() {
         </ModalContent>
       </Modal>
 
-      {/* 一键命令 */}
+      {/* 复制到其他节点 */}
+      <Modal
+        backdrop="blur"
+        classNames={modalClassNames}
+        isOpen={!!copyItem}
+        placement="center"
+        scrollBehavior="inside"
+        size="2xl"
+        onOpenChange={(open) => !open && setCopyItem(null)}
+      >
+        <ModalContent>
+          {(onClose) => (
+            <>
+              <ModalHeader className="flex flex-col gap-1">
+                <h2 className="text-xl font-bold">
+                  复制到其他节点：{copyItem?.name}
+                </h2>
+                <p className="text-small text-default-500">
+                  使用相同的协议、端口和密钥在选中的节点上部署，各自使用节点自己的地址，代理节点以节点名命名。
+                </p>
+              </ModalHeader>
+              <ModalBody>
+                <div className="space-y-4">
+                  {renderNodePicker(
+                    copyNodeIds,
+                    (id) =>
+                      setCopyNodeIds((prev) =>
+                        prev.includes(id)
+                          ? prev.filter((x) => x !== id)
+                          : [...prev, id],
+                      ),
+                    copyItem?.nodeId,
+                  )}
+                  <LabeledSwitch
+                    isSelected={copyRun}
+                    label="复制后立即部署"
+                    onValueChange={setCopyRun}
+                  />
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button variant="light" onPress={onClose}>
+                  取消
+                </Button>
+                <Button color="primary" isLoading={saving} onPress={submitCopy}>
+                  复制
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+
+      {/* 手动安装命令 */}
       <Modal
         backdrop="blur"
         classNames={modalClassNames}
@@ -1057,26 +1352,18 @@ export default function DeployPage() {
           {(onClose) => (
             <>
               <ModalHeader className="flex flex-col gap-1">
-                <h2 className="text-xl font-bold">一键部署命令</h2>
+                <h2 className="text-xl font-bold">
+                  安装命令：{commandItem?.name}
+                </h2>
                 <p className="text-small text-default-500">
-                  以 root 在服务器（{commandItem?.host}
-                  ）执行。云服务器还需要在安全组放行对应端口。
+                  用于没有接入面板的服务器：以 root
+                  执行这条命令即可部署同样的参数。面板不会跟踪手动执行的部署，也不会自动生成代理节点。
                 </p>
               </ModalHeader>
               <ModalBody>
                 <pre className="text-xs font-mono whitespace-pre-wrap break-all rounded-lg bg-default-100 p-3">
-                  {commandItem?.command}
+                  {commandText}
                 </pre>
-                {commandItem?.params.protocols.includes("sudoku") &&
-                  commandItem.params.sudokuKeyMode === "pair" && (
-                    <p className="text-sm text-warning-600">
-                      Sudoku 使用服务器生成的密钥对：执行完成后，请把输出中的
-                      sudoku:// 链接通过「粘贴部署输出」填回面板。
-                    </p>
-                  )}
-                <p className="text-sm text-default-500">
-                  执行成功后点击卡片上的「生成节点」，或「粘贴部署输出」让面板核对端口与密钥。
-                </p>
               </ModalBody>
               <ModalFooter>
                 <Button variant="light" onPress={onClose}>
@@ -1084,133 +1371,9 @@ export default function DeployPage() {
                 </Button>
                 <Button
                   color="primary"
-                  onPress={() =>
-                    commandItem && copyText(commandItem.command, "部署命令")
-                  }
+                  onPress={() => copyText(commandText, "安装命令")}
                 >
                   复制命令
-                </Button>
-              </ModalFooter>
-            </>
-          )}
-        </ModalContent>
-      </Modal>
-
-      {/* SSH 部署 */}
-      <Modal
-        backdrop="blur"
-        classNames={modalClassNames}
-        isOpen={!!sshItem}
-        placement="center"
-        scrollBehavior="inside"
-        size="2xl"
-        onOpenChange={(open) => !open && setSshItem(null)}
-      >
-        <ModalContent>
-          {(onClose) => (
-            <>
-              <ModalHeader className="flex flex-col gap-1">
-                <h2 className="text-xl font-bold">SSH 部署：{sshItem?.name}</h2>
-                <p className="text-small text-default-500">
-                  面板通过 SSH
-                  执行一键脚本并读取分享链接，凭据只用于本次部署，不会保存。部署通常需要
-                  1-3 分钟。
-                </p>
-              </ModalHeader>
-              <ModalBody>
-                <div className="space-y-4">
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <Input
-                      label="SSH 主机"
-                      value={ssh.host}
-                      variant="bordered"
-                      onChange={(e) =>
-                        setSsh({ ...ssh, host: e.target.value.trim() })
-                      }
-                    />
-                    <Input
-                      label="端口"
-                      type="number"
-                      value={String(ssh.port)}
-                      variant="bordered"
-                      onChange={(e) =>
-                        setSsh({ ...ssh, port: Number(e.target.value) || 22 })
-                      }
-                    />
-                    <Input
-                      label="用户名"
-                      value={ssh.username}
-                      variant="bordered"
-                      onChange={(e) =>
-                        setSsh({ ...ssh, username: e.target.value.trim() })
-                      }
-                    />
-                  </div>
-                  <Select
-                    label="认证方式"
-                    selectedKeys={[ssh.authType]}
-                    onSelectionChange={(keys) =>
-                      setSsh({
-                        ...ssh,
-                        authType: String(
-                          Array.from(keys)[0] ?? "password",
-                        ) as SSHTarget["authType"],
-                      })
-                    }
-                  >
-                    <SelectItem key="password">密码</SelectItem>
-                    <SelectItem key="private_key">私钥</SelectItem>
-                  </Select>
-                  {ssh.authType === "password" ? (
-                    <Input
-                      autoComplete="off"
-                      label="密码"
-                      type="password"
-                      value={ssh.password}
-                      variant="bordered"
-                      onChange={(e) =>
-                        setSsh({ ...ssh, password: e.target.value })
-                      }
-                    />
-                  ) : (
-                    <>
-                      <Textarea
-                        className="font-mono"
-                        label="私钥"
-                        minRows={5}
-                        placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
-                        value={ssh.privateKey}
-                        variant="bordered"
-                        onChange={(e) =>
-                          setSsh({ ...ssh, privateKey: e.target.value })
-                        }
-                      />
-                      <Input
-                        autoComplete="off"
-                        label="私钥密码（可选）"
-                        type="password"
-                        value={ssh.passphrase}
-                        variant="bordered"
-                        onChange={(e) =>
-                          setSsh({ ...ssh, passphrase: e.target.value })
-                        }
-                      />
-                    </>
-                  )}
-                  <Checkbox
-                    isSelected={ssh.useSudo}
-                    onValueChange={(v) => setSsh({ ...ssh, useSudo: v })}
-                  >
-                    非 root 用户，使用 sudo（需要免密 sudo）
-                  </Checkbox>
-                </div>
-              </ModalBody>
-              <ModalFooter>
-                <Button variant="light" onPress={onClose}>
-                  取消
-                </Button>
-                <Button color="primary" isLoading={busy} onPress={submitSSH}>
-                  开始部署
                 </Button>
               </ModalFooter>
             </>
@@ -1222,15 +1385,14 @@ export default function DeployPage() {
       <Modal
         backdrop="blur"
         classNames={modalClassNames}
-        isOpen={!!logItem}
+        isOpen={logId !== null}
         placement="center"
         scrollBehavior="inside"
         size="4xl"
         onOpenChange={(open) => {
           if (!open) {
+            setLogId(null);
             setLogItem(null);
-            if (pollRef.current) window.clearInterval(pollRef.current);
-            pollRef.current = null;
           }
         }}
       >
@@ -1238,14 +1400,16 @@ export default function DeployPage() {
           {(onClose) => (
             <>
               <ModalHeader className="flex items-center gap-2">
-                <h2 className="text-xl font-bold">部署日志：{logItem?.name}</h2>
+                <h2 className="text-xl font-bold">
+                  执行日志：{logItem?.name || ""}
+                </h2>
                 {logItem && (
                   <Chip
-                    color={statusChip(logItem.status).color}
+                    color={statusChip(logItem).color}
                     size="sm"
                     variant="flat"
                   >
-                    {statusChip(logItem.status).label}
+                    {statusChip(logItem).label}
                   </Chip>
                 )}
               </ModalHeader>
@@ -1264,42 +1428,34 @@ export default function DeployPage() {
         </ModalContent>
       </Modal>
 
-      {/* 粘贴部署输出 */}
+      {/* 卸载 */}
       <Modal
         backdrop="blur"
         classNames={modalClassNames}
-        isOpen={!!outputItem}
+        isOpen={!!uninstallItem}
         placement="center"
-        scrollBehavior="inside"
-        size="2xl"
-        onOpenChange={(open) => !open && setOutputItem(null)}
+        size="md"
+        onOpenChange={(open) => !open && setUninstallItem(null)}
       >
         <ModalContent>
           {(onClose) => (
             <>
-              <ModalHeader className="flex flex-col gap-1">
-                <h2 className="text-xl font-bold">粘贴部署输出</h2>
-                <p className="text-small text-default-500">
-                  把脚本输出或 <code>mihomo-sh info</code> 显示的 ss:// /
-                  mierus:// / sudoku://
-                  链接粘贴到这里，面板会读取端口与密钥并生成节点。
-                </p>
+              <ModalHeader>
+                <h2 className="text-lg font-bold text-warning">卸载 mihomo</h2>
               </ModalHeader>
               <ModalBody>
-                <Textarea
-                  className="font-mono"
-                  minRows={8}
-                  value={outputText}
-                  variant="bordered"
-                  onChange={(e) => setOutputText(e.target.value)}
-                />
+                <p className="text-default-600">
+                  将在 FLVX 节点「{uninstallItem?.nodeName}」上执行
+                  mihomo_script uninstall，删除 mihomo
+                  和它的全部配置；对应的代理节点会被停用。部署记录会保留，之后可以重新部署。
+                </p>
               </ModalBody>
               <ModalFooter>
                 <Button variant="light" onPress={onClose}>
                   取消
                 </Button>
-                <Button color="primary" isLoading={busy} onPress={submitOutput}>
-                  读取并生成节点
+                <Button color="warning" onPress={confirmUninstall}>
+                  确认卸载
                 </Button>
               </ModalFooter>
             </>
@@ -1325,14 +1481,13 @@ export default function DeployPage() {
               <ModalBody>
                 <p className="text-default-600">
                   只删除面板中的记录，不会卸载服务器上的
-                  mihomo（如需卸载请在服务器执行{" "}
-                  <code>mihomo-sh uninstall</code>）。
+                  mihomo；需要卸载请先点「卸载」。
                 </p>
                 <Checkbox
                   isSelected={deleteNodes}
                   onValueChange={setDeleteNodes}
                 >
-                  同时删除生成的节点（以及它们的中转节点）
+                  同时删除生成的代理节点（以及它们的中转节点）
                 </Checkbox>
               </ModalBody>
               <ModalFooter>
@@ -1362,6 +1517,10 @@ export default function DeployPage() {
             <>
               <ModalHeader className="flex flex-col gap-1">
                 <h2 className="text-xl font-bold">脚本设置</h2>
+                <p className="text-small text-default-500">
+                  节点端从这个地址下载 mihomo_script 并以 root 执行（只支持
+                  https 地址）。
+                </p>
               </ModalHeader>
               <ModalBody>
                 <div className="space-y-4">
@@ -1373,7 +1532,7 @@ export default function DeployPage() {
                     onChange={(e) => setSettingsUrl(e.target.value)}
                   />
                   <LabeledSwitch
-                    description="国内服务器访问 GitHub 困难时可开启（使用「设置」中的 GitHub 加速地址）。脚本以 root 运行，请只使用可信的加速地址；脚本下载 mihomo 内核仍需访问 GitHub。"
+                    description="国内服务器访问 GitHub 困难时可开启（使用「设置」中的 GitHub 加速地址）。请只使用可信的加速地址；脚本下载 mihomo 内核仍需访问 GitHub。"
                     isSelected={settingsProxy}
                     label="通过 GitHub 加速代理下载脚本"
                     onValueChange={setSettingsProxy}

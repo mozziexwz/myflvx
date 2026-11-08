@@ -7,6 +7,7 @@ import {
   StaggerList,
 } from "@/components/animated-page";
 import { PageLoadingState } from "@/components/page-state";
+import { PageIntro } from "@/components/page-intro";
 import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
 import { Button } from "@/shadcn-bridge/heroui/button";
 import { Chip } from "@/shadcn-bridge/heroui/chip";
@@ -22,7 +23,6 @@ import {
   formatDateTime,
   saveTextFile,
 } from "@/utils/enhanced";
-import { getAdminFlag } from "@/utils/session";
 
 type DownloadFormat = "clash" | "base64" | "uri";
 
@@ -30,7 +30,6 @@ export default function SubDownloadPage() {
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<Subscription[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
-  const isAdmin = getAdminFlag();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -84,16 +83,16 @@ export default function SubDownloadPage() {
     return <PageLoadingState message="正在加载订阅..." />;
   }
 
-  const expired = (item: Subscription) =>
-    item.expireTime > 0 && Date.now() > item.expireTime;
-
   return (
     <AnimatedPage className="px-3 lg:px-6 py-8 space-y-4">
+      <PageIntro
+        className=""
+        description="下载你在「订阅管理」中启用的订阅文件，导入客户端使用。订阅只能登录面板后下载，不会生成公网订阅链接，配置不会暴露在公网。"
+        title="订阅下载"
+      />
       <Card className="border border-gray-200 dark:border-gray-700">
-        <CardBody className="text-sm text-default-600 space-y-1">
-          <p>
-            订阅只提供文件下载，不提供公网订阅链接，配置不会暴露在公网。下载后在客户端中导入本地文件：
-          </p>
+        <CardBody className="text-sm text-default-600 space-y-1 pt-4 md:pt-4">
+          <p>下载后在客户端中导入本地文件：</p>
           <ul className="list-disc pl-5 text-default-500 text-xs space-y-0.5">
             <li>
               Clash Verge Rev / Mihomo Party / FlClash：订阅或配置 → 新建 / 导入
@@ -117,9 +116,7 @@ export default function SubDownloadPage() {
               暂无可下载的订阅
             </h3>
             <p className="text-default-500 text-sm max-w-xs mx-auto leading-relaxed">
-              {isAdmin
-                ? "先在「订阅管理」中创建订阅。"
-                : "请联系管理员为你分配订阅。"}
+              先在「订阅管理」中上传、导入或生成订阅，并保持启用。
             </p>
           </CardBody>
         </Card>
@@ -140,19 +137,13 @@ export default function SubDownloadPage() {
                         </p>
                       )}
                     </div>
-                    {!item.enabled ? (
-                      <Chip color="danger" size="sm" variant="flat">
-                        已停用
-                      </Chip>
-                    ) : expired(item) ? (
-                      <Chip color="warning" size="sm" variant="flat">
-                        已过期
-                      </Chip>
-                    ) : (
-                      <Chip color="success" size="sm" variant="flat">
-                        可用
-                      </Chip>
-                    )}
+                    <Chip size="sm" variant="flat">
+                      {item.type === "generate"
+                        ? "生成"
+                        : item.type === "import"
+                          ? "导入"
+                          : "上传"}
+                    </Chip>
                   </div>
                 </CardHeader>
                 <CardBody className="pt-0 space-y-3">
@@ -175,9 +166,6 @@ export default function SubDownloadPage() {
                       <div>
                         套餐到期：{formatDate(item.subInfo.expire * 1000)}
                       </div>
-                    ) : null}
-                    {item.expireTime ? (
-                      <div>下载截止：{formatDate(item.expireTime)}</div>
                     ) : null}
                   </div>
                   <div className="flex flex-wrap gap-2">

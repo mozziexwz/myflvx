@@ -1,4 +1,4 @@
-import type { TunnelApiItem } from "@/api/types";
+import type { UserTunnelApiItem } from "@/api/types";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import toast from "react-hot-toast";
@@ -7,6 +7,7 @@ import { useNavigate } from "react-router-dom";
 import { AnimatedPage } from "@/components/animated-page";
 import { SearchBar } from "@/components/search-bar";
 import { PageLoadingState } from "@/components/page-state";
+import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
 import { Card, CardBody } from "@/shadcn-bridge/heroui/card";
 import { Button } from "@/shadcn-bridge/heroui/button";
@@ -31,7 +32,7 @@ import {
   TableRow,
   TableCell,
 } from "@/shadcn-bridge/heroui/table";
-import { getTunnelList } from "@/api";
+import { userTunnel } from "@/api";
 import {
   bindRelay,
   createProxyNode,
@@ -50,21 +51,22 @@ import {
   type RelayCandidate,
 } from "@/api/enhanced";
 import { useLocalStorageState } from "@/hooks/use-local-storage-state";
+import { isAdmin } from "@/utils/auth";
 import {
   copyText,
+  firstKey,
   hostPort,
   protocolLabel,
   sourceLabel,
   splitInputTags,
 } from "@/utils/enhanced";
 
-// bridge Select 会把空 key 换成序号，“全部”选项用占位 key
-const ALL_KEY = "__all__";
-const fromFilterKey = (keys: Set<React.Key>) => {
-  const value = String(Array.from(keys)[0] ?? ALL_KEY);
-
-  return value === ALL_KEY ? "" : value;
-};
+const SOURCE_OPTIONS = [
+  { key: "manual", label: "手动" },
+  { key: "import", label: "导入" },
+  { key: "deploy", label: "部署" },
+  { key: "relay", label: "中转" },
+];
 
 const modalClassNames = {
   base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
@@ -119,6 +121,11 @@ export default function ProxyNodePage() {
     "proxy-node-source",
     "",
   );
+  const [tunnelFilter, setTunnelFilter] = useLocalStorageState(
+    "proxy-node-tunnel",
+    "",
+  );
+  const admin = isAdmin();
 
   const [editOpen, setEditOpen] = useState(false);
   const [editForm, setEditForm] = useState<EditForm>(emptyEditForm);
@@ -148,7 +155,7 @@ export default function ProxyNodePage() {
   const [relayOpen, setRelayOpen] = useState(false);
   const [relayNode, setRelayNode] = useState<ProxyNode | null>(null);
   const [relayTab, setRelayTab] = useState<string>("create");
-  const [tunnels, setTunnels] = useState<TunnelApiItem[]>([]);
+  const [tunnels, setTunnels] = useState<UserTunnelApiItem[]>([]);
   const [relayTunnelId, setRelayTunnelId] = useState("");
   const [relayPort, setRelayPort] = useState("");
   const [relayHost, setRelayHost] = useState("");
@@ -177,12 +184,36 @@ export default function ProxyNodePage() {
     void loadNodes();
   }, [loadNodes]);
 
+  // 隧道筛选的选项来自中转节点所用的隧道
+  const tunnelOptions = useMemo(() => {
+    const map = new Map<string, string>();
+
+    nodes.forEach((n) => {
+      if (n.tunnelId > 0) {
+        map.set(String(n.tunnelId), n.tunnelName || `隧道 #${n.tunnelId}`);
+      }
+    });
+
+    return Array.from(map, ([key, label]) => ({ key, label }));
+  }, [nodes]);
+
+  useEffect(() => {
+    if (
+      !loading &&
+      tunnelFilter &&
+      !tunnelOptions.some((t) => t.key === tunnelFilter)
+    ) {
+      setTunnelFilter("");
+    }
+  }, [loading, tunnelFilter, tunnelOptions, setTunnelFilter]);
+
   const filteredNodes = useMemo(() => {
     const kw = keyword.trim().toLowerCase();
 
     return nodes.filter((n) => {
       if (tagFilter && !n.tags.includes(tagFilter)) return false;
       if (sourceFilter && n.source !== sourceFilter) return false;
+      if (tunnelFilter && String(n.tunnelId) !== tunnelFilter) return false;
       if (!kw) return true;
 
       return (
@@ -192,7 +223,7 @@ export default function ProxyNodePage() {
         (n.remark || "").toLowerCase().includes(kw)
       );
     });
-  }, [nodes, keyword, tagFilter, sourceFilter]);
+  }, [nodes, keyword, tagFilter, sourceFilter, tunnelFilter]);
 
   const allFilteredSelected =
     filteredNodes.length > 0 && filteredNodes.every((n) => selected.has(n.id));
@@ -464,13 +495,14 @@ export default function ProxyNodePage() {
     setRelayAllEntries(false);
     setRelayCandidates([]);
     setRelayOpen(true);
+    // 只列出当前用户有权限的隧道（管理员为全部启用的隧道）
     const [tunnelRes, candidateRes] = await Promise.all([
-      getTunnelList(),
+      userTunnel(),
       getRelayCandidates(node.id),
     ]);
 
     if (tunnelRes.code === 0 && tunnelRes.data) {
-      setTunnels(tunnelRes.data.filter((t) => t.status === 1));
+      setTunnels(tunnelRes.data);
     }
     if (candidateRes.code === 0 && candidateRes.data) {
       setRelayCandidates(candidateRes.data);
@@ -535,8 +567,22 @@ export default function ProxyNodePage() {
     return <PageLoadingState message="正在加载节点..." />;
   }
 
+  const hasFilter = Boolean(
+    keyword.trim() || tagFilter || sourceFilter || tunnelFilter,
+  );
+
   return (
     <AnimatedPage className="px-3 lg:px-6 py-8">
+      <PageIntro
+        description={
+          <>
+            管理你自己的代理节点：粘贴分享链接新增、从机场订阅导入，或在节点上点「隧道中转」，
+            面板会通过隧道自动创建转发并生成中转节点。节点只有你自己能看到，可在「生成订阅」中使用。
+            {admin && "「部署节点」生成的节点也会出现在这里。"}
+          </>
+        }
+        title="代理节点"
+      />
       <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between mb-4 gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <SearchBar
@@ -551,15 +597,12 @@ export default function ProxyNodePage() {
             <Select
               aria-label="标签筛选"
               placeholder="全部标签"
-              selectedKeys={[tagFilter || ALL_KEY]}
+              selectedKeys={tagFilter ? [tagFilter] : []}
               size="sm"
-              onSelectionChange={(keys) => setTagFilter(fromFilterKey(keys))}
+              onSelectionChange={(keys) => setTagFilter(firstKey(keys))}
             >
-              {[
-                { key: ALL_KEY, label: "全部标签" },
-                ...allTags.map((t) => ({ key: t, label: t })),
-              ].map((item) => (
-                <SelectItem key={item.key}>{item.label}</SelectItem>
+              {allTags.map((t) => (
+                <SelectItem key={t}>{t}</SelectItem>
               ))}
             </Select>
           </div>
@@ -567,26 +610,39 @@ export default function ProxyNodePage() {
             <Select
               aria-label="来源筛选"
               placeholder="全部来源"
-              selectedKeys={[sourceFilter || ALL_KEY]}
+              selectedKeys={sourceFilter ? [sourceFilter] : []}
               size="sm"
-              onSelectionChange={(keys) => setSourceFilter(fromFilterKey(keys))}
+              onSelectionChange={(keys) => setSourceFilter(firstKey(keys))}
             >
-              {[
-                { key: ALL_KEY, label: "全部来源" },
-                { key: "manual", label: "手动" },
-                { key: "import", label: "导入" },
-                { key: "deploy", label: "部署" },
-                { key: "relay", label: "中转" },
-              ].map((item) => (
+              {SOURCE_OPTIONS.map((item) => (
+                <SelectItem key={item.key}>{item.label}</SelectItem>
+              ))}
+            </Select>
+          </div>
+          <div className="w-36">
+            <Select
+              aria-label="隧道筛选"
+              placeholder="全部隧道"
+              selectedKeys={tunnelFilter ? [tunnelFilter] : []}
+              size="sm"
+              onSelectionChange={(keys) => setTunnelFilter(firstKey(keys))}
+            >
+              {tunnelOptions.map((item) => (
                 <SelectItem key={item.key}>{item.label}</SelectItem>
               ))}
             </Select>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button size="sm" variant="flat" onPress={() => navigate("/deploy")}>
-            部署节点
-          </Button>
+          {admin && (
+            <Button
+              size="sm"
+              variant="flat"
+              onPress={() => navigate("/deploy")}
+            >
+              部署节点
+            </Button>
+          )}
           <Button size="sm" variant="flat" onPress={openImport}>
             导入
           </Button>
@@ -597,11 +653,11 @@ export default function ProxyNodePage() {
       </div>
 
       {selected.size > 0 && (
-        <Card className="mb-4 border border-primary-200 dark:border-primary-800">
-          <CardBody className="py-2 flex flex-row flex-wrap items-center gap-2">
-            <span className="text-sm text-default-600 mr-2">
-              已选择 {selected.size} 个节点
-            </span>
+        <div className="mb-4 flex flex-col gap-2 rounded-xl border border-primary-200 bg-primary-50/60 px-4 py-2.5 sm:flex-row sm:items-center sm:justify-between dark:border-primary-800 dark:bg-primary-900/20">
+          <span className="text-sm font-medium text-foreground">
+            已选择 {selected.size} 个节点
+          </span>
+          <div className="flex flex-wrap items-center gap-2">
             <Button size="sm" variant="flat" onPress={() => batchToggle(true)}>
               启用
             </Button>
@@ -640,19 +696,22 @@ export default function ProxyNodePage() {
             >
               取消选择
             </Button>
-          </CardBody>
-        </Card>
+          </div>
+        </div>
       )}
 
       {filteredNodes.length === 0 ? (
         <Card className="shadow-sm border border-gray-200 dark:border-gray-700 bg-default-50/50">
           <CardBody className="text-center py-20 flex flex-col items-center justify-center min-h-[240px]">
             <h3 className="text-xl font-medium text-foreground tracking-tight mb-2">
-              暂无节点
+              {hasFilter ? "没有符合筛选条件的节点" : "暂无节点"}
             </h3>
             <p className="text-default-500 text-sm max-w-md mx-auto leading-relaxed">
-              可以粘贴分享链接新增节点、从订阅导入机场节点，或在「部署节点」一键部署
-              Shadowsocks 2022 / mieru / Sudoku。
+              {hasFilter
+                ? "换个关键词，或把标签 / 来源 / 隧道筛选改回「全部」。"
+                : admin
+                  ? "可以粘贴分享链接新增节点、从订阅导入机场节点，或在「部署节点」一键部署 Shadowsocks 2022 / mieru / Sudoku。"
+                  : "可以粘贴分享链接新增节点，或从订阅导入机场节点。"}
             </p>
           </CardBody>
         </Card>
@@ -1162,9 +1221,7 @@ export default function ProxyNodePage() {
                         }
                       >
                         {tunnels.map((t) => (
-                          <SelectItem key={String(t.id)}>
-                            {`${t.name}（${t.type === 1 ? "端口转发" : "隧道转发"}）`}
-                          </SelectItem>
+                          <SelectItem key={String(t.id)}>{t.name}</SelectItem>
                         ))}
                       </Select>
                       <Input

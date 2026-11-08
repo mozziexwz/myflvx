@@ -1,14 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom";
 
 import { AnimatedPage } from "@/components/animated-page";
 import { PageLoadingState } from "@/components/page-state";
+import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
 import { Card, CardBody } from "@/shadcn-bridge/heroui/card";
 import { Button } from "@/shadcn-bridge/heroui/button";
 import { Input, Textarea } from "@/shadcn-bridge/heroui/input";
-import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
 import { Chip } from "@/shadcn-bridge/heroui/chip";
 import { Switch } from "@/shadcn-bridge/heroui/switch";
 import {
@@ -32,12 +32,10 @@ import {
   downloadMySubscription,
   getSubscription,
   getSubscriptions,
-  getSubscriptionUsers,
   refreshSubscription,
   updateSubscription,
   type Subscription,
   type SubscriptionMutation,
-  type UserBrief,
 } from "@/api/enhanced";
 import {
   formatBytes,
@@ -85,9 +83,7 @@ interface FormState {
   sourceUrl: string;
   userAgent: string;
   autoUpdate: string;
-  userIds: number[];
   enabled: boolean;
-  expireDate: string;
 }
 
 const emptyForm: FormState = {
@@ -99,31 +95,13 @@ const emptyForm: FormState = {
   sourceUrl: "",
   userAgent: "",
   autoUpdate: "0",
-  userIds: [],
   enabled: true,
-  expireDate: "",
-};
-
-const dateToMs = (value: string) => {
-  if (!value) return 0;
-  const ms = new Date(`${value}T23:59:59`).getTime();
-
-  return Number.isNaN(ms) ? 0 : ms;
-};
-
-const msToDate = (ms: number) => {
-  if (!ms) return "";
-  const d = new Date(ms);
-  const pad = (n: number) => String(n).padStart(2, "0");
-
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 };
 
 export default function SubscriptionPage() {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<Subscription[]>([]);
-  const [users, setUsers] = useState<UserBrief[]>([]);
   const [formOpen, setFormOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [saving, setSaving] = useState(false);
@@ -131,25 +109,13 @@ export default function SubscriptionPage() {
   const [deleteTarget, setDeleteTarget] = useState<Subscription | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const userName = useMemo(() => {
-    const map = new Map<number, string>();
-
-    users.forEach((u) => map.set(u.id, u.user));
-
-    return map;
-  }, [users]);
-
   const load = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [subRes, userRes] = await Promise.all([
-        getSubscriptions(),
-        getSubscriptionUsers(),
-      ]);
+      const res = await getSubscriptions();
 
-      if (subRes.code === 0 && subRes.data) setItems(subRes.data);
-      else toast.error(subRes.msg || "加载订阅失败");
-      if (userRes.code === 0 && userRes.data) setUsers(userRes.data);
+      if (res.code === 0 && res.data) setItems(res.data);
+      else toast.error(res.msg || "加载订阅失败");
     } finally {
       setLoading(false);
     }
@@ -189,9 +155,7 @@ export default function SubscriptionPage() {
       sourceUrl: s.sourceUrl || "",
       userAgent: s.userAgent || "",
       autoUpdate: String(s.autoUpdate || 0),
-      userIds: s.userIds || [],
       enabled: s.enabled,
-      expireDate: msToDate(s.expireTime),
     });
     setFormOpen(true);
   };
@@ -227,9 +191,7 @@ export default function SubscriptionPage() {
       remark: form.remark,
       type: form.type,
       fileName: form.fileName.trim(),
-      userIds: form.userIds,
       enabled: form.enabled,
-      expireTime: dateToMs(form.expireDate),
       autoUpdate: Number(form.autoUpdate) || 0,
     };
 
@@ -306,7 +268,6 @@ export default function SubscriptionPage() {
       type: item.type,
       fileName: item.fileName?.replace(/\.(yaml|yml|txt)$/i, ""),
       enabled,
-      expireTime: item.expireTime,
       autoUpdate: item.autoUpdate,
     };
     const res = await updateSubscription(base);
@@ -333,18 +294,17 @@ export default function SubscriptionPage() {
     }
   };
 
-  const assignableUsers = users.filter((u) => u.roleId !== 0);
-
   if (loading) {
     return <PageLoadingState message="正在加载订阅..." />;
   }
 
   return (
     <AnimatedPage className="px-3 lg:px-6 py-8">
-      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between mb-4 gap-3">
-        <p className="text-sm text-default-500">
-          订阅只能在面板内下载（「订阅下载」页），不会生成公网订阅链接。
-        </p>
+      <PageIntro
+        description="管理你自己的订阅：上传 Clash / mihomo 配置文件、从机场订阅地址导入，或在「生成订阅」中用自己的代理节点生成。订阅只属于你自己，只能登录面板后下载，不会生成公网订阅链接。"
+        title="订阅管理"
+      />
+      <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-end mb-4 gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <Button size="sm" variant="flat" onPress={() => openCreate("upload")}>
             上传配置
@@ -371,8 +331,7 @@ export default function SubscriptionPage() {
             </h3>
             <p className="text-default-500 text-sm max-w-md mx-auto leading-relaxed">
               上传 Clash / mihomo
-              配置文件、从其他订阅地址导入，或从节点管理里的节点生成订阅，
-              然后分配给用户下载。
+              配置文件、从其他订阅地址导入，或用「代理节点」里的节点生成订阅。
             </p>
           </CardBody>
         </Card>
@@ -391,7 +350,6 @@ export default function SubscriptionPage() {
               <TableColumn>订阅</TableColumn>
               <TableColumn>类型</TableColumn>
               <TableColumn>节点</TableColumn>
-              <TableColumn>分配用户</TableColumn>
               <TableColumn>流量 / 到期</TableColumn>
               <TableColumn>更新时间</TableColumn>
               <TableColumn>启用</TableColumn>
@@ -420,21 +378,6 @@ export default function SubscriptionPage() {
                     </span>
                   </TableCell>
                   <TableCell>
-                    <div className="flex flex-wrap gap-1 max-w-[200px]">
-                      {(item.userIds || []).length === 0 ? (
-                        <span className="text-xs text-default-400">
-                          仅管理员
-                        </span>
-                      ) : (
-                        (item.userIds || []).map((id) => (
-                          <Chip key={id} size="sm" variant="flat">
-                            {userName.get(id) || `#${id}`}
-                          </Chip>
-                        ))
-                      )}
-                    </div>
-                  </TableCell>
-                  <TableCell>
                     <div className="text-xs text-default-500 whitespace-nowrap">
                       {item.subInfo && item.subInfo.total > 0 && (
                         <div>
@@ -449,10 +392,7 @@ export default function SubscriptionPage() {
                           机场到期 {formatDate(item.subInfo.expire * 1000)}
                         </div>
                       ) : null}
-                      {item.expireTime ? (
-                        <div>下载截止 {formatDate(item.expireTime)}</div>
-                      ) : null}
-                      {!item.subInfo && !item.expireTime && "-"}
+                      {!item.subInfo && "-"}
                     </div>
                   </TableCell>
                   <TableCell>
@@ -537,7 +477,7 @@ export default function SubscriptionPage() {
                 <p className="text-small text-default-500">
                   {form.type === "upload"
                     ? "上传 Clash / mihomo 配置文件（YAML）。粘贴分享链接或 base64 订阅时会按「常用分流」模板生成完整配置。"
-                    : "面板定时或手动从订阅地址拉取配置（拒绝内网地址），用户只能在面板内下载。"}
+                    : "面板定时或手动从订阅地址拉取配置（拒绝内网地址），只能在面板内下载。"}
                 </p>
               </ModalHeader>
               <ModalBody>
@@ -637,47 +577,16 @@ export default function SubscriptionPage() {
                       </div>
                     </>
                   )}
-                  <Select
-                    description="被分配的用户可以在「订阅下载」页下载；管理员始终可以下载"
-                    label="分配给用户"
-                    placeholder="不分配"
-                    selectedKeys={form.userIds.map(String)}
-                    selectionMode="multiple"
-                    onSelectionChange={(keys) =>
-                      setForm((p) => ({
-                        ...p,
-                        userIds: Array.from(keys).map((k) => Number(k)),
-                      }))
+                  <Input
+                    label="备注"
+                    value={form.remark}
+                    variant="bordered"
+                    onChange={(e) =>
+                      setForm((p) => ({ ...p, remark: e.target.value }))
                     }
-                  >
-                    {assignableUsers.map((u) => (
-                      <SelectItem key={String(u.id)}>
-                        {u.status === 1 ? u.user : `${u.user}（已禁用）`}
-                      </SelectItem>
-                    ))}
-                  </Select>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <Input
-                      description="到期后用户不能再下载，留空不限制"
-                      label="下载截止日期（可选）"
-                      type="date"
-                      value={form.expireDate}
-                      variant="bordered"
-                      onChange={(e) =>
-                        setForm((p) => ({ ...p, expireDate: e.target.value }))
-                      }
-                    />
-                    <Input
-                      label="备注"
-                      value={form.remark}
-                      variant="bordered"
-                      onChange={(e) =>
-                        setForm((p) => ({ ...p, remark: e.target.value }))
-                      }
-                    />
-                  </div>
+                  />
                   <LabeledSwitch
-                    description="停用后用户不能下载"
+                    description="停用后不在「订阅下载」页显示"
                     isSelected={form.enabled}
                     label="启用"
                     onValueChange={(v) =>
@@ -715,8 +624,7 @@ export default function SubscriptionPage() {
               </ModalHeader>
               <ModalBody>
                 <p className="text-default-600">
-                  确定删除订阅「{deleteTarget?.name}
-                  」吗？已分配的用户将无法再下载。
+                  确定删除订阅「{deleteTarget?.name}」吗？删除后无法恢复。
                 </p>
               </ModalBody>
               <ModalFooter>

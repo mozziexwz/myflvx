@@ -4,6 +4,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { AnimatedPage } from "@/components/animated-page";
 import { PageLoadingState } from "@/components/page-state";
+import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
 import { SelectableCard } from "@/components/selectable-card";
 import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
@@ -24,29 +25,20 @@ import {
   getProxyNodes,
   getSubscription,
   getSubscriptionTemplates,
-  getSubscriptionUsers,
   previewSubscription,
   updateSubscription,
   type GeneratorConfig,
   type ProxyGroupSpec,
   type ProxyNode,
   type SubscriptionTemplate,
-  type UserBrief,
 } from "@/api/enhanced";
 import {
   copyText,
+  firstKey,
   hostPort,
   protocolLabel,
   saveTextFile,
 } from "@/utils/enhanced";
-
-// bridge Select 会把空 key 换成序号，“全部”选项用占位 key
-const ALL_KEY = "__all__";
-const fromFilterKey = (keys: Set<React.Key>) => {
-  const value = String(Array.from(keys)[0] ?? ALL_KEY);
-
-  return value === ALL_KEY ? "" : value;
-};
 
 const modalClassNames = {
   base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
@@ -61,21 +53,6 @@ const GROUP_TYPES = [
 
 const BUILTIN_POLICIES = ["DIRECT", "REJECT", "REJECT-DROP", "PASS"];
 
-const dateToMs = (value: string) => {
-  if (!value) return 0;
-  const ms = new Date(`${value}T23:59:59`).getTime();
-
-  return Number.isNaN(ms) ? 0 : ms;
-};
-
-const msToDate = (ms: number) => {
-  if (!ms) return "";
-  const d = new Date(ms);
-  const pad = (n: number) => String(n).padStart(2, "0");
-
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-};
-
 const cloneGroups = (groups: ProxyGroupSpec[]) =>
   groups.map((g) => ({ ...g, proxies: [...(g.proxies || [])] }));
 
@@ -89,14 +66,11 @@ export default function SubGeneratorPage() {
   const [allTags, setAllTags] = useState<string[]>([]);
   const [templates, setTemplates] = useState<SubscriptionTemplate[]>([]);
   const [defaultBaseConfig, setDefaultBaseConfig] = useState("");
-  const [users, setUsers] = useState<UserBrief[]>([]);
 
   const [name, setName] = useState("");
   const [fileName, setFileName] = useState("");
   const [remark, setRemark] = useState("");
-  const [userIds, setUserIds] = useState<number[]>([]);
   const [enabled, setEnabled] = useState(true);
-  const [expireDate, setExpireDate] = useState("");
 
   const [allNodes, setAllNodes] = useState(false);
   const [tags, setTags] = useState<string[]>([]);
@@ -136,10 +110,9 @@ export default function SubGeneratorPage() {
     (async () => {
       setLoading(true);
       try {
-        const [nodeRes, tplRes, userRes] = await Promise.all([
+        const [nodeRes, tplRes] = await Promise.all([
           getProxyNodes(),
           getSubscriptionTemplates(),
-          getSubscriptionUsers(),
         ]);
 
         if (cancelled) return;
@@ -153,7 +126,6 @@ export default function SubGeneratorPage() {
 
         setTemplates(tplList);
         setDefaultBaseConfig(tplRes.data?.defaultBaseConfig || "");
-        if (userRes.code === 0 && userRes.data) setUsers(userRes.data);
 
         if (editId > 0) {
           const subRes = await getSubscription(editId);
@@ -170,9 +142,7 @@ export default function SubGeneratorPage() {
           setName(s.name);
           setFileName(s.fileName?.replace(/\.(yaml|yml|txt)$/i, "") || "");
           setRemark(s.remark || "");
-          setUserIds(s.userIds || []);
           setEnabled(s.enabled);
-          setExpireDate(msToDate(s.expireTime));
           if (cfg) {
             setAllNodes(Boolean(cfg.allNodes));
             setTags(cfg.tags || []);
@@ -438,9 +408,7 @@ export default function SubGeneratorPage() {
         type: "generate",
         fileName: fileName.trim(),
         genConfig: buildConfig(),
-        userIds,
         enabled,
-        expireTime: dateToMs(expireDate),
         autoUpdate: 0,
       };
       const res =
@@ -463,21 +431,15 @@ export default function SubGeneratorPage() {
     return <PageLoadingState message="正在加载..." />;
   }
 
-  const assignableUsers = users.filter((u) => u.roleId !== 0);
-
   return (
     <AnimatedPage className="px-3 lg:px-6 py-8 space-y-4">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold text-foreground">
-            {editId > 0 ? "编辑生成订阅" : "生成订阅"}
-          </h1>
-          <p className="text-sm text-default-500">
-            从节点管理中的节点生成 Clash / mihomo
-            订阅；用户每次下载都会按最新节点重新生成。
-          </p>
-        </div>
-        <div className="flex gap-2">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+        <PageIntro
+          className=""
+          description="用你自己的代理节点生成 Clash / mihomo 订阅：手动选择节点或按标签自动包含，选择模板并调整代理组与规则。保存后在「订阅管理」中下载，每次下载都会按节点的最新状态重新生成。"
+          title={editId > 0 ? "编辑生成订阅" : "生成订阅"}
+        />
+        <div className="flex shrink-0 gap-2">
           <Button
             size="sm"
             variant="light"
@@ -520,39 +482,14 @@ export default function SubGeneratorPage() {
               onChange={(e) => setFileName(e.target.value)}
             />
           </div>
-          <Select
-            description="被分配的用户可以在「订阅下载」页下载；管理员始终可以下载"
-            label="分配给用户"
-            placeholder="不分配"
-            selectedKeys={userIds.map(String)}
-            selectionMode="multiple"
-            onSelectionChange={(keys) =>
-              setUserIds(Array.from(keys).map((k) => Number(k)))
-            }
-          >
-            {assignableUsers.map((u) => (
-              <SelectItem key={String(u.id)}>
-                {u.status === 1 ? u.user : `${u.user}（已禁用）`}
-              </SelectItem>
-            ))}
-          </Select>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Input
-              description="到期后用户不能再下载，留空不限制"
-              label="下载截止日期（可选）"
-              type="date"
-              value={expireDate}
-              variant="bordered"
-              onChange={(e) => setExpireDate(e.target.value)}
-            />
-            <Input
-              label="备注"
-              value={remark}
-              variant="bordered"
-              onChange={(e) => setRemark(e.target.value)}
-            />
-          </div>
+          <Input
+            label="备注"
+            value={remark}
+            variant="bordered"
+            onChange={(e) => setRemark(e.target.value)}
+          />
           <LabeledSwitch
+            description="停用后不在「订阅下载」页显示"
             isSelected={enabled}
             label="启用"
             onValueChange={setEnabled}
@@ -611,7 +548,7 @@ export default function SubGeneratorPage() {
                 type="button"
                 onClick={() => navigate("/proxy-node")}
               >
-                节点管理
+                代理节点
               </button>
               添加或导入节点。
             </div>
@@ -631,17 +568,14 @@ export default function SubGeneratorPage() {
                   <Select
                     aria-label="标签"
                     placeholder="全部标签"
-                    selectedKeys={[nodeTagFilter || ALL_KEY]}
+                    selectedKeys={nodeTagFilter ? [nodeTagFilter] : []}
                     size="sm"
                     onSelectionChange={(keys) =>
-                      setNodeTagFilter(fromFilterKey(keys))
+                      setNodeTagFilter(firstKey(keys))
                     }
                   >
-                    {[
-                      { key: ALL_KEY, label: "全部标签" },
-                      ...allTags.map((t) => ({ key: t, label: t })),
-                    ].map((item) => (
-                      <SelectItem key={item.key}>{item.label}</SelectItem>
+                    {allTags.map((t) => (
+                      <SelectItem key={t}>{t}</SelectItem>
                     ))}
                   </Select>
                 </div>

@@ -127,3 +127,7 @@ export const splitInputTags = (value: string) =>
     .split(/[,，\s]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+
+// 单选下拉框的选中值；选回占位项（「全部…」）时为空字符串
+export const firstKey = (keys: Set<React.Key>) =>
+  String(Array.from(keys)[0] ?? "");

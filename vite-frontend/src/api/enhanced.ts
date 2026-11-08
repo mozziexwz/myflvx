@@ -197,12 +197,10 @@ export interface Subscription {
   subInfo?: SubscriptionInfo;
   autoUpdate: number;
   enabled: boolean;
-  expireTime: number;
   lastSyncTime: number;
   inx: number;
   createdTime: number;
   updatedTime: number;
-  userIds?: number[];
   nodeCount: number;
   genConfig?: GeneratorConfig;
   content?: string;
@@ -218,18 +216,9 @@ export interface SubscriptionMutation {
   userAgent?: string;
   genConfig?: GeneratorConfig;
   fileName?: string;
-  userIds?: number[];
   enabled?: boolean;
   autoUpdate?: number;
-  expireTime?: number;
   refetch?: boolean;
-}
-
-export interface UserBrief {
-  id: number;
-  user: string;
-  roleId: number;
-  status: number;
 }
 
 export const getSubscriptions = () =>
@@ -264,8 +253,6 @@ export const getSubscriptionTemplates = () =>
     templates: SubscriptionTemplate[];
     defaultBaseConfig: string;
   }>("/subscription/templates");
-export const getSubscriptionUsers = () =>
-  Network.post<UserBrief[]>("/subscription/users");
 export const updateSubscriptionOrder = (items: { id: number; inx: number }[]) =>
   Network.post("/subscription/update-order", { items });
 
@@ -307,33 +294,31 @@ export interface DeployParams {
   sudokuCustomTables?: string;
 }
 
+export type DeployStatus =
+  | "pending"
+  | "running"
+  | "success"
+  | "failed"
+  | "uninstalled";
+
 export interface Deployment {
   id: number;
   name: string;
   nodeId: number;
   nodeName?: string;
+  nodeOnline: boolean;
+  nodeVersion?: string;
   host: string;
   protocols: string[];
   params: DeployParams;
-  status: "pending" | "running" | "success" | "failed" | string;
+  status: DeployStatus | string;
+  taskOp?: "install" | "info" | "uninstall" | string;
   lastLog?: string;
   lastRunTime: number;
   remark: string;
   createdTime: number;
   updatedTime: number;
-  command: string;
   proxyNodes: number;
-}
-
-export interface SSHTarget {
-  host: string;
-  port: number;
-  username: string;
-  authType: "password" | "private_key";
-  password?: string;
-  privateKey?: string;
-  passphrase?: string;
-  useSudo: boolean;
 }
 
 export interface DeploySettings {
@@ -343,36 +328,56 @@ export interface DeploySettings {
   effectiveUrl: string;
 }
 
+interface DeployBatchResult {
+  items: Deployment[];
+  warnings: string[];
+}
+
+interface DeployStartResult {
+  started: number;
+  warnings: string[];
+}
+
+const deployTimeout = { timeout: 120_000 };
+
 export const getDeployments = () => Network.post<Deployment[]>("/deploy/list");
 export const getDeployment = (id: number) =>
   Network.post<Deployment>("/deploy/get", { id });
-export const getDeployDefaults = (host?: string, nodeId?: number) =>
-  Network.post<{ params: DeployParams; scriptUrl: string }>(
-    "/deploy/defaults",
-    { host: host || "", nodeId: nodeId || 0 },
-  );
-export const createDeployment = (data: {
-  name: string;
-  nodeId?: number;
+export const getDeployDefaults = () =>
+  Network.post<{ params: DeployParams; scriptUrl: string }>("/deploy/defaults");
+export const createDeployments = (data: {
+  nodeIds: number[];
+  name?: string;
+  host?: string;
   params: DeployParams;
   remark?: string;
-}) => Network.post<Deployment>("/deploy/create", data);
+  run: boolean;
+}) => Network.post<DeployBatchResult>("/deploy/create", data, deployTimeout);
+export const copyDeployment = (id: number, nodeIds: number[], run: boolean) =>
+  Network.post<DeployBatchResult>(
+    "/deploy/copy",
+    { id, nodeIds, run },
+    deployTimeout,
+  );
 export const updateDeployment = (data: {
   id: number;
   name: string;
-  nodeId?: number;
+  host: string;
   params: DeployParams;
   remark?: string;
 }) => Network.post<Deployment>("/deploy/update", data);
 export const deleteDeployment = (id: number, deleteNodes: boolean) =>
   Network.post("/deploy/delete", { id, deleteNodes });
-export const runDeployment = (id: number, ssh: SSHTarget) =>
-  Network.post<{ status: string }>("/deploy/run", { id, ssh });
-export const applyDeployOutput = (id: number, output: string) =>
-  Network.post<{ found: string[]; nodes: number; warnings: string[] }>(
-    "/deploy/apply-output",
-    { id, output },
-  );
+export const runDeployments = (ids: number[]) =>
+  Network.post<DeployStartResult>("/deploy/run", { ids }, deployTimeout);
+export const refreshDeployment = (id: number) =>
+  Network.post<DeployStartResult>("/deploy/refresh", { id }, deployTimeout);
+export const uninstallDeployment = (id: number) =>
+  Network.post<DeployStartResult>("/deploy/uninstall", { id }, deployTimeout);
+export const getDeployCommand = (id: number) =>
+  Network.post<{ command: string; scriptUrl: string }>("/deploy/command", {
+    id,
+  });
 export const syncDeployNodes = (id: number) =>
   Network.post<{ nodes: number; warnings: string[] }>("/deploy/sync-nodes", {
     id,
