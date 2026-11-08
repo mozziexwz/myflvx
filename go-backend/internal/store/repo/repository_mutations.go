@@ -189,6 +189,10 @@ func (r *Repository) DeleteUserCascade(userID int64) error {
 		if err := tx.Where("user_id = ?", userID).Delete(&model.UserQuota{}).Error; err != nil {
 			return err
 		}
+		// myflvx: proxy nodes and subscriptions are private to their owner.
+		if err := deleteEnhancedUserData(tx, userID); err != nil {
+			return err
+		}
 		return tx.Where("id = ?", userID).Delete(&model.User{}).Error
 	})
 }

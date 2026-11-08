@@ -14,7 +14,7 @@ import (
 	"go-backend/internal/store/model"
 )
 
-// Node sources shown in 节点管理.
+// Node sources shown in 代理节点.
 const (
 	proxySourceManual = "manual"
 	proxySourceImport = "import"
@@ -105,8 +105,14 @@ func applyProxyToNode(n *model.ProxyNode, p proxykit.Proxy) error {
 
 func (h *Handler) proxyNodeViews(nodes []model.ProxyNode) []proxyNodeView {
 	tunnelNames, _ := h.repo.ListTunnelNames()
+	forwardIDs := []int64{}
+	for _, n := range nodes {
+		if n.ForwardID > 0 {
+			forwardIDs = append(forwardIDs, n.ForwardID)
+		}
+	}
 	forwardNames := map[int64]string{}
-	if forwards, err := h.repo.ListForwardBriefs(); err == nil {
+	if forwards, err := h.repo.ListForwardBriefsByIDs(forwardIDs); err == nil {
 		for _, f := range forwards {
 			forwardNames[f.ID] = f.Name
 		}
@@ -153,7 +159,11 @@ func (h *Handler) proxyNodeList(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("请求失败"))
 		return
 	}
-	nodes, err := h.repo.ListProxyNodes()
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	nodes, err := h.repo.ListProxyNodesByUser(userID)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -215,6 +225,10 @@ func (h *Handler) proxyNodeCreate(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
 	p, rawURL, err := proxyFromMutation(req)
 	if err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
@@ -222,7 +236,7 @@ func (h *Handler) proxyNodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UnixMilli()
 	node := &model.ProxyNode{
-		RawURL: rawURL, Tags: joinTags(req.Tags), Remark: strings.TrimSpace(req.Remark),
+		UserID: userID, RawURL: rawURL, Tags: joinTags(req.Tags), Remark: strings.TrimSpace(req.Remark),
 		Source: proxySourceManual, Enabled: 1, CreatedTime: now, UpdatedTime: now,
 	}
 	if req.Enabled != nil && !*req.Enabled {
@@ -244,7 +258,11 @@ func (h *Handler) proxyNodeUpdate(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	node, err := h.repo.GetProxyNode(req.ID)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	node, err := h.repo.GetUserProxyNode(userID, req.ID)
 	if err != nil || node == nil {
 		response.WriteJSON(w, response.ErrDefault("节点不存在"))
 		return
@@ -318,10 +336,10 @@ func (h *Handler) proxyNodeUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 type idsRequest struct {
-	IDs            []int64 `json:"ids"`
-	Enabled        bool    `json:"enabled"`
+	IDs            []int64  `json:"ids"`
+	Enabled        bool     `json:"enabled"`
 	Tags           []string `json:"tags"`
-	DeleteForwards bool    `json:"deleteForwards"`
+	DeleteForwards bool     `json:"deleteForwards"`
 }
 
 func (h *Handler) proxyNodeDelete(w http.ResponseWriter, r *http.Request) {
@@ -329,19 +347,29 @@ func (h *Handler) proxyNodeDelete(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
 	if len(req.IDs) == 0 {
 		response.WriteJSON(w, response.ErrDefault("请选择节点"))
 		return
 	}
-	all, err := h.repo.ListProxyNodes()
+	all, err := h.repo.ListProxyNodesByUser(userID)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	// Deleting a source node also deletes its relay nodes.
+	owned := map[int64]bool{}
+	for _, n := range all {
+		owned[n.ID] = true
+	}
 	selected := map[int64]bool{}
 	for _, id := range req.IDs {
-		selected[id] = true
+		if owned[id] {
+			selected[id] = true
+		}
 	}
 	for _, n := range all {
 		if n.ParentID > 0 && selected[n.ParentID] {
@@ -357,6 +385,10 @@ func (h *Handler) proxyNodeDelete(w http.ResponseWriter, r *http.Request) {
 				forwardIDs[n.ForwardID] = true
 			}
 		}
+	}
+	if len(ids) == 0 {
+		response.WriteJSON(w, response.ErrDefault("节点不存在"))
+		return
 	}
 	if err := h.repo.DeleteProxyNodes(ids); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
@@ -387,11 +419,20 @@ func (h *Handler) proxyNodeToggle(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	ids, err := h.repo.FilterOwnedProxyNodeIDs(userID, req.IDs)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
 	enabled := 0
 	if req.Enabled {
 		enabled = 1
 	}
-	if err := h.repo.SetProxyNodesEnabled(req.IDs, enabled, time.Now().UnixMilli()); err != nil {
+	if err := h.repo.SetProxyNodesEnabled(ids, enabled, time.Now().UnixMilli()); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -403,7 +444,16 @@ func (h *Handler) proxyNodeSetTags(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	if err := h.repo.SetProxyNodesTags(req.IDs, joinTags(req.Tags), time.Now().UnixMilli()); err != nil {
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	ids, err := h.repo.FilterOwnedProxyNodeIDs(userID, req.IDs)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.repo.SetProxyNodesTags(ids, joinTags(req.Tags), time.Now().UnixMilli()); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -422,11 +472,15 @@ func (h *Handler) proxyNodeUpdateOrder(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
 	order := map[int64]int{}
 	for _, item := range req.Items {
 		order[item.ID] = item.Inx
 	}
-	if err := h.repo.UpdateProxyNodeOrder(order); err != nil {
+	if err := h.repo.UpdateProxyNodeOrder(userID, order); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -490,6 +544,10 @@ func (h *Handler) proxyNodeImport(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
 	content, sourceURL, err := h.loadImportContent(r.Context(), req)
 	if err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
@@ -502,7 +560,7 @@ func (h *Handler) proxyNodeImport(w http.ResponseWriter, r *http.Request) {
 	}
 	existing := map[string]bool{}
 	if req.SkipDup {
-		if nodes, err := h.repo.ListProxyNodes(); err == nil {
+		if nodes, err := h.repo.ListProxyNodesByUser(userID); err == nil {
 			for _, n := range nodes {
 				if p, err := proxyFromNode(n); err == nil {
 					existing[proxyIdentity(p)] = true
@@ -521,7 +579,7 @@ func (h *Handler) proxyNodeImport(w http.ResponseWriter, r *http.Request) {
 		}
 		existing[proxyIdentity(p)] = true
 		node := &model.ProxyNode{
-			Tags: tags, Remark: strings.TrimSpace(req.Remark), Source: proxySourceImport, SourceRef: sourceURL,
+			UserID: userID, Tags: tags, Remark: strings.TrimSpace(req.Remark), Source: proxySourceImport, SourceRef: sourceURL,
 			Enabled: 1, CreatedTime: now, UpdatedTime: now,
 		}
 		if link, err := proxykit.ShareLink(p); err == nil {
@@ -544,7 +602,11 @@ func (h *Handler) proxyNodeShareLinks(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	nodes, err := h.repo.GetProxyNodesByIDs(req.IDs)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	nodes, err := h.repo.GetUserProxyNodesByIDs(userID, req.IDs)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return

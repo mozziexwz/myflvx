@@ -16,10 +16,11 @@ import (
 )
 
 // registerEnhancedRoutes registers the myflvx subscription and deployment APIs.
-// Access control lives in middleware.requiresAdmin: everything is admin-only
-// except /api/v1/subscription/my/*.
+// Access control lives in middleware.requiresAdmin: 部署节点 (/api/v1/deploy/*)
+// is admin-only; proxy nodes and subscriptions are available to every user and
+// always scoped to the caller's own rows.
 func (h *Handler) registerEnhancedRoutes(mux *http.ServeMux) {
-	// 节点管理
+	// 代理节点
 	mux.HandleFunc("/api/v1/proxy-node/list", h.proxyNodeList)
 	mux.HandleFunc("/api/v1/proxy-node/create", h.proxyNodeCreate)
 	mux.HandleFunc("/api/v1/proxy-node/update", h.proxyNodeUpdate)
@@ -44,23 +45,35 @@ func (h *Handler) registerEnhancedRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/subscription/refresh", h.subscriptionRefresh)
 	mux.HandleFunc("/api/v1/subscription/preview", h.subscriptionPreview)
 	mux.HandleFunc("/api/v1/subscription/templates", h.subscriptionTemplates)
-	mux.HandleFunc("/api/v1/subscription/users", h.subscriptionUsers)
 	mux.HandleFunc("/api/v1/subscription/update-order", h.subscriptionUpdateOrder)
-	// 订阅下载（所有登录用户）
+	// 订阅下载
 	mux.HandleFunc("/api/v1/subscription/my/list", h.subscriptionMyList)
 	mux.HandleFunc("/api/v1/subscription/my/download", h.subscriptionMyDownload)
-	// 部署节点
+	// 部署节点（管理员）：面板通过节点端执行 mihomo_script
 	mux.HandleFunc("/api/v1/deploy/list", h.deployList)
 	mux.HandleFunc("/api/v1/deploy/get", h.deployGet)
 	mux.HandleFunc("/api/v1/deploy/defaults", h.deployDefaults)
 	mux.HandleFunc("/api/v1/deploy/create", h.deployCreate)
 	mux.HandleFunc("/api/v1/deploy/update", h.deployUpdate)
 	mux.HandleFunc("/api/v1/deploy/delete", h.deployDelete)
-	mux.HandleFunc("/api/v1/deploy/command", h.deployCommand)
+	mux.HandleFunc("/api/v1/deploy/copy", h.deployCopy)
 	mux.HandleFunc("/api/v1/deploy/run", h.deployRun)
-	mux.HandleFunc("/api/v1/deploy/apply-output", h.deployApplyOutput)
+	mux.HandleFunc("/api/v1/deploy/refresh", h.deployRefresh)
+	mux.HandleFunc("/api/v1/deploy/uninstall", h.deployUninstall)
+	mux.HandleFunc("/api/v1/deploy/command", h.deployCommand)
 	mux.HandleFunc("/api/v1/deploy/sync-nodes", h.deploySyncNodes)
 	mux.HandleFunc("/api/v1/deploy/settings", h.deploySettings)
+}
+
+// callerID returns the logged-in user's id, writing a 401 response when the
+// request carries no valid identity.
+func callerID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	userID, _, err := userRoleFromRequest(r)
+	if err != nil || userID <= 0 {
+		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
+		return 0, false
+	}
+	return userID, true
 }
 
 // decodeEnhancedBody decodes a POST JSON body, writing an error response on failure.

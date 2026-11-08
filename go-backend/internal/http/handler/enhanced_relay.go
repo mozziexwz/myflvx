@@ -88,7 +88,7 @@ func (h *Handler) relayNodesForForward(parent model.ProxyNode, tunnelID, forward
 			host = relayHost
 		}
 		node := &model.ProxyNode{
-			Name: name, Tags: parent.Tags, Remark: parent.Remark, Source: proxySourceRelay,
+			UserID: parent.UserID, Name: name, Tags: parent.Tags, Remark: parent.Remark, Source: proxySourceRelay,
 			SourceRef: fmt.Sprintf("forward:%d", forwardID), ParentID: parent.ID, TunnelID: tunnelID, ForwardID: forwardID,
 			RelayHost: relayHost, RelayEntry: e.NodeID, Enabled: 1, CreatedTime: now, UpdatedTime: now,
 		}
@@ -110,7 +110,11 @@ func (h *Handler) proxyNodeRelayCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(401, "无效的token或token已过期"))
 		return
 	}
-	parent, err := h.repo.GetProxyNode(req.NodeID)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	parent, err := h.repo.GetUserProxyNode(userID, req.NodeID)
 	if err != nil || parent == nil {
 		response.WriteJSON(w, response.ErrDefault("节点不存在"))
 		return
@@ -142,7 +146,6 @@ func (h *Handler) proxyNodeRelayCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("创建转发失败: "+err.Error()))
 		return
 	}
-	userID, _ := strconv.ParseInt(claims.Sub, 10, 64)
 	forwardID, err := h.repo.FindLatestForwardID(userID, req.TunnelID, forwardName, remoteAddr)
 	if err != nil || forwardID <= 0 {
 		response.WriteJSON(w, response.ErrDefault("转发已创建，但未找到转发记录，请在转发列表中确认"))
@@ -187,12 +190,17 @@ func (h *Handler) proxyNodeRelayCandidates(w http.ResponseWriter, r *http.Reques
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	parent, err := h.repo.GetProxyNode(req.NodeID)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	parent, err := h.repo.GetUserProxyNode(userID, req.NodeID)
 	if err != nil || parent == nil {
 		response.WriteJSON(w, response.ErrDefault("节点不存在"))
 		return
 	}
-	forwards, err := h.repo.ListForwardBriefs()
+	// Only the caller's own forwards can be bound to their relay nodes.
+	forwards, err := h.repo.ListForwardBriefsByUser(userID)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -217,7 +225,11 @@ func (h *Handler) proxyNodeRelayBind(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	parent, err := h.repo.GetProxyNode(req.NodeID)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	parent, err := h.repo.GetUserProxyNode(userID, req.NodeID)
 	if err != nil || parent == nil {
 		response.WriteJSON(w, response.ErrDefault("节点不存在"))
 		return
@@ -227,7 +239,7 @@ func (h *Handler) proxyNodeRelayBind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	forward, err := h.repo.GetForwardBrief(req.ForwardID)
-	if err != nil || forward == nil {
+	if err != nil || forward == nil || forward.UserID != userID {
 		response.WriteJSON(w, response.ErrDefault("转发不存在"))
 		return
 	}
@@ -253,7 +265,11 @@ func (h *Handler) proxyNodeRelayRefresh(w http.ResponseWriter, r *http.Request) 
 		response.WriteJSON(w, response.ErrDefault("请求失败"))
 		return
 	}
-	nodes, err := h.repo.ListProxyNodes()
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	nodes, err := h.repo.ListProxyNodesByUser(userID)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return

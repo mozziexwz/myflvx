@@ -1,5 +1,7 @@
 package proxykit
 
+import "strings"
+
 // Template is a built-in starting point for the subscription generator.
 type Template struct {
 	ID          string           `json:"id"`
@@ -13,7 +15,37 @@ type Template struct {
 // DefaultBaseConfig holds the general settings written before proxies. It
 // targets mihomo (Clash Meta) clients such as Clash Verge Rev, Mihomo Party
 // and FlClash, which are required for SS 2022 / mieru / Sudoku nodes anyway.
-const DefaultBaseConfig = `mixed-port: 7890
+//
+// The general options follow the defaults that subscription converters such
+// as miaomiaowu / sublink-worker ship: no sniffer (it rewrites connection
+// targets), no tcp-concurrent, no global client fingerprint. With those enabled
+// users reported that sites opened by IP:port stopped working while the same
+// node worked with a miaomiaowu subscription.
+const DefaultBaseConfig = baseGeneralSettings + baseDNSSettings
+
+const baseGeneralSettings = `mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: true
+unified-delay: true
+geodata-mode: true
+geodata-loader: standard
+geo-auto-update: true
+geo-update-interval: 24
+geox-url:
+  geoip: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat
+  geosite: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat
+  mmdb: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb
+  asn: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb
+profile:
+  store-selected: true
+  store-fake-ip: true
+`
+
+// legacyGeneralSettingsV1 is the general block of myflvx 2.2.1. A generator
+// config that stored this default verbatim is upgraded to the current default.
+const legacyGeneralSettingsV1 = `mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
@@ -43,7 +75,20 @@ sniffer:
       ports: [443, 8443]
     QUIC:
       ports: [443, 8443]
-dns:
+`
+
+// effectiveBaseConfig returns the base config a generator config renders with:
+// the current default when none is stored, or when the stored text is an old
+// built-in default that was copied verbatim.
+func effectiveBaseConfig(stored string) string {
+	text := strings.TrimSpace(strings.ReplaceAll(stored, "\r\n", "\n"))
+	if text == "" || text == strings.TrimSpace(legacyGeneralSettingsV1+baseDNSSettings) {
+		return DefaultBaseConfig
+	}
+	return text
+}
+
+const baseDNSSettings = `dns:
   enable: true
   ipv6: true
   listen: 0.0.0.0:1053

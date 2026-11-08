@@ -212,6 +212,10 @@ func Open(path string) (*Repository, error) {
 		_ = sqlDB.Close()
 		return nil, err
 	}
+	if err := assignOrphanEnhancedRows(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("assign proxy node owners: %w", err)
+	}
 
 	return &Repository{db: db, dbPath: path}, nil
 }
@@ -253,6 +257,10 @@ func OpenPostgres(dsn string) (*Repository, error) {
 	if err := migrateSchema(db); err != nil {
 		_ = sqlDB.Close()
 		return nil, err
+	}
+	if err := assignOrphanEnhancedRows(db); err != nil {
+		_ = sqlDB.Close()
+		return nil, fmt.Errorf("assign proxy node owners: %w", err)
 	}
 
 	return &Repository{db: db}, nil
@@ -324,7 +332,6 @@ func autoMigrateAll(db *gorm.DB) error {
 		// myflvx enhanced tables
 		&model.ProxyNode{},
 		&model.SubFile{},
-		&model.SubFileUser{},
 		&model.ProxyDeploy{},
 	}
 

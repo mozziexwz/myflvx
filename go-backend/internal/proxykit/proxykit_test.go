@@ -141,16 +141,22 @@ func TestBuildInstallCommand(t *testing.T) {
 	if !strings.Contains(quoted, `--ss-password 'it'"'"'s+bad'`) {
 		t.Fatalf("special characters must be single-quoted: %s", quoted)
 	}
-	script := BuildSSHScript(params, "", true)
-	if !strings.Contains(script, "sudo -n bash \"$tmp\" install -y") || !strings.Contains(script, ShareBeginMarker) {
-		t.Fatalf("unexpected ssh script:\n%s", script)
+	args := ScriptOpArgs(ScriptOpInstall, params)
+	if len(args) == 0 || args[0] != "-y" || strings.Join(args, " ") != strings.Join(InstallArgs(params)[1:], " ") {
+		t.Fatalf("agent install args must be the install options without the op: %v", args)
+	}
+	if got := strings.Join(ScriptOpArgs(ScriptOpUninstall, params), " "); got != "-y" {
+		t.Fatalf("uninstall args: %q", got)
+	}
+	if got := ScriptOpArgs(ScriptOpInfo, params); len(got) != 0 {
+		t.Fatalf("info takes no args: %v", got)
 	}
 }
 
 func TestExtractAndApplyShareLinks(t *testing.T) {
 	params := DeployParams{Protocols: []string{"sudoku"}, Host: "1.2.3.4", SudokuKeyMode: "pair", SudokuTable: "prefer_entropy", SudokuPadding: "1-15", SudokuPort: 1}
 	payload := `{"n":"x","h":"1.2.3.4","p":20003,"k":"abcdef0123456789abcdef0123456789","a":"entropy","e":"chacha20-poly1305","m":1080,"x":true,"hd":true}`
-	output := "==> 安装完成\n" + ShareBeginMarker + "\nsudoku://" + base64.RawURLEncoding.EncodeToString([]byte(payload)) + "\n" + ShareEndMarker + "\n"
+	output := "==> 安装完成\nsudoku://" + base64.RawURLEncoding.EncodeToString([]byte(payload)) + "\n"
 	links := ExtractShareLinks(output)
 	if len(links) != 1 {
 		t.Fatalf("expected 1 link, got %v", links)

@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +23,11 @@ const (
 	subTypeGenerate = "generate"
 )
 
+// Subscriptions belong to the user who created them: every endpoint below is
+// scoped to the caller, and generated subscriptions only use the owner's nodes.
+// There is deliberately no public subscription URL; files are downloaded from
+// inside the panel with the login token.
+
 type subFileView struct {
 	ID           int64                      `json:"id"`
 	Name         string                     `json:"name"`
@@ -35,23 +39,21 @@ type subFileView struct {
 	SubInfo      *proxykit.SubscriptionInfo `json:"subInfo,omitempty"`
 	AutoUpdate   int                        `json:"autoUpdate"`
 	Enabled      bool                       `json:"enabled"`
-	ExpireTime   int64                      `json:"expireTime"`
 	LastSyncTime int64                      `json:"lastSyncTime"`
 	Inx          int                        `json:"inx"`
 	CreatedTime  int64                      `json:"createdTime"`
 	UpdatedTime  int64                      `json:"updatedTime"`
-	UserIDs      []int64                    `json:"userIds,omitempty"`
 	NodeCount    int                        `json:"nodeCount"`
 	GenConfig    *proxykit.GeneratorConfig  `json:"genConfig,omitempty"`
 	Content      string                     `json:"content,omitempty"`
 }
 
-func subFileToView(s model.SubFile, userIDs []int64, withContent bool) subFileView {
+func subFileToView(s model.SubFile, withContent bool) subFileView {
 	v := subFileView{
 		ID: s.ID, Name: s.Name, Remark: s.Remark, Type: s.Type, SourceURL: s.SourceURL, UserAgent: s.UserAgent,
 		FileName: subscriptionFileName(s, "clash"), SubInfo: proxykit.ParseSubscriptionUserInfo(s.SubInfo),
-		AutoUpdate: s.AutoUpdate, Enabled: s.Enabled == 1, ExpireTime: s.ExpireTime, LastSyncTime: s.LastSyncTime,
-		Inx: s.Inx, CreatedTime: s.CreatedTime, UpdatedTime: s.UpdatedTime, UserIDs: userIDs,
+		AutoUpdate: s.AutoUpdate, Enabled: s.Enabled == 1, LastSyncTime: s.LastSyncTime,
+		Inx: s.Inx, CreatedTime: s.CreatedTime, UpdatedTime: s.UpdatedTime,
 	}
 	if s.Type == subTypeGenerate {
 		if cfg, err := decodeGenConfig(s.GenConfig); err == nil {
@@ -111,15 +113,18 @@ func (h *Handler) subscriptionList(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("请求失败"))
 		return
 	}
-	items, err := h.repo.ListSubFiles()
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	items, err := h.repo.ListSubFilesByUser(userID)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
-	users, _ := h.repo.SubFileUserMap()
 	views := make([]subFileView, 0, len(items))
 	for _, s := range items {
-		views = append(views, subFileToView(s, users[s.ID], false))
+		views = append(views, subFileToView(s, false))
 	}
 	response.WriteJSON(w, response.OK(views))
 }
@@ -131,13 +136,16 @@ func (h *Handler) subscriptionGet(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	s, err := h.repo.GetSubFile(req.ID)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	s, err := h.repo.GetUserSubFile(userID, req.ID)
 	if err != nil || s == nil {
 		response.WriteJSON(w, response.ErrDefault("订阅不存在"))
 		return
 	}
-	users, _ := h.repo.SubFileUserMap()
-	response.WriteJSON(w, response.OK(subFileToView(*s, users[s.ID], true)))
+	response.WriteJSON(w, response.OK(subFileToView(*s, true)))
 }
 
 type subscriptionMutation struct {
@@ -150,14 +158,12 @@ type subscriptionMutation struct {
 	UserAgent  string                    `json:"userAgent"`
 	GenConfig  *proxykit.GeneratorConfig `json:"genConfig"`
 	FileName   string                    `json:"fileName"`
-	UserIDs    []int64                   `json:"userIds"`
 	Enabled    *bool                     `json:"enabled"`
 	AutoUpdate int                       `json:"autoUpdate"`
-	ExpireTime int64                     `json:"expireTime"`
 	Refetch    bool                      `json:"refetch"`
 }
 
-// normalizeUploadedContent accepts a Clash YAML document, or a share-link /
+// normalizeSubscriptionContent accepts a Clash YAML document, or a share-link /
 // base64 list which is turned into a full config with the standard template.
 func normalizeSubscriptionContent(content []byte) (string, error) {
 	text := strings.TrimSpace(strings.TrimPrefix(string(content), "\xef\xbb\xbf"))
@@ -204,9 +210,6 @@ func (h *Handler) applySubscriptionMutation(ctx context.Context, s *model.SubFil
 	s.FileName = strings.TrimSpace(req.FileName)
 	if req.AutoUpdate >= 0 {
 		s.AutoUpdate = req.AutoUpdate
-	}
-	if req.ExpireTime >= 0 {
-		s.ExpireTime = req.ExpireTime
 	}
 	if req.Enabled != nil {
 		s.Enabled = 0
@@ -260,7 +263,7 @@ func (h *Handler) applySubscriptionMutation(ctx context.Context, s *model.SubFil
 			return err
 		}
 		s.GenConfig = string(raw)
-		res, err := h.renderGeneratedSubscription(ctx, *req.GenConfig)
+		res, err := h.renderGeneratedSubscription(ctx, s.UserID, *req.GenConfig)
 		if err != nil {
 			return err
 		}
@@ -276,17 +279,21 @@ func (h *Handler) subscriptionCreate(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
 	now := time.Now().UnixMilli()
-	s := &model.SubFile{Type: strings.TrimSpace(req.Type), Enabled: 1, CreatedTime: now, UpdatedTime: now}
+	s := &model.SubFile{UserID: userID, Type: strings.TrimSpace(req.Type), Enabled: 1, CreatedTime: now, UpdatedTime: now}
 	if err := h.applySubscriptionMutation(r.Context(), s, req, true); err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
-	if err := h.repo.CreateSubFile(s, req.UserIDs); err != nil {
+	if err := h.repo.CreateSubFile(s); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
-	response.WriteJSON(w, response.OK(subFileToView(*s, req.UserIDs, false)))
+	response.WriteJSON(w, response.OK(subFileToView(*s, false)))
 }
 
 func (h *Handler) subscriptionUpdate(w http.ResponseWriter, r *http.Request) {
@@ -294,7 +301,11 @@ func (h *Handler) subscriptionUpdate(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	s, err := h.repo.GetSubFile(req.ID)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	s, err := h.repo.GetUserSubFile(userID, req.ID)
 	if err != nil || s == nil {
 		response.WriteJSON(w, response.ErrDefault("订阅不存在"))
 		return
@@ -304,12 +315,11 @@ func (h *Handler) subscriptionUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.UpdatedTime = time.Now().UnixMilli()
-	if err := h.repo.SaveSubFile(s, req.UserIDs, req.UserIDs != nil); err != nil {
+	if err := h.repo.SaveSubFile(s); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
-	users, _ := h.repo.SubFileUserMap()
-	response.WriteJSON(w, response.OK(subFileToView(*s, users[s.ID], false)))
+	response.WriteJSON(w, response.OK(subFileToView(*s, false)))
 }
 
 func (h *Handler) subscriptionDelete(w http.ResponseWriter, r *http.Request) {
@@ -317,7 +327,16 @@ func (h *Handler) subscriptionDelete(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	if err := h.repo.DeleteSubFiles(req.IDs); err != nil {
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	ids, err := h.repo.FilterOwnedSubFileIDs(userID, req.IDs)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.repo.DeleteSubFiles(ids); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
@@ -331,7 +350,11 @@ func (h *Handler) subscriptionRefresh(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	s, err := h.repo.GetSubFile(req.ID)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	s, err := h.repo.GetUserSubFile(userID, req.ID)
 	if err != nil || s == nil {
 		response.WriteJSON(w, response.ErrDefault("订阅不存在"))
 		return
@@ -352,7 +375,7 @@ func (h *Handler) subscriptionRefresh(w http.ResponseWriter, r *http.Request) {
 			response.WriteJSON(w, response.ErrDefault(err.Error()))
 			return
 		}
-		res, err := h.renderGeneratedSubscription(r.Context(), cfg)
+		res, err := h.renderGeneratedSubscription(r.Context(), s.UserID, cfg)
 		if err != nil {
 			response.WriteJSON(w, response.ErrDefault(err.Error()))
 			return
@@ -363,8 +386,7 @@ func (h *Handler) subscriptionRefresh(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("上传的订阅无需刷新"))
 		return
 	}
-	users, _ := h.repo.SubFileUserMap()
-	response.WriteJSON(w, response.OK(subFileToView(*s, users[s.ID], false)))
+	response.WriteJSON(w, response.OK(subFileToView(*s, false)))
 }
 
 func (h *Handler) subscriptionUpdateOrder(w http.ResponseWriter, r *http.Request) {
@@ -372,20 +394,24 @@ func (h *Handler) subscriptionUpdateOrder(w http.ResponseWriter, r *http.Request
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
 	order := map[int64]int{}
 	for _, item := range req.Items {
 		order[item.ID] = item.Inx
 	}
-	if err := h.repo.UpdateSubFileOrder(order); err != nil {
+	if err := h.repo.UpdateSubFileOrder(userID, order); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	response.WriteJSON(w, response.OKEmpty())
 }
 
-// resolveGeneratorNodes returns the enabled nodes selected by a generator config.
-func (h *Handler) resolveGeneratorNodes(ctx context.Context, cfg proxykit.GeneratorConfig) ([]proxykit.Proxy, error) {
-	nodes, err := h.repo.ListProxyNodes()
+// resolveGeneratorNodes returns the owner's enabled nodes selected by a generator config.
+func (h *Handler) resolveGeneratorNodes(ctx context.Context, ownerID int64, cfg proxykit.GeneratorConfig) ([]proxykit.Proxy, error) {
+	nodes, err := h.repo.ListProxyNodesByUser(ownerID)
 	if err != nil {
 		return nil, err
 	}
@@ -442,8 +468,8 @@ func (h *Handler) resolveGeneratorNodes(ctx context.Context, cfg proxykit.Genera
 	return proxies, nil
 }
 
-func (h *Handler) renderGeneratedSubscription(ctx context.Context, cfg proxykit.GeneratorConfig) (proxykit.RenderResult, error) {
-	proxies, err := h.resolveGeneratorNodes(ctx, cfg)
+func (h *Handler) renderGeneratedSubscription(ctx context.Context, ownerID int64, cfg proxykit.GeneratorConfig) (proxykit.RenderResult, error) {
+	proxies, err := h.resolveGeneratorNodes(ctx, ownerID, cfg)
 	if err != nil {
 		return proxykit.RenderResult{}, err
 	}
@@ -460,7 +486,11 @@ func (h *Handler) subscriptionPreview(w http.ResponseWriter, r *http.Request) {
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	proxies, err := h.resolveGeneratorNodes(r.Context(), req.GenConfig)
+	userID, ok := callerID(w, r)
+	if !ok {
+		return
+	}
+	proxies, err := h.resolveGeneratorNodes(r.Context(), userID, req.GenConfig)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
@@ -485,53 +515,28 @@ func (h *Handler) subscriptionTemplates(w http.ResponseWriter, r *http.Request) 
 	response.WriteJSON(w, response.OK(map[string]interface{}{"templates": proxykit.Templates(), "defaultBaseConfig": proxykit.DefaultBaseConfig}))
 }
 
-func (h *Handler) subscriptionUsers(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		response.WriteJSON(w, response.ErrDefault("请求失败"))
-		return
-	}
-	users, err := h.repo.ListUserBriefs()
-	if err != nil {
-		response.WriteJSON(w, response.Err(-2, err.Error()))
-		return
-	}
-	response.WriteJSON(w, response.OK(users))
-}
-
 // ─── 订阅下载 ─────────────────────────────────────────────────────────
-// Users download the subscription file from inside the panel with their
-// login token; there is deliberately no public subscription URL.
 
 func (h *Handler) subscriptionMyList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		response.WriteJSON(w, response.ErrDefault("请求失败"))
 		return
 	}
-	claims, ok := requestClaims(r)
+	userID, ok := callerID(w, r)
 	if !ok {
-		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
 		return
 	}
-	var items []model.SubFile
-	var err error
-	if claims.RoleID == 0 {
-		items, err = h.repo.ListSubFiles()
-	} else {
-		userID, _ := strconv.ParseInt(claims.Sub, 10, 64)
-		items, err = h.repo.ListSubFilesForUser(userID)
-	}
+	items, err := h.repo.ListSubFilesByUser(userID)
 	if err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
 	views := make([]subFileView, 0, len(items))
 	for _, s := range items {
-		v := subFileToView(s, nil, false)
-		if claims.RoleID != 0 {
-			v.SourceURL = ""
-			v.UserAgent = ""
+		if s.Enabled != 1 {
+			continue
 		}
-		views = append(views, v)
+		views = append(views, subFileToView(s, false))
 	}
 	response.WriteJSON(w, response.OK(views))
 }
@@ -544,27 +549,14 @@ func (h *Handler) subscriptionMyDownload(w http.ResponseWriter, r *http.Request)
 	if !decodeEnhancedBody(w, r, &req) {
 		return
 	}
-	claims, ok := requestClaims(r)
+	userID, ok := callerID(w, r)
 	if !ok {
-		response.WriteJSON(w, response.Err(401, "未登录或token已过期"))
 		return
 	}
-	s, err := h.repo.GetSubFile(req.ID)
+	s, err := h.repo.GetUserSubFile(userID, req.ID)
 	if err != nil || s == nil {
 		response.WriteJSON(w, response.ErrDefault("订阅不存在"))
 		return
-	}
-	if claims.RoleID != 0 {
-		userID, _ := strconv.ParseInt(claims.Sub, 10, 64)
-		allowed, err := h.repo.UserHasSubFile(userID, s.ID)
-		if err != nil || !allowed || s.Enabled != 1 {
-			response.WriteJSON(w, response.Err(403, "无权下载该订阅"))
-			return
-		}
-		if s.ExpireTime > 0 && time.Now().UnixMilli() > s.ExpireTime {
-			response.WriteJSON(w, response.Err(403, "该订阅已过期"))
-			return
-		}
 	}
 
 	content, proxies, err := h.subscriptionContent(r.Context(), s)
@@ -614,7 +606,7 @@ func (h *Handler) subscriptionContent(ctx context.Context, s *model.SubFile) (st
 		if err != nil {
 			return "", nil, err
 		}
-		proxies, err := h.resolveGeneratorNodes(ctx, cfg)
+		proxies, err := h.resolveGeneratorNodes(ctx, s.UserID, cfg)
 		if err != nil {
 			return "", nil, err
 		}

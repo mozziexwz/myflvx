@@ -58,6 +58,9 @@ type Handler struct {
 
 	qualityProber *tunnelQualityProber
 	bestExit      *bestExitManager
+
+	// myflvx: deployment id → agent task id of the mihomo_script runs being followed.
+	deployTasks sync.Map
 }
 
 const monitorTunnelQualityEnabledConfigKey = "monitor_tunnel_quality_enabled"

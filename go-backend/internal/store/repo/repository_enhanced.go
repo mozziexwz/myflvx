@@ -13,13 +13,27 @@ import (
 )
 
 // ─── myflvx: proxy nodes ─────────────────────────────────────────────
+//
+// Proxy nodes and subscriptions belong to one user. Handlers resolve the
+// caller's own ids with the Filter*/GetUser* helpers before mutating rows.
 
+// ListProxyNodes returns every node of every user (backup export).
 func (r *Repository) ListProxyNodes() ([]model.ProxyNode, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("repository not initialized")
 	}
 	var nodes []model.ProxyNode
 	err := r.db.Order("inx ASC, id ASC").Find(&nodes).Error
+	return nodes, err
+}
+
+// ListProxyNodesByUser returns the nodes owned by a user.
+func (r *Repository) ListProxyNodesByUser(userID int64) ([]model.ProxyNode, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var nodes []model.ProxyNode
+	err := r.db.Where("user_id = ?", userID).Order("inx ASC, id ASC").Find(&nodes).Error
 	return nodes, err
 }
 
@@ -38,7 +52,20 @@ func (r *Repository) GetProxyNode(id int64) (*model.ProxyNode, error) {
 	return &node, nil
 }
 
-func (r *Repository) GetProxyNodesByIDs(ids []int64) ([]model.ProxyNode, error) {
+// GetUserProxyNode returns the node if it exists and belongs to the user.
+func (r *Repository) GetUserProxyNode(userID, id int64) (*model.ProxyNode, error) {
+	node, err := r.GetProxyNode(id)
+	if err != nil || node == nil {
+		return nil, err
+	}
+	if node.UserID != userID {
+		return nil, nil
+	}
+	return node, nil
+}
+
+// GetUserProxyNodesByIDs returns the nodes among ids that belong to the user.
+func (r *Repository) GetUserProxyNodesByIDs(userID int64, ids []int64) ([]model.ProxyNode, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("repository not initialized")
 	}
@@ -46,8 +73,21 @@ func (r *Repository) GetProxyNodesByIDs(ids []int64) ([]model.ProxyNode, error) 
 		return []model.ProxyNode{}, nil
 	}
 	var nodes []model.ProxyNode
-	err := r.db.Where("id IN ?", ids).Order("inx ASC, id ASC").Find(&nodes).Error
+	err := r.db.Where("user_id = ? AND id IN ?", userID, ids).Order("inx ASC, id ASC").Find(&nodes).Error
 	return nodes, err
+}
+
+// FilterOwnedProxyNodeIDs keeps the ids that belong to the user.
+func (r *Repository) FilterOwnedProxyNodeIDs(userID int64, ids []int64) ([]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	if len(ids) == 0 {
+		return []int64{}, nil
+	}
+	var owned []int64
+	err := r.db.Model(&model.ProxyNode{}).Where("user_id = ? AND id IN ?", userID, ids).Pluck("id", &owned).Error
+	return owned, err
 }
 
 func (r *Repository) ListProxyNodesBySource(source, sourceRef string) ([]model.ProxyNode, error) {
@@ -146,13 +186,14 @@ func (r *Repository) SetProxyNodesTags(ids []int64, tags string, now int64) erro
 		Updates(map[string]interface{}{"tags": tags, "updated_time": now}).Error
 }
 
-func (r *Repository) UpdateProxyNodeOrder(order map[int64]int) error {
+// UpdateProxyNodeOrder sets inx for the user's nodes in order (other ids are ignored).
+func (r *Repository) UpdateProxyNodeOrder(userID int64, order map[int64]int) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		for id, inx := range order {
-			if err := tx.Model(&model.ProxyNode{}).Where("id = ?", id).Update("inx", inx).Error; err != nil {
+			if err := tx.Model(&model.ProxyNode{}).Where("id = ? AND user_id = ?", id, userID).Update("inx", inx).Error; err != nil {
 				return err
 			}
 		}
@@ -162,12 +203,23 @@ func (r *Repository) UpdateProxyNodeOrder(order map[int64]int) error {
 
 // ─── myflvx: subscriptions ───────────────────────────────────────────
 
+// ListSubFiles returns every subscription of every user (backup export).
 func (r *Repository) ListSubFiles() ([]model.SubFile, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("repository not initialized")
 	}
 	var items []model.SubFile
 	err := r.db.Order("inx ASC, id ASC").Find(&items).Error
+	return items, err
+}
+
+// ListSubFilesByUser returns the subscriptions owned by a user.
+func (r *Repository) ListSubFilesByUser(userID int64) ([]model.SubFile, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var items []model.SubFile
+	err := r.db.Where("user_id = ?", userID).Order("inx ASC, id ASC").Find(&items).Error
 	return items, err
 }
 
@@ -186,7 +238,32 @@ func (r *Repository) GetSubFile(id int64) (*model.SubFile, error) {
 	return &item, nil
 }
 
-func (r *Repository) CreateSubFile(item *model.SubFile, userIDs []int64) error {
+// GetUserSubFile returns the subscription if it exists and belongs to the user.
+func (r *Repository) GetUserSubFile(userID, id int64) (*model.SubFile, error) {
+	item, err := r.GetSubFile(id)
+	if err != nil || item == nil {
+		return nil, err
+	}
+	if item.UserID != userID {
+		return nil, nil
+	}
+	return item, nil
+}
+
+// FilterOwnedSubFileIDs keeps the ids that belong to the user.
+func (r *Repository) FilterOwnedSubFileIDs(userID int64, ids []int64) ([]int64, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	if len(ids) == 0 {
+		return []int64{}, nil
+	}
+	var owned []int64
+	err := r.db.Model(&model.SubFile{}).Where("user_id = ? AND id IN ?", userID, ids).Pluck("id", &owned).Error
+	return owned, err
+}
+
+func (r *Repository) CreateSubFile(item *model.SubFile) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
@@ -196,26 +273,15 @@ func (r *Repository) CreateSubFile(item *model.SubFile, userIDs []int64) error {
 		if max.Valid {
 			item.Inx = int(max.Int64) + 1
 		}
-		if err := tx.Create(item).Error; err != nil {
-			return err
-		}
-		return replaceSubFileUsers(tx, item.ID, userIDs, item.CreatedTime)
+		return tx.Create(item).Error
 	})
 }
 
-func (r *Repository) SaveSubFile(item *model.SubFile, userIDs []int64, replaceUsers bool) error {
+func (r *Repository) SaveSubFile(item *model.SubFile) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
-	return r.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(item).Error; err != nil {
-			return err
-		}
-		if replaceUsers {
-			return replaceSubFileUsers(tx, item.ID, userIDs, item.UpdatedTime)
-		}
-		return nil
-	})
+	return r.db.Save(item).Error
 }
 
 func (r *Repository) UpdateSubFileSync(id int64, content, subInfo, fileName string, syncTime int64) error {
@@ -243,101 +309,22 @@ func (r *Repository) DeleteSubFiles(ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	return r.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("sub_file_id IN ?", ids).Delete(&model.SubFileUser{}).Error; err != nil {
-			return err
-		}
-		return tx.Where("id IN ?", ids).Delete(&model.SubFile{}).Error
-	})
+	return r.db.Where("id IN ?", ids).Delete(&model.SubFile{}).Error
 }
 
-func (r *Repository) UpdateSubFileOrder(order map[int64]int) error {
+// UpdateSubFileOrder sets inx for the user's subscriptions (other ids are ignored).
+func (r *Repository) UpdateSubFileOrder(userID int64, order map[int64]int) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
 	}
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		for id, inx := range order {
-			if err := tx.Model(&model.SubFile{}).Where("id = ?", id).Update("inx", inx).Error; err != nil {
+			if err := tx.Model(&model.SubFile{}).Where("id = ? AND user_id = ?", id, userID).Update("inx", inx).Error; err != nil {
 				return err
 			}
 		}
 		return nil
 	})
-}
-
-func replaceSubFileUsers(tx *gorm.DB, subFileID int64, userIDs []int64, now int64) error {
-	if err := tx.Where("sub_file_id = ?", subFileID).Delete(&model.SubFileUser{}).Error; err != nil {
-		return err
-	}
-	seen := map[int64]bool{}
-	for _, uid := range userIDs {
-		if uid <= 0 || seen[uid] {
-			continue
-		}
-		seen[uid] = true
-		row := model.SubFileUser{SubFileID: subFileID, UserID: uid, CreatedTime: now}
-		if err := tx.Create(&row).Error; err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// SubFileUserMap returns subscription id → assigned user ids.
-func (r *Repository) SubFileUserMap() (map[int64][]int64, error) {
-	if r == nil || r.db == nil {
-		return nil, errors.New("repository not initialized")
-	}
-	var rows []model.SubFileUser
-	if err := r.db.Order("id ASC").Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := map[int64][]int64{}
-	for _, row := range rows {
-		out[row.SubFileID] = append(out[row.SubFileID], row.UserID)
-	}
-	return out, nil
-}
-
-// ListSubFilesForUser returns the enabled subscriptions assigned to a user.
-func (r *Repository) ListSubFilesForUser(userID int64) ([]model.SubFile, error) {
-	if r == nil || r.db == nil {
-		return nil, errors.New("repository not initialized")
-	}
-	var items []model.SubFile
-	err := r.db.Model(&model.SubFile{}).
-		Joins("JOIN sub_file_user ON sub_file_user.sub_file_id = sub_file.id").
-		Where("sub_file_user.user_id = ? AND sub_file.enabled = 1", userID).
-		Order("sub_file.inx ASC, sub_file.id ASC").
-		Find(&items).Error
-	return items, err
-}
-
-func (r *Repository) UserHasSubFile(userID, subFileID int64) (bool, error) {
-	if r == nil || r.db == nil {
-		return false, errors.New("repository not initialized")
-	}
-	var count int64
-	err := r.db.Model(&model.SubFileUser{}).Where("user_id = ? AND sub_file_id = ?", userID, subFileID).Count(&count).Error
-	return count > 0, err
-}
-
-// ListUserBriefs returns id/name/role/status of all users for assignment UIs.
-func (r *Repository) ListUserBriefs() ([]map[string]interface{}, error) {
-	if r == nil || r.db == nil {
-		return nil, errors.New("repository not initialized")
-	}
-	// Load whole rows: an unquoted `user` in a select list is the current_user
-	// function on PostgreSQL, so selecting individual columns would break there.
-	var users []model.User
-	if err := r.db.Order("id ASC").Find(&users).Error; err != nil {
-		return nil, err
-	}
-	out := make([]map[string]interface{}, 0, len(users))
-	for _, u := range users {
-		out = append(out, map[string]interface{}{"id": u.ID, "user": u.User, "roleId": u.RoleID, "status": u.Status})
-	}
-	return out, nil
 }
 
 // ─── myflvx: deployments ─────────────────────────────────────────────
@@ -380,6 +367,8 @@ func (r *Repository) SaveProxyDeploy(item *model.ProxyDeploy) error {
 	return r.db.Save(item).Error
 }
 
+// UpdateProxyDeployRun stores the status and log of a run. runTime > 0 also
+// records the start time of the run.
 func (r *Repository) UpdateProxyDeployRun(id int64, status, log string, runTime, now int64) error {
 	if r == nil || r.db == nil {
 		return errors.New("repository not initialized")
@@ -389,6 +378,25 @@ func (r *Repository) UpdateProxyDeployRun(id int64, status, log string, runTime,
 		updates["last_run_time"] = runTime
 	}
 	return r.db.Model(&model.ProxyDeploy{}).Where("id = ?", id).Updates(updates).Error
+}
+
+// SetProxyDeployTask records (or clears, with empty values) the agent task of a deployment.
+func (r *Repository) SetProxyDeployTask(id int64, taskID, taskOp string, now int64) error {
+	if r == nil || r.db == nil {
+		return errors.New("repository not initialized")
+	}
+	return r.db.Model(&model.ProxyDeploy{}).Where("id = ?", id).
+		Updates(map[string]interface{}{"task_id": taskID, "task_op": taskOp, "updated_time": now}).Error
+}
+
+// ListRunningProxyDeploys returns deployments whose agent task is still in progress.
+func (r *Repository) ListRunningProxyDeploys() ([]model.ProxyDeploy, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var items []model.ProxyDeploy
+	err := r.db.Where("status = ?", "running").Order("id ASC").Find(&items).Error
+	return items, err
 }
 
 func (r *Repository) DeleteProxyDeploy(id int64) error {
@@ -482,14 +490,76 @@ func (r *Repository) GetForwardBrief(forwardID int64) (*model.Forward, error) {
 	return &f, nil
 }
 
-// ListForwardBriefs returns all forwards (id, name, tunnel, remote address).
-func (r *Repository) ListForwardBriefs() ([]model.Forward, error) {
+const forwardBriefColumns = "id, user_id, user_name, name, tunnel_id, remote_addr, status"
+
+// ListForwardBriefsByUser returns a user's forwards (id, name, tunnel, remote address).
+func (r *Repository) ListForwardBriefsByUser(userID int64) ([]model.Forward, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("repository not initialized")
 	}
 	var items []model.Forward
-	err := r.db.Select("id, user_id, user_name, name, tunnel_id, remote_addr, status").Order("inx ASC, id ASC").Find(&items).Error
+	err := r.db.Select(forwardBriefColumns).Where("user_id = ?", userID).Order("inx ASC, id ASC").Find(&items).Error
 	return items, err
+}
+
+// ListForwardBriefsByIDs returns the forwards with the given ids.
+func (r *Repository) ListForwardBriefsByIDs(ids []int64) ([]model.Forward, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	if len(ids) == 0 {
+		return []model.Forward{}, nil
+	}
+	var items []model.Forward
+	err := r.db.Select(forwardBriefColumns).Where("id IN ?", ids).Find(&items).Error
+	return items, err
+}
+
+// ListTunnelNames returns tunnel id → name.
+func (r *Repository) ListTunnelNames() (map[int64]string, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("repository not initialized")
+	}
+	var rows []model.Tunnel
+	if err := r.db.Select("id, name").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[int64]string, len(rows))
+	for _, t := range rows {
+		out[t.ID] = t.Name
+	}
+	return out, nil
+}
+
+// ─── myflvx: ownership maintenance ───────────────────────────────────
+
+// assignOrphanEnhancedRows gives proxy nodes, subscriptions and deployments
+// without a valid owner (rows from myflvx 2.2.1, or imported for users that
+// do not exist here) to the first administrator.
+func assignOrphanEnhancedRows(db *gorm.DB) error {
+	var admin model.User
+	err := db.Where("role_id = ?", 0).Order("id ASC").First(&admin).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	existing := db.Model(&model.User{}).Select("id")
+	for _, m := range []interface{}{&model.ProxyNode{}, &model.SubFile{}, &model.ProxyDeploy{}} {
+		if err := db.Model(m).Where("user_id = 0 OR user_id NOT IN (?)", existing).Update("user_id", admin.ID).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deleteEnhancedUserData removes the proxy nodes and subscriptions of a deleted user.
+func deleteEnhancedUserData(tx *gorm.DB, userID int64) error {
+	if err := tx.Where("user_id = ?", userID).Delete(&model.ProxyNode{}).Error; err != nil {
+		return err
+	}
+	return tx.Where("user_id = ?", userID).Delete(&model.SubFile{}).Error
 }
 
 // ─── myflvx: backup of the enhanced tables ───────────────────────────
@@ -502,7 +572,7 @@ func (r *Repository) exportProxyNodes() ([]model.ProxyNodeBackup, error) {
 	out := make([]model.ProxyNodeBackup, 0, len(nodes))
 	for _, n := range nodes {
 		out = append(out, model.ProxyNodeBackup{
-			ID: n.ID, Name: n.Name, Protocol: n.Protocol, Server: n.Server, Port: n.Port, Config: n.Config,
+			ID: n.ID, UserID: n.UserID, Name: n.Name, Protocol: n.Protocol, Server: n.Server, Port: n.Port, Config: n.Config,
 			RawURL: n.RawURL, Tags: n.Tags, Remark: n.Remark, Source: n.Source, SourceRef: n.SourceRef,
 			ParentID: n.ParentID, TunnelID: n.TunnelID, ForwardID: n.ForwardID, RelayHost: n.RelayHost,
 			RelayEntry: n.RelayEntry, Enabled: n.Enabled, Inx: n.Inx, CreatedTime: n.CreatedTime, UpdatedTime: n.UpdatedTime,
@@ -516,17 +586,13 @@ func (r *Repository) exportSubFiles() ([]model.SubFileBackup, error) {
 	if err != nil {
 		return nil, err
 	}
-	users, err := r.SubFileUserMap()
-	if err != nil {
-		return nil, err
-	}
 	out := make([]model.SubFileBackup, 0, len(items))
 	for _, s := range items {
 		out = append(out, model.SubFileBackup{
-			ID: s.ID, Name: s.Name, Remark: s.Remark, Type: s.Type, SourceURL: s.SourceURL, UserAgent: s.UserAgent,
+			ID: s.ID, UserID: s.UserID, Name: s.Name, Remark: s.Remark, Type: s.Type, SourceURL: s.SourceURL, UserAgent: s.UserAgent,
 			Content: s.Content, GenConfig: s.GenConfig, FileName: s.FileName, SubInfo: s.SubInfo,
 			AutoUpdate: s.AutoUpdate, Enabled: s.Enabled, ExpireTime: s.ExpireTime, LastSyncTime: s.LastSyncTime,
-			Inx: s.Inx, CreatedTime: s.CreatedTime, UpdatedTime: s.UpdatedTime, UserIDs: users[s.ID],
+			Inx: s.Inx, CreatedTime: s.CreatedTime, UpdatedTime: s.UpdatedTime,
 		})
 	}
 	return out, nil
@@ -544,7 +610,7 @@ func (r *Repository) exportProxyDeploys() ([]model.ProxyDeployBackup, error) {
 			status = "failed"
 		}
 		out = append(out, model.ProxyDeployBackup{
-			ID: d.ID, Name: d.Name, NodeID: d.NodeID, Host: d.Host, Protocols: d.Protocols, Params: d.Params,
+			ID: d.ID, UserID: d.UserID, Name: d.Name, NodeID: d.NodeID, Host: d.Host, Protocols: d.Protocols, Params: d.Params,
 			Status: status, LastRunTime: d.LastRunTime, Remark: d.Remark, CreatedTime: d.CreatedTime, UpdatedTime: d.UpdatedTime,
 		})
 	}
@@ -577,12 +643,14 @@ func (r *Repository) exportEnhanced(backup *model.BackupData, typeSet map[string
 	return nil
 }
 
-// importEnhanced upserts the enhanced sections of a backup by id.
+// importEnhanced upserts the enhanced sections of a backup by id. Rows without
+// an owner that exists here are given to the first administrator afterwards.
 func importEnhanced(tx *gorm.DB, backup *model.BackupData, typeSet map[string]bool, now int64, result *model.ImportResult) error {
+	imported := false
 	if typeSet["proxyNodes"] && len(backup.ProxyNodes) > 0 {
 		for _, n := range backup.ProxyNodes {
 			item := model.ProxyNode{
-				ID: n.ID, Name: n.Name, Protocol: n.Protocol, Server: n.Server, Port: n.Port, Config: n.Config,
+				ID: n.ID, UserID: n.UserID, Name: n.Name, Protocol: n.Protocol, Server: n.Server, Port: n.Port, Config: n.Config,
 				RawURL: n.RawURL, Tags: n.Tags, Remark: n.Remark, Source: n.Source, SourceRef: n.SourceRef,
 				ParentID: n.ParentID, TunnelID: n.TunnelID, ForwardID: n.ForwardID, RelayHost: n.RelayHost,
 				RelayEntry: n.RelayEntry, Enabled: n.Enabled, Inx: n.Inx, CreatedTime: n.CreatedTime, UpdatedTime: now,
@@ -594,12 +662,13 @@ func importEnhanced(tx *gorm.DB, backup *model.BackupData, typeSet map[string]bo
 				return fmt.Errorf("import proxy nodes failed: %w", err)
 			}
 			result.ProxyNodesImported++
+			imported = true
 		}
 	}
 	if typeSet["subscriptions"] && len(backup.Subscriptions) > 0 {
 		for _, s := range backup.Subscriptions {
 			item := model.SubFile{
-				ID: s.ID, Name: s.Name, Remark: s.Remark, Type: s.Type, SourceURL: s.SourceURL, UserAgent: s.UserAgent,
+				ID: s.ID, UserID: s.UserID, Name: s.Name, Remark: s.Remark, Type: s.Type, SourceURL: s.SourceURL, UserAgent: s.UserAgent,
 				Content: s.Content, GenConfig: s.GenConfig, FileName: s.FileName, SubInfo: s.SubInfo,
 				AutoUpdate: s.AutoUpdate, Enabled: s.Enabled, ExpireTime: s.ExpireTime, LastSyncTime: s.LastSyncTime,
 				Inx: s.Inx, CreatedTime: s.CreatedTime, UpdatedTime: now,
@@ -610,16 +679,14 @@ func importEnhanced(tx *gorm.DB, backup *model.BackupData, typeSet map[string]bo
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, UpdateAll: true}).Create(&item).Error; err != nil {
 				return fmt.Errorf("import subscriptions failed: %w", err)
 			}
-			if err := replaceSubFileUsers(tx, item.ID, s.UserIDs, now); err != nil {
-				return fmt.Errorf("import subscription users failed: %w", err)
-			}
 			result.SubscriptionsImported++
+			imported = true
 		}
 	}
 	if typeSet["proxyDeploys"] && len(backup.ProxyDeploys) > 0 {
 		for _, d := range backup.ProxyDeploys {
 			item := model.ProxyDeploy{
-				ID: d.ID, Name: d.Name, NodeID: d.NodeID, Host: d.Host, Protocols: d.Protocols, Params: d.Params,
+				ID: d.ID, UserID: d.UserID, Name: d.Name, NodeID: d.NodeID, Host: d.Host, Protocols: d.Protocols, Params: d.Params,
 				Status: d.Status, LastRunTime: d.LastRunTime, Remark: d.Remark, CreatedTime: d.CreatedTime, UpdatedTime: now,
 			}
 			if item.Status == "" || item.Status == "running" {
@@ -632,23 +699,13 @@ func importEnhanced(tx *gorm.DB, backup *model.BackupData, typeSet map[string]bo
 				return fmt.Errorf("import deployments failed: %w", err)
 			}
 			result.ProxyDeploysImported++
+			imported = true
+		}
+	}
+	if imported {
+		if err := assignOrphanEnhancedRows(tx); err != nil {
+			return fmt.Errorf("assign imported rows failed: %w", err)
 		}
 	}
 	return nil
-}
-
-// ListTunnelNames returns tunnel id → name.
-func (r *Repository) ListTunnelNames() (map[int64]string, error) {
-	if r == nil || r.db == nil {
-		return nil, errors.New("repository not initialized")
-	}
-	var rows []model.Tunnel
-	if err := r.db.Select("id, name").Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	out := make(map[int64]string, len(rows))
-	for _, t := range rows {
-		out[t.ID] = t.Name
-	}
-	return out, nil
 }

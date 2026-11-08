@@ -444,7 +444,8 @@ func quotedArgs(args []string) string {
 	return strings.Join(parts, " ")
 }
 
-// BuildInstallCommand returns the one-click command to paste on the server.
+// BuildInstallCommand returns the one-click command for running the same
+// deployment by hand on a server that is not managed by the panel.
 func BuildInstallCommand(p DeployParams, scriptURL string) string {
 	if scriptURL == "" {
 		scriptURL = DefaultMihomoScriptURL
@@ -452,48 +453,31 @@ func BuildInstallCommand(p DeployParams, scriptURL string) string {
 	return fmt.Sprintf("bash <(curl -fsSL %s) %s", shellQuote(scriptURL), quotedArgs(InstallArgs(p)))
 }
 
-// Share-link markers printed around /etc/mihomo/share.txt by BuildSSHScript.
+// Script operations the panel runs through the node agent.
 const (
-	ShareBeginMarker = "===FLVX-MIHOMO-SHARE-BEGIN==="
-	ShareEndMarker   = "===FLVX-MIHOMO-SHARE-END==="
+	ScriptOpInstall   = "install"
+	ScriptOpInfo      = "info"
+	ScriptOpUninstall = "uninstall"
 )
 
-// BuildSSHScript returns a POSIX shell script that downloads mihomo_script,
-// runs the unattended install and prints the resulting share links.
-func BuildSSHScript(p DeployParams, scriptURL string, useSudo bool) string {
-	if scriptURL == "" {
-		scriptURL = DefaultMihomoScriptURL
+// ScriptOpArgs returns the options (after the operation name) for running a
+// mihomo_script operation unattended through the node agent.
+func ScriptOpArgs(op string, p DeployParams) []string {
+	switch op {
+	case ScriptOpInstall:
+		return InstallArgs(p)[1:]
+	case ScriptOpUninstall:
+		return []string{"-y"}
+	default:
+		return []string{}
 	}
-	run := ""
-	if useSudo {
-		run = "sudo -n "
-	}
-	var b strings.Builder
-	b.WriteString("set -e\n")
-	b.WriteString("command -v curl >/dev/null 2>&1 || { echo '缺少 curl，请先安装 curl' >&2; exit 1; }\n")
-	b.WriteString("command -v bash >/dev/null 2>&1 || { echo '缺少 bash' >&2; exit 1; }\n")
-	b.WriteString("tmp=$(mktemp /tmp/flvx-mihomo-XXXXXX.sh)\n")
-	b.WriteString("trap 'rm -f \"$tmp\"' EXIT\n")
-	fmt.Fprintf(&b, "curl -fsSL --retry 3 --connect-timeout 15 -m 120 %s -o \"$tmp\"\n", shellQuote(scriptURL))
-	fmt.Fprintf(&b, "%sbash \"$tmp\" %s\n", run, quotedArgs(InstallArgs(p)))
-	fmt.Fprintf(&b, "echo %s\n", ShareBeginMarker)
-	fmt.Fprintf(&b, "%scat /etc/mihomo/share.txt\n", run)
-	fmt.Fprintf(&b, "echo %s\n", ShareEndMarker)
-	return b.String()
 }
 
-// ExtractShareLinks returns the share links printed between the markers (or,
-// without markers, every line that looks like a supported share link).
+// ExtractShareLinks returns every line of the output (for example the content
+// of /etc/mihomo/share.txt) that is a supported share link.
 func ExtractShareLinks(output string) []string {
-	text := output
-	if start := strings.Index(output, ShareBeginMarker); start >= 0 {
-		text = output[start+len(ShareBeginMarker):]
-		if end := strings.Index(text, ShareEndMarker); end >= 0 {
-			text = text[:end]
-		}
-	}
 	links := []string{}
-	for _, line := range strings.Split(text, "\n") {
+	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		for _, scheme := range []string{"ss://", "mierus://", "mieru://", "sudoku://"} {
 			if idx := strings.Index(line, scheme); idx >= 0 {

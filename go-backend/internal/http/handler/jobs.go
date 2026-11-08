@@ -32,6 +32,8 @@ func (h *Handler) StartBackgroundJobs() {
 	go h.runTunnelQualityProber(ctx)
 	go h.runNftablesTrafficCollectLoop(ctx)
 	go h.runFederationCleanupRetryLoop(ctx)
+	// myflvx: keep following mihomo_script deployments that were running when the panel stopped.
+	go h.resumeDeployTasks()
 }
 
 func (h *Handler) runFederationCleanupRetryLoop(ctx context.Context) {

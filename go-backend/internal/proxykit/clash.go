@@ -102,10 +102,7 @@ func Render(cfg GeneratorConfig, nodes []Proxy) (RenderResult, error) {
 			rules = tpl.Rules
 		}
 	}
-	baseConfig := strings.TrimSpace(cfg.BaseConfig)
-	if baseConfig == "" {
-		baseConfig = DefaultBaseConfig
-	}
+	baseConfig := effectiveBaseConfig(cfg.BaseConfig)
 
 	groupNames := map[string]bool{}
 	for _, g := range groups {

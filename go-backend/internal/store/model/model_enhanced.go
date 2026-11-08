@@ -5,11 +5,13 @@ package model
 // GORM omits zero-valued fields that carry a `default` tag on INSERT, so every
 // default below equals the Go zero value and callers always set the real value.
 
-// ProxyNode is a proxy node managed in 节点管理. Config holds the Clash/mihomo
+// ProxyNode is a proxy node managed in 代理节点. Config holds the Clash/mihomo
 // proxy definition as JSON and is the source of truth; the other columns are
-// denormalised for listing and filtering.
+// denormalised for listing and filtering. Every node belongs to one user and is
+// only visible to that user.
 type ProxyNode struct {
 	ID          int64  `gorm:"primaryKey;autoIncrement"`
+	UserID      int64  `gorm:"column:user_id;not null;default:0;index"`
 	Name        string `gorm:"type:varchar(200);not null"`
 	Protocol    string `gorm:"type:varchar(32);not null;default:''"`
 	Server      string `gorm:"type:varchar(255);not null;default:''"`
@@ -34,9 +36,11 @@ type ProxyNode struct {
 func (ProxyNode) TableName() string { return "proxy_node" }
 
 // SubFile is a subscription in 订阅管理: an uploaded or imported Clash
-// configuration, or one generated from nodes on every download.
+// configuration, or one generated from the owner's nodes on every download.
+// Subscriptions belong to one user and are never shared.
 type SubFile struct {
 	ID           int64  `gorm:"primaryKey;autoIncrement"`
+	UserID       int64  `gorm:"column:user_id;not null;default:0;index"`
 	Name         string `gorm:"type:varchar(200);not null"`
 	Remark       string `gorm:"type:text;not null;default:''"`
 	Type         string `gorm:"type:varchar(20);not null"`
@@ -57,26 +61,21 @@ type SubFile struct {
 
 func (SubFile) TableName() string { return "sub_file" }
 
-// SubFileUser grants a user access to a subscription in 订阅下载.
-type SubFileUser struct {
-	ID          int64 `gorm:"primaryKey;autoIncrement"`
-	SubFileID   int64 `gorm:"column:sub_file_id;not null;uniqueIndex:idx_sub_file_user_pair"`
-	UserID      int64 `gorm:"column:user_id;not null;uniqueIndex:idx_sub_file_user_pair;index"`
-	CreatedTime int64 `gorm:"column:created_time;not null"`
-}
-
-func (SubFileUser) TableName() string { return "sub_file_user" }
-
-// ProxyDeploy is a mihomo_script deployment (部署节点). Params holds the JSON
-// encoded proxykit.DeployParams; SSH credentials are never stored.
+// ProxyDeploy is a mihomo_script deployment (部署节点) on one FLVX node. The
+// panel runs the script through the node agent; Params holds the JSON encoded
+// proxykit.DeployParams. TaskID/TaskOp identify the agent task in progress so
+// polling can resume after a panel restart.
 type ProxyDeploy struct {
 	ID          int64  `gorm:"primaryKey;autoIncrement"`
+	UserID      int64  `gorm:"column:user_id;not null;default:0"`
 	Name        string `gorm:"type:varchar(200);not null"`
 	NodeID      int64  `gorm:"column:node_id;not null;default:0"`
 	Host        string `gorm:"type:varchar(255);not null;default:''"`
 	Protocols   string `gorm:"type:varchar(100);not null;default:''"`
 	Params      string `gorm:"type:text;not null"`
 	Status      string `gorm:"type:varchar(20);not null;default:''"`
+	TaskID      string `gorm:"column:task_id;type:varchar(64);not null;default:''"`
+	TaskOp      string `gorm:"column:task_op;type:varchar(20);not null;default:''"`
 	LastLog     string `gorm:"column:last_log;type:text;not null"`
 	LastRunTime int64  `gorm:"column:last_run_time;not null;default:0"`
 	Remark      string `gorm:"type:text;not null;default:''"`
@@ -90,6 +89,7 @@ func (ProxyDeploy) TableName() string { return "proxy_deploy" }
 
 type ProxyNodeBackup struct {
 	ID          int64  `json:"id"`
+	UserID      int64  `json:"userId,omitempty"`
 	Name        string `json:"name"`
 	Protocol    string `json:"protocol"`
 	Server      string `json:"server"`
@@ -112,28 +112,32 @@ type ProxyNodeBackup struct {
 }
 
 type SubFileBackup struct {
-	ID           int64   `json:"id"`
-	Name         string  `json:"name"`
-	Remark       string  `json:"remark,omitempty"`
-	Type         string  `json:"type"`
-	SourceURL    string  `json:"sourceUrl,omitempty"`
-	UserAgent    string  `json:"userAgent,omitempty"`
-	Content      string  `json:"content,omitempty"`
-	GenConfig    string  `json:"genConfig,omitempty"`
-	FileName     string  `json:"fileName,omitempty"`
-	SubInfo      string  `json:"subInfo,omitempty"`
-	AutoUpdate   int     `json:"autoUpdate,omitempty"`
-	Enabled      int     `json:"enabled"`
-	ExpireTime   int64   `json:"expireTime,omitempty"`
-	LastSyncTime int64   `json:"lastSyncTime,omitempty"`
-	Inx          int     `json:"inx"`
-	CreatedTime  int64   `json:"createdTime"`
-	UpdatedTime  int64   `json:"updatedTime"`
-	UserIDs      []int64 `json:"userIds,omitempty"`
+	ID           int64  `json:"id"`
+	UserID       int64  `json:"userId,omitempty"`
+	Name         string `json:"name"`
+	Remark       string `json:"remark,omitempty"`
+	Type         string `json:"type"`
+	SourceURL    string `json:"sourceUrl,omitempty"`
+	UserAgent    string `json:"userAgent,omitempty"`
+	Content      string `json:"content,omitempty"`
+	GenConfig    string `json:"genConfig,omitempty"`
+	FileName     string `json:"fileName,omitempty"`
+	SubInfo      string `json:"subInfo,omitempty"`
+	AutoUpdate   int    `json:"autoUpdate,omitempty"`
+	Enabled      int    `json:"enabled"`
+	ExpireTime   int64  `json:"expireTime,omitempty"`
+	LastSyncTime int64  `json:"lastSyncTime,omitempty"`
+	Inx          int    `json:"inx"`
+	CreatedTime  int64  `json:"createdTime"`
+	UpdatedTime  int64  `json:"updatedTime"`
+	// UserIDs is the subscription assignment of myflvx 2.2.1. Subscriptions are
+	// per user now; the field is accepted (and ignored) so old backups import.
+	UserIDs []int64 `json:"userIds,omitempty"`
 }
 
 type ProxyDeployBackup struct {
 	ID          int64  `json:"id"`
+	UserID      int64  `json:"userId,omitempty"`
 	Name        string `json:"name"`
 	NodeID      int64  `json:"nodeId,omitempty"`
 	Host        string `json:"host"`
