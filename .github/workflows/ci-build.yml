@@ -85,6 +85,10 @@ jobs:
           go test -count=1 ./internal/store/repo/ -run 'Backup|Import'
           go test -count=1 ./tests/contract/ -run 'TestMyflvx'
 
+      - name: Agent deploy command tests
+        working-directory: go-gost/x
+        run: go test -count=1 ./socket/ -run 'Mihomo'
+
   backend-postgres-contract:
     name: Go Backend PostgreSQL Contract
     runs-on: ubuntu-latest
