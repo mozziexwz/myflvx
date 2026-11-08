@@ -166,7 +166,11 @@ func (h *Handler) deployToView(d model.ProxyDeploy, withLog bool, nodes map[int6
 			}
 		}
 		if node != nil {
+			// The deployment name follows the FLVX node name.
 			v.NodeName = node.Name
+			if strings.TrimSpace(node.Name) != "" {
+				v.Name = node.Name
+			}
 			v.NodeOnline = node.Status == 1
 			if node.Version.Valid {
 				v.NodeVersion = node.Version.String
@@ -229,25 +233,35 @@ func (h *Handler) deployDefaults(w http.ResponseWriter, r *http.Request) {
 	response.WriteJSON(w, response.OK(map[string]interface{}{"params": params, "scriptUrl": h.deployScriptURL()}))
 }
 
-// deployRecordName names the deployment (and the prefix of its proxy nodes).
-func deployRecordName(prefix string, node *model.Node, multiple bool) string {
-	prefix = strings.TrimSpace(prefix)
-	switch {
-	case prefix == "":
-		return node.Name
-	case multiple:
-		return prefix + "-" + node.Name
-	default:
-		return prefix
+// deployName is the name shown for a deployment and used as the prefix of its
+// proxy nodes: the current name of its FLVX node (the stored name only for
+// legacy records without a node).
+func (h *Handler) deployName(d model.ProxyDeploy) string {
+	if d.NodeID > 0 {
+		if node, err := h.repo.GetNodeByID(d.NodeID); err == nil && node != nil && strings.TrimSpace(node.Name) != "" {
+			return node.Name
+		}
 	}
+	return d.Name
 }
 
 // buildDeployRecords prepares one deployment per FLVX node, all sharing the
 // given parameters except the client address (each node's own address unless
-// host overrides it for a single node).
-func (h *Handler) buildDeployRecords(userID int64, nodeIDs []int64, prefix, host string, base proxykit.DeployParams, remark string) ([]*model.ProxyDeploy, error) {
+// host overrides it for a single node). Each node may only have one deployment.
+func (h *Handler) buildDeployRecords(userID int64, nodeIDs []int64, host string, base proxykit.DeployParams, remark string) ([]*model.ProxyDeploy, error) {
+	deployed := map[int64]bool{}
+	existing, err := h.repo.ListProxyDeploys()
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range existing {
+		if d.NodeID > 0 {
+			deployed[d.NodeID] = true
+		}
+	}
 	seen := map[int64]bool{}
 	nodes := []*model.Node{}
+	duplicates := []string{}
 	for _, id := range nodeIDs {
 		if id <= 0 || seen[id] {
 			continue
@@ -257,7 +271,14 @@ func (h *Handler) buildDeployRecords(userID int64, nodeIDs []int64, prefix, host
 		if err != nil || node == nil {
 			return nil, fmt.Errorf("FLVX 节点 %d 不存在", id)
 		}
+		if deployed[node.ID] {
+			duplicates = append(duplicates, node.Name)
+			continue
+		}
 		nodes = append(nodes, node)
+	}
+	if len(duplicates) > 0 {
+		return nil, fmt.Errorf("节点「%s」已有部署记录，每个节点只能有一条部署", strings.Join(duplicates, "」「"))
 	}
 	if len(nodes) == 0 {
 		return nil, errors.New("请选择要部署的 FLVX 节点")
@@ -279,7 +300,7 @@ func (h *Handler) buildDeployRecords(userID int64, nodeIDs []int64, prefix, host
 			params.SudokuKey = ""
 			params.SudokuServerKey = ""
 		}
-		name := deployRecordName(prefix, node, len(nodes) > 1)
+		name := node.Name
 		params.ScriptName = proxykit.ScriptSafeName(name)
 		if err := proxykit.ValidateDeployParams(params); err != nil {
 			return nil, fmt.Errorf("节点「%s」: %v", node.Name, err)
@@ -329,7 +350,6 @@ func claimsPointer(r *http.Request) *auth.Claims {
 func (h *Handler) deployCreate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		NodeIDs []int64               `json:"nodeIds"`
-		Name    string                `json:"name"`
 		Host    string                `json:"host"`
 		Params  proxykit.DeployParams `json:"params"`
 		Remark  string                `json:"remark"`
@@ -342,7 +362,7 @@ func (h *Handler) deployCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	records, err := h.buildDeployRecords(userID, req.NodeIDs, req.Name, req.Host, req.Params, req.Remark)
+	records, err := h.buildDeployRecords(userID, req.NodeIDs, req.Host, req.Params, req.Remark)
 	if err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
@@ -385,7 +405,7 @@ func (h *Handler) deployCopy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Each copy is named after its FLVX node and keeps the ports and secrets.
-	records, err := h.buildDeployRecords(userID, targets, "", "", params, source.Remark)
+	records, err := h.buildDeployRecords(userID, targets, "", params, source.Remark)
 	if err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
@@ -401,7 +421,6 @@ func (h *Handler) deployCopy(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) deployUpdate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID     int64                 `json:"id"`
-		Name   string                `json:"name"`
 		Host   string                `json:"host"`
 		Params proxykit.DeployParams `json:"params"`
 		Remark string                `json:"remark"`
@@ -418,9 +437,8 @@ func (h *Handler) deployUpdate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault("正在执行任务，请稍后再修改"))
 		return
 	}
-	if name := strings.TrimSpace(req.Name); name != "" {
-		d.Name = name
-	}
+	// The name always follows the FLVX node.
+	d.Name = h.deployName(*d)
 	params := req.Params
 	params.Host = strings.Trim(strings.TrimSpace(req.Host), "[]")
 	if params.Host == "" {
@@ -833,7 +851,7 @@ func (h *Handler) syncDeployNodes(ctx context.Context, claims *auth.Claims, d mo
 	for _, n := range existing {
 		byProto[n.Protocol] = n
 	}
-	clients := proxykit.ClientProxies(params, d.Name)
+	clients := proxykit.ClientProxies(params, h.deployName(d))
 	if params.HasProtocol(proxykit.DeployProtoSudoku) && clients[proxykit.DeployProtoSudoku] == nil {
 		warnings = append(warnings, "还没有读取到 Sudoku 的客户端密钥（服务器生成的密钥对），请点「刷新状态」")
 	}

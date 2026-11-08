@@ -587,24 +587,28 @@ func TestMyflvxDeployRunsThroughNodeAgent(t *testing.T) {
 		Warnings []string         `json:"warnings"`
 	}
 	mustAPI(t, router, admin, "/api/v1/deploy/create", map[string]interface{}{
-		"nodeIds": []int64{nodeA}, "name": "HK-01", "params": defaults.Params, "run": true,
+		"nodeIds": []int64{nodeA}, "params": defaults.Params, "run": true,
 	}, &created)
 	if len(created.Items) != 1 || len(created.Warnings) != 0 {
 		t.Fatalf("unexpected create result: %+v", created)
 	}
 	deployA := created.Items[0]
-	if deployA.Host != "198.51.100.30" || deployA.NodeID != nodeA {
-		t.Fatalf("deployment should use the FLVX node address: %+v", deployA)
+	if deployA.Host != "198.51.100.30" || deployA.NodeID != nodeA || deployA.Name != "香港A" {
+		t.Fatalf("deployment should use the FLVX node name and address: %+v", deployA)
 	}
 	start := agent.lastStart()
 	if start == nil || start["op"] != "install" || !strings.HasPrefix(fmt.Sprint(start["scriptUrl"]), "https://") {
 		t.Fatalf("agent should receive the install: %+v", start)
 	}
 	args := fmt.Sprint(start["args"])
-	for _, want := range []string{"-y", "--protocols ss,mieru,sudoku", "--host 198.51.100.30", "--name HK-01"} {
+	for _, want := range []string{"-y", "--protocols ss,mieru,sudoku", "--host 198.51.100.30"} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("install args missing %q: %s", want, args)
 		}
+	}
+	// Each FLVX node can only have one deployment.
+	if res := callAPI(t, router, admin, "/api/v1/deploy/create", map[string]interface{}{"nodeIds": []int64{nodeA}, "params": defaults.Params}); res.Code == 0 || !strings.Contains(res.Msg, "已有部署") {
+		t.Fatalf("a second deployment on the same node must be rejected, got code=%d msg=%s", res.Code, res.Msg)
 	}
 
 	done := waitDeployStatus(t, router, admin, deployA.ID, "success")
@@ -623,7 +627,7 @@ func TestMyflvxDeployRunsThroughNodeAgent(t *testing.T) {
 			t.Fatalf("sudoku node should use the share link read back from the node: %+v", n)
 		}
 	}
-	if !names["HK-01-SS"] || !names["HK-01-mieru"] || !names["HK-01-Sudoku"] {
+	if !names["香港A-SS"] || !names["香港A-mieru"] || !names["香港A-Sudoku"] {
 		t.Fatalf("deployed node names wrong: %v", names)
 	}
 	var userList proxyNodeListData
@@ -841,9 +845,22 @@ func TestMyflvxDragSortOrders(t *testing.T) {
 	if deploys[0].Name != "排序B" || deploys[1].Name != "排序A" {
 		t.Fatalf("deployment order not saved: %+v", deploys)
 	}
-	mustAPI(t, router, admin, "/api/v1/deploy/create", map[string]interface{}{"nodeIds": []int64{nodeA}, "name": "新部署", "params": defaults.Params}, nil)
+	nodeC := insertMyflvxNode(t, r, "排序C", "order-node-c", "198.51.100.42")
+	mustAPI(t, router, admin, "/api/v1/deploy/create", map[string]interface{}{"nodeIds": []int64{nodeC}, "params": defaults.Params}, nil)
 	mustAPI(t, router, admin, "/api/v1/deploy/list", map[string]interface{}{}, &deploys)
-	if len(deploys) != 3 || deploys[2].Name != "新部署" {
+	if len(deploys) != 3 || deploys[2].Name != "排序C" {
 		t.Fatalf("a new deployment should be appended at the end: %+v", deploys)
+	}
+	// Copying to a node that already has a deployment is rejected as well.
+	if res := callAPI(t, router, admin, "/api/v1/deploy/copy", map[string]interface{}{"id": deploys[2].ID, "nodeIds": []int64{nodeA}}); res.Code == 0 || !strings.Contains(res.Msg, "已有部署") {
+		t.Fatalf("copying onto a deployed node must be rejected, got code=%d msg=%s", res.Code, res.Msg)
+	}
+	// Renaming the FLVX node renames the deployment.
+	if err := r.DB().Exec(`UPDATE node SET name = ? WHERE id = ?`, "排序C-新", nodeC).Error; err != nil {
+		t.Fatalf("rename node: %v", err)
+	}
+	mustAPI(t, router, admin, "/api/v1/deploy/list", map[string]interface{}{}, &deploys)
+	if deploys[2].Name != "排序C-新" {
+		t.Fatalf("deployment name should follow the node name: %+v", deploys[2])
 	}
 }
