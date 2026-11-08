@@ -1014,6 +1014,13 @@ func (w *WebSocketReporter) routeCommand(cmd CommandMessage) {
 		response.Type = "RollbackAgentResponse"
 		// needSaveConfig = false (默认值)
 
+	// myflvx: 部署节点（mihomo_script，异步任务）
+	case "MihomoScript":
+		var result interface{}
+		result, err = w.handleMihomoScript(cmd.Data)
+		response.Type = "MihomoScriptResponse"
+		response.Data = result
+
 	default:
 		err = fmt.Errorf("未知命令类型: %s", cmd.Type)
 		response.Type = "UnknownCommandResponse"
