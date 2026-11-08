@@ -4,6 +4,7 @@ interface SelectableCardProps {
   selected: boolean;
   onToggle: () => void;
   className?: string;
+  disabled?: boolean;
   children: React.ReactNode;
 }
 
@@ -12,22 +13,28 @@ export function SelectableCard({
   selected,
   onToggle,
   className,
+  disabled = false,
   children,
 }: SelectableCardProps) {
   return (
     <div
+      aria-disabled={disabled}
       aria-pressed={selected}
       className={cn(
-        "flex gap-2 rounded-lg border px-3 py-2 cursor-pointer text-left select-none",
+        "flex gap-2 rounded-lg border px-3 py-2 text-left select-none",
+        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
         selected
           ? "border-primary-300 bg-primary-50/50 dark:border-primary-700 dark:bg-primary-900/20"
           : "border-divider",
         className,
       )}
       role="button"
-      tabIndex={0}
-      onClick={onToggle}
+      tabIndex={disabled ? -1 : 0}
+      onClick={() => {
+        if (!disabled) onToggle();
+      }}
       onKeyDown={(e) => {
+        if (disabled) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onToggle();

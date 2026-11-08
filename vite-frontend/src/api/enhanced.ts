@@ -348,7 +348,6 @@ export const getDeployDefaults = () =>
   Network.post<{ params: DeployParams; scriptUrl: string }>("/deploy/defaults");
 export const createDeployments = (data: {
   nodeIds: number[];
-  name?: string;
   host?: string;
   params: DeployParams;
   remark?: string;
@@ -362,7 +361,6 @@ export const copyDeployment = (id: number, nodeIds: number[], run: boolean) =>
   );
 export const updateDeployment = (data: {
   id: number;
-  name: string;
   host: string;
   params: DeployParams;
   remark?: string;

@@ -167,10 +167,43 @@ const nodeAddress = (node: NodeApiItem) =>
 
 const isOnline = (node: NodeApiItem) => node.status === 1;
 
+const PROTOCOL_NAMES: Record<string, string> = {
+  ss: "SS 2022",
+  mieru: "mieru",
+  sudoku: "Sudoku",
+};
+
+const protocolPort = (params: DeployParams, proto: string) =>
+  proto === "ss"
+    ? params.ssPort
+    : proto === "mieru"
+      ? params.mieruPort
+      : params.sudokuPort;
+
+// 与原版节点卡片相同的在线状态点
+const StatusDot = ({ online }: { online: boolean }) => (
+  <span
+    className={`h-2.5 w-2.5 flex-shrink-0 rounded-full ${online ? "bg-emerald-500" : "bg-rose-500"}`}
+    title={online ? "在线" : "离线"}
+  />
+);
+
+const InfoRow = ({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) => (
+  <div className="flex min-w-0 items-center justify-between gap-2 text-sm">
+    <span className="flex-shrink-0 text-default-600">{label}</span>
+    <span className="min-w-0 truncate text-right text-xs">{children}</span>
+  </div>
+);
+
 interface DeployForm {
   id?: number;
   nodeName?: string;
-  name: string;
   host: string;
   nodeIds: number[];
   remark: string;
@@ -300,7 +333,6 @@ export default function DeployPage() {
       return;
     }
     setForm({
-      name: "",
       host: "",
       nodeIds: [],
       remark: "",
@@ -312,8 +344,7 @@ export default function DeployPage() {
   const openEdit = (item: Deployment) => {
     setForm({
       id: item.id,
-      nodeName: item.nodeName,
-      name: item.name,
+      nodeName: item.nodeName || item.name,
       host: item.host,
       nodeIds: [item.nodeId],
       remark: item.remark || "",
@@ -397,14 +428,8 @@ export default function DeployPage() {
     setSaving(true);
     try {
       if (form.id) {
-        if (!form.name.trim()) {
-          toast.error("请填写名称");
-
-          return;
-        }
         const res = await updateDeployment({
           id: form.id,
-          name: form.name.trim(),
           host: form.host.trim(),
           params,
           remark: form.remark,
@@ -427,7 +452,6 @@ export default function DeployPage() {
       }
       const res = await createDeployments({
         nodeIds: form.nodeIds,
-        name: form.name.trim(),
         host: form.nodeIds.length === 1 ? form.host.trim() : "",
         params,
         remark: form.remark,
@@ -592,6 +616,10 @@ export default function DeployPage() {
   const p = form?.params;
   const singleFormNode =
     form && form.nodeIds.length === 1 ? nodeById.get(form.nodeIds[0]) : null;
+  // 每个 FLVX 节点只能有一条部署
+  const deployedNodeIds = new Set(
+    items.map((d) => d.nodeId).filter((id) => id > 0),
+  );
 
   const renderNodePicker = (
     selectedIds: number[],
@@ -599,6 +627,8 @@ export default function DeployPage() {
     excludeId?: number,
   ) => {
     const list = flvxNodes.filter((n) => n.id !== excludeId);
+    const allTaken =
+      list.length > 0 && list.every((n) => deployedNodeIds.has(n.id));
 
     if (list.length === 0) {
       return (
@@ -617,32 +647,55 @@ export default function DeployPage() {
     }
 
     return (
-      <div className="grid max-h-[260px] grid-cols-1 gap-2 overflow-auto pr-1 md:grid-cols-2">
-        {list.map((n) => (
-          <SelectableCard
-            key={n.id}
-            className="items-center"
-            selected={selectedIds.includes(n.id)}
-            onToggle={() => onToggle(n.id)}
-          >
-            <Checkbox
-              className="pointer-events-none"
-              isSelected={selectedIds.includes(n.id)}
-            />
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5">
-                <span
-                  className={`h-2 w-2 shrink-0 rounded-full ${isOnline(n) ? "bg-success" : "bg-default-300"}`}
+      <div className="space-y-2">
+        {allTaken && (
+          <p className="text-xs text-warning">
+            这些节点都已经有部署了（每个节点只能部署一次），请先在「节点」页面添加新的
+            FLVX 节点。
+          </p>
+        )}
+        <div className="grid max-h-[260px] grid-cols-1 gap-2 overflow-auto pr-1 md:grid-cols-2">
+          {list.map((n) => {
+            const taken = deployedNodeIds.has(n.id);
+            const checked = !taken && selectedIds.includes(n.id);
+
+            return (
+              <SelectableCard
+                key={n.id}
+                className="items-center"
+                disabled={taken}
+                selected={checked}
+                onToggle={() => onToggle(n.id)}
+              >
+                <Checkbox
+                  className="pointer-events-none"
+                  isDisabled={taken}
+                  isSelected={checked}
                 />
-                <span className="truncate text-sm font-medium">{n.name}</span>
-              </div>
-              <div className="truncate font-mono text-xs text-default-500">
-                {nodeAddress(n) || "-"}
-                {isOnline(n) ? "" : " · 离线"}
-              </div>
-            </div>
-          </SelectableCard>
-        ))}
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate text-sm font-medium">
+                      {n.name}
+                    </span>
+                    <StatusDot online={isOnline(n)} />
+                  </div>
+                  <div className="truncate font-mono text-xs text-default-500">
+                    {nodeAddress(n) || "-"}
+                  </div>
+                </div>
+                {taken && (
+                  <Chip
+                    className="h-5 flex-shrink-0 px-1 text-[10px]"
+                    size="sm"
+                    variant="flat"
+                  >
+                    已部署
+                  </Chip>
+                )}
+              </SelectableCard>
+            );
+          })}
+        </div>
       </div>
     );
   };
@@ -717,40 +770,37 @@ export default function DeployPage() {
             items={items.map((d) => d.id)}
             strategy={rectSortingStrategy}
           >
-            <div className="grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-4">
               {items.map((item) => {
                 const chip = statusChip(item);
                 const running = item.status === "running";
                 const busy = busyId === item.id;
+                const noNode = item.nodeId <= 0;
 
                 return (
                   <SortableCard key={item.id} id={item.id}>
                     {(handle) => (
-                      <Card className="shadow-sm border border-gray-200 dark:border-gray-700 h-full">
-                        <CardHeader className="pb-2">
-                          <div className="flex justify-between items-start w-full gap-2">
-                            <div className="flex min-w-0 flex-1 items-start gap-1.5">
-                              <DragHandle className="-ml-1.5" handle={handle} />
-                              <div className="min-w-0 flex-1">
-                                <h3 className="font-semibold truncate">
-                                  {item.name}
-                                </h3>
-                                <p className="flex min-w-0 items-center gap-1.5 text-xs text-default-500">
-                                  <span
-                                    className={`h-2 w-2 shrink-0 rounded-full ${item.nodeOnline ? "bg-success" : "bg-default-300"}`}
-                                  />
-                                  <span className="min-w-0 truncate">
-                                    {item.nodeName || `节点 #${item.nodeId}`}
-                                    {item.nodeOnline ? "" : "（离线）"}
-                                  </span>
-                                  <span className="shrink-0 whitespace-nowrap font-mono">
-                                    · {item.host}
-                                  </span>
-                                </p>
+                      <Card className="group relative h-full flex flex-col overflow-visible border border-divider shadow-sm transition-shadow duration-200 hover:shadow-md">
+                        <CardHeader className="pb-3 md:pb-3">
+                          <div className="flex w-full items-start justify-between gap-2">
+                            <div className="flex min-w-0 flex-1 items-start gap-1">
+                              <DragHandle
+                                className="-ml-2 flex-shrink-0 opacity-100 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                                handle={handle}
+                              />
+                              <div className="min-w-0 flex-1 pt-0.5">
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <h3 className="truncate text-sm font-semibold leading-5 text-foreground">
+                                    {item.name}
+                                  </h3>
+                                  {!noNode && (
+                                    <StatusDot online={item.nodeOnline} />
+                                  )}
+                                </div>
                               </div>
                             </div>
                             <Chip
-                              className="shrink-0 whitespace-nowrap"
+                              className="h-5 flex-shrink-0 px-1 text-[10px]"
                               color={chip.color}
                               size="sm"
                               variant="flat"
@@ -759,112 +809,152 @@ export default function DeployPage() {
                             </Chip>
                           </div>
                         </CardHeader>
-                        <CardBody className="pt-0 space-y-3">
-                          <div className="flex flex-wrap gap-1">
+                        <CardBody className="flex flex-1 flex-col pt-0 pb-3 md:pt-0 md:pb-3">
+                          <div className="mb-4 space-y-2">
+                            <InfoRow label="地址">
+                              <span className="font-mono" title={item.host}>
+                                {item.host || "-"}
+                              </span>
+                            </InfoRow>
                             {item.protocols.map((proto) => (
-                              <Chip key={proto} size="sm" variant="flat">
-                                {proto === "ss"
-                                  ? `SS ${item.params.ssPort}`
-                                  : proto === "mieru"
-                                    ? `mieru ${item.params.mieruPort}`
-                                    : `Sudoku ${item.params.sudokuPort}`}
-                              </Chip>
+                              <InfoRow
+                                key={proto}
+                                label={PROTOCOL_NAMES[proto] || proto}
+                              >
+                                <span className="font-mono">
+                                  {protocolPort(item.params, proto) || "-"}
+                                </span>
+                              </InfoRow>
                             ))}
+                            <InfoRow label="代理节点">
+                              {item.proxyNodes} 个
+                            </InfoRow>
+                            <InfoRow label="上次执行">
+                              {item.lastRunTime
+                                ? formatDateTime(item.lastRunTime)
+                                : "-"}
+                            </InfoRow>
+                            {item.remark && (
+                              <InfoRow label="备注">
+                                <span title={item.remark}>{item.remark}</span>
+                              </InfoRow>
+                            )}
+                            {noNode && (
+                              <div className="text-xs text-warning">
+                                没有关联 FLVX 节点，不能由面板执行
+                              </div>
+                            )}
                           </div>
-                          <div className="text-xs text-default-500">
-                            代理节点 {item.proxyNodes} 个 · 上次执行{" "}
-                            {formatDateTime(item.lastRunTime)}
-                            {item.remark ? ` · ${item.remark}` : ""}
-                          </div>
-                          <div className="flex flex-wrap gap-1.5">
-                            <Button
-                              color="primary"
-                              isDisabled={running}
-                              isLoading={busy}
-                              size="sm"
-                              variant="flat"
-                              onPress={() => runOp(item, "install")}
-                            >
-                              {item.status === "pending" ? "部署" : "重新部署"}
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="flat"
-                              onPress={() => {
-                                setLogItem(item);
-                                setLogId(item.id);
-                              }}
-                            >
-                              日志
-                            </Button>
-                            <Button
-                              isDisabled={running || busy}
-                              size="sm"
-                              variant="flat"
-                              onPress={() => runOp(item, "info")}
-                            >
-                              刷新状态
-                            </Button>
-                            <Button
-                              isDisabled={running}
-                              size="sm"
-                              variant="flat"
-                              onPress={() => openCopy(item)}
-                            >
-                              复制到其他节点
-                            </Button>
-                          </div>
-                          <div className="flex flex-wrap gap-1.5 border-t border-divider pt-2">
-                            <Button
-                              className="h-7 min-w-0 px-2 text-xs"
-                              isDisabled={running}
-                              size="sm"
-                              variant="light"
-                              onPress={() => openEdit(item)}
-                            >
-                              编辑参数
-                            </Button>
-                            <Button
-                              className="h-7 min-w-0 px-2 text-xs"
-                              size="sm"
-                              variant="light"
-                              onPress={() => generateNodes(item)}
-                            >
-                              重新生成代理节点
-                            </Button>
-                            <Button
-                              className="h-7 min-w-0 px-2 text-xs"
-                              size="sm"
-                              variant="light"
-                              onPress={() => openCommand(item)}
-                            >
-                              复制安装命令
-                            </Button>
-                            <Button
-                              className="h-7 min-w-0 px-2 text-xs"
-                              color="warning"
-                              isDisabled={
-                                running || item.status === "uninstalled"
-                              }
-                              size="sm"
-                              variant="light"
-                              onPress={() => setUninstallItem(item)}
-                            >
-                              卸载
-                            </Button>
-                            <Button
-                              className="h-7 min-w-0 px-2 text-xs"
-                              color="danger"
-                              isDisabled={running}
-                              size="sm"
-                              variant="light"
-                              onPress={() => {
-                                setDeleteNodes(true);
-                                setDeleteItem(item);
-                              }}
-                            >
-                              删除记录
-                            </Button>
+                          <div className="mt-auto space-y-1.5">
+                            <div className="grid grid-cols-3 gap-1.5">
+                              <Button
+                                className="min-h-8"
+                                color="success"
+                                isDisabled={running || noNode}
+                                isLoading={busy}
+                                size="sm"
+                                variant="flat"
+                                onPress={() => runOp(item, "install")}
+                              >
+                                {item.status === "pending"
+                                  ? "部署"
+                                  : "重新部署"}
+                              </Button>
+                              <Button
+                                className="min-h-8"
+                                color="warning"
+                                isDisabled={running || busy || noNode}
+                                size="sm"
+                                title="读取服务器上的部署状态并更新代理节点"
+                                variant="flat"
+                                onPress={() => runOp(item, "info")}
+                              >
+                                刷新
+                              </Button>
+                              <Button
+                                className="min-h-8"
+                                color="secondary"
+                                size="sm"
+                                variant="flat"
+                                onPress={() => {
+                                  setLogItem(item);
+                                  setLogId(item.id);
+                                }}
+                              >
+                                日志
+                              </Button>
+                            </div>
+                            <div className="grid grid-cols-3 gap-1.5">
+                              <Button
+                                className="min-h-8"
+                                color="primary"
+                                isDisabled={running}
+                                size="sm"
+                                title="编辑部署参数"
+                                variant="flat"
+                                onPress={() => openEdit(item)}
+                              >
+                                编辑
+                              </Button>
+                              <Button
+                                className="min-h-8"
+                                color="primary"
+                                isDisabled={running}
+                                size="sm"
+                                title="把部署参数复制到其他节点"
+                                variant="flat"
+                                onPress={() => openCopy(item)}
+                              >
+                                复制
+                              </Button>
+                              <Button
+                                className="min-h-8"
+                                color="warning"
+                                isDisabled={
+                                  running ||
+                                  noNode ||
+                                  item.status === "uninstalled"
+                                }
+                                size="sm"
+                                variant="flat"
+                                onPress={() => setUninstallItem(item)}
+                              >
+                                卸载
+                              </Button>
+                            </div>
+                            <div className="grid grid-cols-3 gap-1.5">
+                              <Button
+                                className="min-h-8"
+                                size="sm"
+                                title="按部署参数重新生成代理节点"
+                                variant="flat"
+                                onPress={() => generateNodes(item)}
+                              >
+                                生成节点
+                              </Button>
+                              <Button
+                                className="min-h-8"
+                                size="sm"
+                                title="复制手动安装命令（用于未接入面板的服务器）"
+                                variant="flat"
+                                onPress={() => openCommand(item)}
+                              >
+                                安装命令
+                              </Button>
+                              <Button
+                                className="min-h-8"
+                                color="danger"
+                                isDisabled={running}
+                                size="sm"
+                                variant="flat"
+                                onPress={() => {
+                                  setDeleteNodes(true);
+                                  setDeleteItem(item);
+                                }}
+                              >
+                                删除
+                              </Button>
+                            </div>
                           </div>
                         </CardBody>
                       </Card>
@@ -893,7 +983,7 @@ export default function DeployPage() {
               <>
                 <ModalHeader className="flex flex-col gap-1">
                   <h2 className="text-xl font-bold">
-                    {form.id ? `编辑部署：${form.name}` : "新建部署"}
+                    {form.id ? `编辑部署：${form.nodeName || ""}` : "新建部署"}
                   </h2>
                   <p className="text-small text-default-500">
                     {form.id
@@ -904,22 +994,13 @@ export default function DeployPage() {
                 <ModalBody>
                   <div className="space-y-4">
                     {form.id ? (
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <Input
                           readOnly
+                          description="名称与 FLVX 节点保持一致，代理节点名为「节点名-SS」等"
                           label="FLVX 节点"
                           value={form.nodeName || `#${form.nodeIds[0]}`}
                           variant="bordered"
-                        />
-                        <Input
-                          isRequired
-                          description="代理节点名前缀，如 HK-01 → HK-01-SS"
-                          label="名称"
-                          value={form.name}
-                          variant="bordered"
-                          onChange={(e) =>
-                            setForm({ ...form, name: e.target.value })
-                          }
                         />
                         <Input
                           description="客户端连接用的 IP 或域名"
@@ -936,7 +1017,7 @@ export default function DeployPage() {
                         <div>
                           <div className="mb-2 flex items-center justify-between">
                             <span className="text-sm font-medium">
-                              选择 FLVX 节点（可多选）
+                              选择 FLVX 节点（可多选，每个节点只能部署一次）
                             </span>
                             <span className="text-xs text-default-500">
                               已选 {form.nodeIds.length} 个
@@ -944,38 +1025,23 @@ export default function DeployPage() {
                           </div>
                           {renderNodePicker(form.nodeIds, toggleFormNode)}
                         </div>
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <Input
-                            description={
-                              form.nodeIds.length > 1
-                                ? "选择多个节点时生成「前缀-节点名」，留空使用节点名"
-                                : "代理节点名前缀，如 HK-01 → HK-01-SS；留空使用节点名"
-                            }
-                            label="名称前缀（可选）"
-                            value={form.name}
-                            variant="bordered"
-                            onChange={(e) =>
-                              setForm({ ...form, name: e.target.value })
-                            }
-                          />
-                          <Input
-                            description={
-                              form.nodeIds.length > 1
-                                ? "选择多个节点时各自使用节点地址"
-                                : "客户端连接用的 IP 或域名，留空使用节点地址"
-                            }
-                            isDisabled={form.nodeIds.length > 1}
-                            label="连接地址（可选）"
-                            placeholder={
-                              singleFormNode ? nodeAddress(singleFormNode) : ""
-                            }
-                            value={form.nodeIds.length > 1 ? "" : form.host}
-                            variant="bordered"
-                            onChange={(e) =>
-                              setForm({ ...form, host: e.target.value })
-                            }
-                          />
-                        </div>
+                        <Input
+                          description={
+                            form.nodeIds.length > 1
+                              ? "选择多个节点时各自使用节点地址；部署名称与节点名称相同"
+                              : "客户端连接用的 IP 或域名，留空使用节点地址；部署名称与节点名称相同"
+                          }
+                          isDisabled={form.nodeIds.length > 1}
+                          label="连接地址（可选）"
+                          placeholder={
+                            singleFormNode ? nodeAddress(singleFormNode) : ""
+                          }
+                          value={form.nodeIds.length > 1 ? "" : form.host}
+                          variant="bordered"
+                          onChange={(e) =>
+                            setForm({ ...form, host: e.target.value })
+                          }
+                        />
                       </>
                     )}
 
