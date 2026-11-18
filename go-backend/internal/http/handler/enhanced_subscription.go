@@ -75,13 +75,27 @@ func subFileToView(s model.SubFile, withContent bool) subFileView {
 	return v
 }
 
+// The version is stored alongside the generator config so a user can still
+// explicitly save the old rule list after upgrading the panel.
+type storedGeneratorConfig struct {
+	proxykit.GeneratorConfig
+	TemplateRulesVersion int `json:"templateRulesVersion"`
+}
+
+const currentTemplateRulesVersion = 2
+
 func decodeGenConfig(raw string) (proxykit.GeneratorConfig, error) {
-	var cfg proxykit.GeneratorConfig
+	var stored storedGeneratorConfig
 	if strings.TrimSpace(raw) == "" {
-		return cfg, fmt.Errorf("缺少生成配置")
+		return stored.GeneratorConfig, fmt.Errorf("缺少生成配置")
 	}
-	err := json.Unmarshal([]byte(raw), &cfg)
-	return cfg, err
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		return stored.GeneratorConfig, err
+	}
+	if stored.TemplateRulesVersion == 0 {
+		stored.UpgradeLegacyTemplateRules()
+	}
+	return stored.GeneratorConfig, nil
 }
 
 var unsafeFileNameChars = regexp.MustCompile(`[\\/:*?"<>|\x00-\x1f]+`)
@@ -258,7 +272,10 @@ func (h *Handler) applySubscriptionMutation(ctx context.Context, s *model.SubFil
 			}
 			break
 		}
-		raw, err := json.Marshal(req.GenConfig)
+		raw, err := json.Marshal(storedGeneratorConfig{
+			GeneratorConfig:      *req.GenConfig,
+			TemplateRulesVersion: currentTemplateRulesVersion,
+		})
 		if err != nil {
 			return err
 		}

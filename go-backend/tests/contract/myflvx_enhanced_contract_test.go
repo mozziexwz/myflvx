@@ -8,15 +8,19 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"gopkg.in/yaml.v3"
 
 	"go-backend/internal/auth"
+	"go-backend/internal/proxykit"
 	"go-backend/internal/security"
+	"go-backend/internal/store/model"
 	"go-backend/internal/store/repo"
 )
 
@@ -262,6 +266,99 @@ func TestMyflvxSubscriptionsArePerUser(t *testing.T) {
 	if strings.TrimSpace(file.Content) != strings.TrimSpace(upload) {
 		t.Fatalf("uploaded content changed:\n%s", file.Content)
 	}
+}
+
+func TestMyflvxClaudeRouting(t *testing.T) {
+	secret := "myflvx-claude-secret"
+	router, r := setupContractRouter(t, secret)
+	admin := tokenFor(t, 1, "admin_user", 0, secret)
+	mustAPI(t, router, admin, "/api/v1/proxy-node/import", map[string]any{"content": testShareLinks}, nil)
+
+	legacyRules := strings.Split(`GEOSITE,category-ads-all,🛑 广告拦截
+GEOSITE,private,🎯 全球直连
+GEOIP,private,🎯 全球直连,no-resolve
+GEOSITE,category-ai-!cn,🤖 AI 服务
+GEOSITE,youtube,📹 YouTube
+GEOSITE,netflix,🎥 流媒体
+GEOSITE,disney,🎥 流媒体
+GEOSITE,spotify,🎥 流媒体
+GEOSITE,telegram,📲 Telegram
+GEOIP,telegram,📲 Telegram,no-resolve
+GEOSITE,github,🐱 GitHub
+GEOSITE,google,🔍 Google
+GEOSITE,microsoft,Ⓜ️ 微软服务
+GEOSITE,apple,🍎 苹果服务
+GEOSITE,geolocation-!cn,🚀 节点选择
+GEOSITE,cn,🎯 全球直连
+GEOIP,cn,🎯 全球直连
+MATCH,🐟 漏网之鱼`, "\n")
+
+	standard := proxykit.TemplateByID("standard")
+	adsIndex := slices.Index(standard.Rules, legacyRules[0])
+	if adsIndex < 0 || !slices.Equal(standard.Rules[adsIndex:], legacyRules) {
+		t.Fatalf("the standard template must retain the original ordered rules: %q", standard.Rules)
+	}
+	for _, rule := range []string{
+		"DOMAIN-SUFFIX,claude.com,🤖 AI 服务",
+		"DOMAIN-SUFFIX,claudemcpcontent.com,🤖 AI 服务",
+		"DOMAIN-SUFFIX,claudeusercontent.com,🤖 AI 服务",
+		"DOMAIN,browser-intake-us5-datadoghq.com,🤖 AI 服务",
+		"IP-CIDR,160.79.104.0/23,🤖 AI 服务,no-resolve",
+		"IP-CIDR,153.61.224.0/22,🤖 AI 服务,no-resolve",
+		"IP-CIDR6,2607:6bc0::/48,🤖 AI 服务,no-resolve",
+	} {
+		if !slices.Contains(standard.Rules[:adsIndex], rule) {
+			t.Errorf("missing Claude rule ahead of general categories: %q", rule)
+		}
+	}
+
+	seedLegacy := func(cfg proxykit.GeneratorConfig) int64 {
+		t.Helper()
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sub := model.SubFile{UserID: 1, Name: "旧订阅", Type: "generate", Enabled: 1, GenConfig: string(raw)}
+		if err := r.CreateSubFile(&sub); err != nil {
+			t.Fatal(err)
+		}
+		return sub.ID
+	}
+	checkDownload := func(id int64, want []string) {
+		t.Helper()
+		var file struct {
+			Content string `json:"content"`
+		}
+		mustAPI(t, router, admin, "/api/v1/subscription/my/download", map[string]any{"id": id, "format": "clash"}, &file)
+		var doc struct {
+			Rules []string `yaml:"rules"`
+		}
+		if err := yaml.Unmarshal([]byte(file.Content), &doc); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(doc.Rules, want) {
+			t.Fatalf("subscription %d: expected rules %q, got %q", id, want, doc.Rules)
+		}
+	}
+
+	cfg := proxykit.GeneratorConfig{AllNodes: true, Template: "standard", Groups: standard.Groups, Rules: legacyRules}
+	id := seedLegacy(cfg)
+	checkDownload(id, standard.Rules)
+
+	var editable struct {
+		GenConfig proxykit.GeneratorConfig `json:"genConfig"`
+	}
+	mustAPI(t, router, admin, "/api/v1/subscription/get", map[string]any{"id": id}, &editable)
+	if !slices.Equal(editable.GenConfig.Rules, standard.Rules) {
+		t.Fatal("the editor should load the upgraded rules")
+	}
+
+	// Users can explicitly save even the previous default as their own rules.
+	mustAPI(t, router, admin, "/api/v1/subscription/update", map[string]any{"id": id, "genConfig": cfg}, nil)
+	checkDownload(id, legacyRules)
+
+	cfg.Rules = append([]string{"DOMAIN,claude.ai,DIRECT"}, legacyRules...)
+	checkDownload(seedLegacy(cfg), cfg.Rules)
 }
 
 func TestMyflvxBackupFormatsAndRestore(t *testing.T) {

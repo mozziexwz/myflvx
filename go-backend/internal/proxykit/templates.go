@@ -1,6 +1,9 @@
 package proxykit
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // Template is a built-in starting point for the subscription generator.
 type Template struct {
@@ -121,7 +124,71 @@ const (
 	groupFallback = "🔯 故障转移"
 	groupFinal    = "🐟 漏网之鱼"
 	groupDirect   = "🎯 全球直连"
+	groupAI       = "🤖 AI 服务"
 )
+
+// legacyStandardRules is the exact rule list saved by the pre-2.2.5 editor.
+var legacyStandardRules = []string{
+	"GEOSITE,category-ads-all,🛑 广告拦截",
+	"GEOSITE,private," + groupDirect,
+	"GEOIP,private," + groupDirect + ",no-resolve",
+	"GEOSITE,category-ai-!cn," + groupAI,
+	"GEOSITE,youtube,📹 YouTube",
+	"GEOSITE,netflix,🎥 流媒体",
+	"GEOSITE,disney,🎥 流媒体",
+	"GEOSITE,spotify,🎥 流媒体",
+	"GEOSITE,telegram,📲 Telegram",
+	"GEOIP,telegram,📲 Telegram,no-resolve",
+	"GEOSITE,github,🐱 GitHub",
+	"GEOSITE,google,🔍 Google",
+	"GEOSITE,microsoft,Ⓜ️ 微软服务",
+	"GEOSITE,apple,🍎 苹果服务",
+	"GEOSITE,geolocation-!cn," + groupSelect,
+	"GEOSITE,cn," + groupDirect,
+	"GEOIP,cn," + groupDirect,
+	"MATCH," + groupFinal,
+}
+
+func standardRules() []string {
+	// Mihomo uses the first matching rule. Route Claude's documented hosts
+	// ahead of general GeoSite categories, including the ad list.
+	return slices.Concat([]string{
+		"DOMAIN-SUFFIX,anthropic.com," + groupAI,
+		"DOMAIN-SUFFIX,claude.ai," + groupAI,
+		"DOMAIN-SUFFIX,claude.com," + groupAI,
+		"DOMAIN-SUFFIX,clau.de," + groupAI,
+		"DOMAIN-SUFFIX,claudemcpclient.com," + groupAI,
+		"DOMAIN-SUFFIX,claudemcpcontent.com," + groupAI,
+		"DOMAIN-SUFFIX,claudeusercontent.com," + groupAI,
+		"DOMAIN,servd-anthropic-website.b-cdn.net," + groupAI,
+		"DOMAIN,anthropic.com.cdn.cloudflare.net," + groupAI,
+		"DOMAIN,anthropic.auth0.com," + groupAI,
+		"DOMAIN,anthropic-com.ghost.io," + groupAI,
+		"DOMAIN,http-intake.logs.us5.datadoghq.com," + groupAI,
+		"DOMAIN,browser-intake-us5-datadoghq.com," + groupAI,
+		// Inbound ranges from https://platform.claude.com/docs/en/api/ip-addresses.
+		"IP-CIDR,160.79.104.0/23," + groupAI + ",no-resolve",
+		"IP-CIDR,153.61.224.0/22," + groupAI + ",no-resolve",
+		"IP-CIDR6,2607:6bc0::/48," + groupAI + ",no-resolve",
+	}, legacyStandardRules)
+}
+
+// UpgradeLegacyTemplateRules updates the stored rules of an older subscription
+// that still uses the default standard rule list and its AI group.
+func (cfg *GeneratorConfig) UpgradeLegacyTemplateRules() {
+	if cfg.Template != "" && cfg.Template != "standard" {
+		return
+	}
+	if !slices.Equal(cfg.Rules, legacyStandardRules) {
+		return
+	}
+	if len(cfg.Groups) > 0 && !slices.ContainsFunc(cfg.Groups, func(group ProxyGroupSpec) bool {
+		return strings.TrimSpace(group.Name) == groupAI
+	}) {
+		return
+	}
+	cfg.Rules = standardRules()
+}
 
 func autoGroup(name, typ string) ProxyGroupSpec {
 	return ProxyGroupSpec{Name: name, Type: typ, IncludeAllNodes: true, URL: defaultTestURL, Interval: 300}
@@ -155,13 +222,13 @@ func Templates() []Template {
 		{
 			ID:          "standard",
 			Name:        "常用分流",
-			Description: "AI、YouTube、流媒体、Telegram、Google、GitHub、微软、苹果分流，广告拦截",
+			Description: "AI（含 Claude Code）、YouTube、流媒体、Telegram、Google、GitHub、微软、苹果分流，广告拦截",
 			BaseConfig:  DefaultBaseConfig,
 			Groups: []ProxyGroupSpec{
 				selectGroup(groupSelect, []string{groupAuto, groupFallback, "DIRECT"}, true),
 				autoGroup(groupAuto, "url-test"),
 				autoGroup(groupFallback, "fallback"),
-				selectGroup("🤖 AI 服务", []string{groupSelect, groupAuto}, true),
+				selectGroup(groupAI, []string{groupSelect, groupAuto}, true),
 				selectGroup("📹 YouTube", []string{groupSelect, groupAuto}, true),
 				selectGroup("🎥 流媒体", []string{groupSelect, groupAuto}, true),
 				selectGroup("📲 Telegram", []string{groupSelect, groupAuto}, true),
@@ -173,26 +240,7 @@ func Templates() []Template {
 				selectGroup("🛑 广告拦截", []string{"REJECT", "DIRECT"}, false),
 				selectGroup(groupFinal, []string{groupSelect, groupAuto, "DIRECT"}, false),
 			},
-			Rules: []string{
-				"GEOSITE,category-ads-all,🛑 广告拦截",
-				"GEOSITE,private," + groupDirect,
-				"GEOIP,private," + groupDirect + ",no-resolve",
-				"GEOSITE,category-ai-!cn,🤖 AI 服务",
-				"GEOSITE,youtube,📹 YouTube",
-				"GEOSITE,netflix,🎥 流媒体",
-				"GEOSITE,disney,🎥 流媒体",
-				"GEOSITE,spotify,🎥 流媒体",
-				"GEOSITE,telegram,📲 Telegram",
-				"GEOIP,telegram,📲 Telegram,no-resolve",
-				"GEOSITE,github,🐱 GitHub",
-				"GEOSITE,google,🔍 Google",
-				"GEOSITE,microsoft,Ⓜ️ 微软服务",
-				"GEOSITE,apple,🍎 苹果服务",
-				"GEOSITE,geolocation-!cn," + groupSelect,
-				"GEOSITE,cn," + groupDirect,
-				"GEOIP,cn," + groupDirect,
-				"MATCH," + groupFinal,
-			},
+			Rules: standardRules(),
 		},
 		{
 			ID:          "global",
