@@ -393,6 +393,15 @@ run_panel_compose() {
   $DOCKER_CMD "$@"
 }
 
+valid_panel_published_port() {
+  local binding="$1"
+  local port="${binding##*:}"
+
+  # Compose validates the host address. Require one explicit, nonzero host port.
+  [[ "$binding" != ":$port" && "$port" =~ ^0*([1-9][0-9]{0,4})$ ]] &&
+    (( BASH_REMATCH[1] <= 65535 ))
+}
+
 validate_panel_update_environment() {
   local key value backend_port frontend_port configured_db_type db_type database_url postgres_password
 
@@ -415,11 +424,11 @@ validate_panel_update_environment() {
 
   backend_port=$(get_env_var "BACKEND_PORT" || true)
   frontend_port=$(get_env_var "FRONTEND_PORT" || true)
-  if [[ ! "$backend_port" =~ ^[0-9]+$ || "$backend_port" -lt 1 || "$backend_port" -gt 65535 ]]; then
+  if ! valid_panel_published_port "$backend_port"; then
     echo "❌ BACKEND_PORT 不是有效端口：$backend_port"
     return 1
   fi
-  if [[ ! "$frontend_port" =~ ^[0-9]+$ || "$frontend_port" -lt 1 || "$frontend_port" -gt 65535 ]]; then
+  if ! valid_panel_published_port "$frontend_port"; then
     echo "❌ FRONTEND_PORT 不是有效端口：$frontend_port"
     return 1
   fi

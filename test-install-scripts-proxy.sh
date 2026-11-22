@@ -672,6 +672,46 @@ test_validate_panel_update_environment_rejects_empty_required_values() (
   assert_equals "1" "$rc" "update should reject an empty JWT secret before touching the running service"
 )
 
+test_panel_update_preserves_host_port_bindings() (
+  set -euo pipefail
+  load_script_without_main "$ROOT_DIR/panel_install.sh"
+
+  local deploy_dir host_prefix backend_binding frontend_binding invalid_port compose_checks=0
+  deploy_dir=$(mktemp -d)
+  trap 'cd "$ROOT_DIR"; rm -f "$deploy_dir/.env" "$deploy_dir/docker-compose.yml" "$deploy_dir/compose.candidate"; rmdir "$deploy_dir"' EXIT
+  cd "$deploy_dir"
+  printf 'services: {}\n' > docker-compose.yml
+
+  run_panel_compose() {
+    assert_equals "-f docker-compose.yml config -q" "$*" "update should validate the existing Compose file"
+    assert_equals "$backend_binding" "$(get_env_var BACKEND_PORT)" "Compose should receive the original backend binding"
+    assert_equals "$frontend_binding" "$(get_env_var FRONTEND_PORT)" "Compose should receive the original frontend binding"
+    compose_checks=$((compose_checks + 1))
+  }
+
+  for host_prefix in "" "[::1]:" "127.0.0.1:"; do
+    backend_binding="${host_prefix}6365"
+    frontend_binding="${host_prefix}6366"
+    printf 'JWT_SECRET=test\nBACKEND_PORT=%s\nFRONTEND_PORT=%s\nFLUX_VERSION=2.2.4\n' "$backend_binding" "$frontend_binding" > .env
+    validate_panel_update_environment >/dev/null
+  done
+  assert_equals "3" "$compose_checks" "plain, IPv6 and IPv4 bindings should pass the update preflight"
+
+  UPDATE_COMPOSE_CANDIDATE="compose.candidate"
+  LATEST_VERSION="v-test"
+  cp docker-compose.yml "$UPDATE_COMPOSE_CANDIDATE"
+  activate_panel_update_files
+  assert_equals "127.0.0.1:6365" "$(get_env_var BACKEND_PORT)" "activation should preserve the backend loopback binding"
+  assert_equals "127.0.0.1:6366" "$(get_env_var FRONTEND_PORT)" "activation should preserve the frontend loopback binding"
+  assert_equals "$LATEST_VERSION" "$(get_env_var FLUX_VERSION)" "activation should record the new version"
+
+  for invalid_port in "0" "65536" "127.0.0.1:0" "[::1]:65536" ":6365" "127.0.0.1:"; do
+    if valid_panel_published_port "$invalid_port"; then
+      fail "accepted invalid published port: $invalid_port"
+    fi
+  done
+)
+
 test_backup_sqlite_for_update_pauses_copies_and_unpauses() (
   set -euo pipefail
   load_script_without_main "$ROOT_DIR/panel_install.sh"
@@ -764,6 +804,7 @@ test_panel_install_script_recomputes_compose_urls_after_prompt
 test_update_panel_asks_for_proxy_config
 test_resolve_panel_deployment_uses_container_labels
 test_validate_panel_update_environment_rejects_empty_required_values
+test_panel_update_preserves_host_port_bindings
 test_backup_sqlite_for_update_pauses_copies_and_unpauses
 test_panel_install_script_uses_default_proxy
 test_panel_install_script_accepts_proxy_url_env_without_prompt
