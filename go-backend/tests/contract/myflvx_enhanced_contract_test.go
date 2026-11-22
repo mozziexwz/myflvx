@@ -298,6 +298,11 @@ MATCH,🐟 漏网之鱼`, "\n")
 	if adsIndex < 0 || !slices.Equal(standard.Rules[adsIndex:], legacyRules) {
 		t.Fatalf("the standard template must retain the original ordered rules: %q", standard.Rules)
 	}
+	const lastCIDR = "IP-CIDR6,2607:6bc0::/48,🤖 AI 服务,no-resolve"
+	asnIndex := slices.Index(standard.Rules, "IP-ASN,399358,🤖 AI 服务,no-resolve")
+	if asnIndex < 1 || asnIndex != adsIndex-1 || standard.Rules[asnIndex-1] != lastCIDR {
+		t.Fatalf("Anthropic ASN must follow the inbound CIDRs and precede the general rules: %q", standard.Rules)
+	}
 	for _, rule := range []string{
 		"DOMAIN-SUFFIX,claude.com,🤖 AI 服务",
 		"DOMAIN-SUFFIX,claudemcpcontent.com,🤖 AI 服务",
@@ -305,16 +310,18 @@ MATCH,🐟 漏网之鱼`, "\n")
 		"DOMAIN,browser-intake-us5-datadoghq.com,🤖 AI 服务",
 		"IP-CIDR,160.79.104.0/23,🤖 AI 服务,no-resolve",
 		"IP-CIDR,153.61.224.0/22,🤖 AI 服务,no-resolve",
-		"IP-CIDR6,2607:6bc0::/48,🤖 AI 服务,no-resolve",
 	} {
 		if !slices.Contains(standard.Rules[:adsIndex], rule) {
 			t.Errorf("missing Claude rule ahead of general categories: %q", rule)
 		}
 	}
 
-	seedLegacy := func(cfg proxykit.GeneratorConfig) int64 {
+	seedLegacy := func(cfg proxykit.GeneratorConfig, version int) int64 {
 		t.Helper()
-		raw, err := json.Marshal(cfg)
+		raw, err := json.Marshal(struct {
+			proxykit.GeneratorConfig
+			TemplateRulesVersion int `json:"templateRulesVersion,omitempty"`
+		}{GeneratorConfig: cfg, TemplateRulesVersion: version})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -342,7 +349,7 @@ MATCH,🐟 漏网之鱼`, "\n")
 	}
 
 	cfg := proxykit.GeneratorConfig{AllNodes: true, Template: "standard", Groups: standard.Groups, Rules: legacyRules}
-	id := seedLegacy(cfg)
+	id := seedLegacy(cfg, 0)
 	checkDownload(id, standard.Rules)
 
 	var editable struct {
@@ -356,9 +363,19 @@ MATCH,🐟 漏网之鱼`, "\n")
 	// Users can explicitly save even the previous default as their own rules.
 	mustAPI(t, router, admin, "/api/v1/subscription/update", map[string]any{"id": id, "genConfig": cfg}, nil)
 	checkDownload(id, legacyRules)
+	checkDownload(seedLegacy(cfg, 2), legacyRules)
 
 	cfg.Rules = append([]string{"DOMAIN,claude.ai,DIRECT"}, legacyRules...)
-	checkDownload(seedLegacy(cfg), cfg.Rules)
+	checkDownload(seedLegacy(cfg, 0), cfg.Rules)
+
+	cfg.Rules = slices.Delete(slices.Clone(standard.Rules), asnIndex, asnIndex+1)
+	id = seedLegacy(cfg, 2)
+	checkDownload(id, standard.Rules)
+	mustAPI(t, router, admin, "/api/v1/subscription/update", map[string]any{"id": id, "genConfig": cfg}, nil)
+	checkDownload(id, cfg.Rules)
+
+	cfg.Rules = append([]string{"DOMAIN,claude.ai,DIRECT"}, cfg.Rules...)
+	checkDownload(seedLegacy(cfg, 2), cfg.Rules)
 }
 
 func TestMyflvxBackupFormatsAndRestore(t *testing.T) {

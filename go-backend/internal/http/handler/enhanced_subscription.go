@@ -82,7 +82,7 @@ type storedGeneratorConfig struct {
 	TemplateRulesVersion int `json:"templateRulesVersion"`
 }
 
-const currentTemplateRulesVersion = 2
+const currentTemplateRulesVersion = 3
 
 func decodeGenConfig(raw string) (proxykit.GeneratorConfig, error) {
 	var stored storedGeneratorConfig
@@ -92,9 +92,7 @@ func decodeGenConfig(raw string) (proxykit.GeneratorConfig, error) {
 	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
 		return stored.GeneratorConfig, err
 	}
-	if stored.TemplateRulesVersion == 0 {
-		stored.UpgradeLegacyTemplateRules()
-	}
+	stored.UpgradeLegacyTemplateRules(stored.TemplateRulesVersion)
 	return stored.GeneratorConfig, nil
 }
 

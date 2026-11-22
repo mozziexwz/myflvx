@@ -149,37 +149,47 @@ var legacyStandardRules = []string{
 	"MATCH," + groupFinal,
 }
 
+// claudeRulesV2 is the rule block saved before the general categories in 2.2.5.
+var claudeRulesV2 = []string{
+	"DOMAIN-SUFFIX,anthropic.com," + groupAI,
+	"DOMAIN-SUFFIX,claude.ai," + groupAI,
+	"DOMAIN-SUFFIX,claude.com," + groupAI,
+	"DOMAIN-SUFFIX,clau.de," + groupAI,
+	"DOMAIN-SUFFIX,claudemcpclient.com," + groupAI,
+	"DOMAIN-SUFFIX,claudemcpcontent.com," + groupAI,
+	"DOMAIN-SUFFIX,claudeusercontent.com," + groupAI,
+	"DOMAIN,servd-anthropic-website.b-cdn.net," + groupAI,
+	"DOMAIN,anthropic.com.cdn.cloudflare.net," + groupAI,
+	"DOMAIN,anthropic.auth0.com," + groupAI,
+	"DOMAIN,anthropic-com.ghost.io," + groupAI,
+	"DOMAIN,http-intake.logs.us5.datadoghq.com," + groupAI,
+	"DOMAIN,browser-intake-us5-datadoghq.com," + groupAI,
+	// Inbound ranges from https://platform.claude.com/docs/en/api/ip-addresses.
+	"IP-CIDR,160.79.104.0/23," + groupAI + ",no-resolve",
+	"IP-CIDR,153.61.224.0/22," + groupAI + ",no-resolve",
+	"IP-CIDR6,2607:6bc0::/48," + groupAI + ",no-resolve",
+}
+
 func standardRules() []string {
-	// Mihomo uses the first matching rule. Route Claude's documented hosts
-	// ahead of general GeoSite categories, including the ad list.
-	return slices.Concat([]string{
-		"DOMAIN-SUFFIX,anthropic.com," + groupAI,
-		"DOMAIN-SUFFIX,claude.ai," + groupAI,
-		"DOMAIN-SUFFIX,claude.com," + groupAI,
-		"DOMAIN-SUFFIX,clau.de," + groupAI,
-		"DOMAIN-SUFFIX,claudemcpclient.com," + groupAI,
-		"DOMAIN-SUFFIX,claudemcpcontent.com," + groupAI,
-		"DOMAIN-SUFFIX,claudeusercontent.com," + groupAI,
-		"DOMAIN,servd-anthropic-website.b-cdn.net," + groupAI,
-		"DOMAIN,anthropic.com.cdn.cloudflare.net," + groupAI,
-		"DOMAIN,anthropic.auth0.com," + groupAI,
-		"DOMAIN,anthropic-com.ghost.io," + groupAI,
-		"DOMAIN,http-intake.logs.us5.datadoghq.com," + groupAI,
-		"DOMAIN,browser-intake-us5-datadoghq.com," + groupAI,
-		// Inbound ranges from https://platform.claude.com/docs/en/api/ip-addresses.
-		"IP-CIDR,160.79.104.0/23," + groupAI + ",no-resolve",
-		"IP-CIDR,153.61.224.0/22," + groupAI + ",no-resolve",
-		"IP-CIDR6,2607:6bc0::/48," + groupAI + ",no-resolve",
-	}, legacyStandardRules)
+	return slices.Concat(claudeRulesV2, []string{"IP-ASN,399358," + groupAI + ",no-resolve"}, legacyStandardRules)
 }
 
 // UpgradeLegacyTemplateRules updates the stored rules of an older subscription
 // that still uses the default standard rule list and its AI group.
-func (cfg *GeneratorConfig) UpgradeLegacyTemplateRules() {
+func (cfg *GeneratorConfig) UpgradeLegacyTemplateRules(version int) {
 	if cfg.Template != "" && cfg.Template != "standard" {
 		return
 	}
-	if !slices.Equal(cfg.Rules, legacyStandardRules) {
+	var previousRules []string
+	switch version {
+	case 0:
+		previousRules = legacyStandardRules
+	case 2:
+		previousRules = slices.Concat(claudeRulesV2, legacyStandardRules)
+	default:
+		return
+	}
+	if !slices.Equal(cfg.Rules, previousRules) {
 		return
 	}
 	if len(cfg.Groups) > 0 && !slices.ContainsFunc(cfg.Groups, func(group ProxyGroupSpec) bool {
