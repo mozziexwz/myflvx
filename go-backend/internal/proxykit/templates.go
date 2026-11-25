@@ -19,14 +19,40 @@ type Template struct {
 // targets mihomo (Clash Meta) clients such as Clash Verge Rev, Mihomo Party
 // and FlClash, which are required for SS 2022 / mieru / Sudoku nodes anyway.
 //
-// The general options follow the defaults that subscription converters such
-// as miaomiaowu / sublink-worker ship: no sniffer (it rewrites connection
-// targets), no tcp-concurrent, no global client fingerprint. With those enabled
-// users reported that sites opened by IP:port stopped working while the same
-// node worked with a miaomiaowu subscription.
+// Sniffed domains are used for matching while preserving the target address.
 const DefaultBaseConfig = baseGeneralSettings + baseDNSSettings
 
-const baseGeneralSettings = `mixed-port: 7890
+const baseGeneralSettings = legacyGeneralSettingsV2 + `sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  override-destination: false
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+    TLS:
+      ports: [443, 8443]
+    QUIC:
+      ports: [443, 8443]
+  skip-domain:
+    - "Mijia Cloud"
+    - "+.push.apple.com"
+    - "+.lan"
+    - "+.local"
+    - "+.home.arpa"
+    - "+.internal"
+  skip-dst-address:
+    - 10.0.0.0/8
+    - 127.0.0.0/8
+    - 169.254.0.0/16
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - "::1/128"
+    - "fc00::/7"
+    - "fe80::/10"
+`
+
+const legacyGeneralSettingsV2 = `mixed-port: 7890
 allow-lan: false
 mode: rule
 log-level: info
@@ -80,18 +106,24 @@ sniffer:
       ports: [443, 8443]
 `
 
-// effectiveBaseConfig returns the base config a generator config renders with:
-// the current default when none is stored, or when the stored text is an old
-// built-in default that was copied verbatim.
-func effectiveBaseConfig(stored string) string {
-	text := strings.TrimSpace(strings.ReplaceAll(stored, "\r\n", "\n"))
-	if text == "" || text == strings.TrimSpace(legacyGeneralSettingsV1+baseDNSSettings) {
-		return DefaultBaseConfig
+func usesDefaultBaseConfig(stored string) bool {
+	switch strings.TrimSpace(strings.ReplaceAll(stored, "\r\n", "\n")) {
+	case "", strings.TrimSpace(DefaultBaseConfig),
+		strings.TrimSpace(legacyGeneralSettingsV1 + legacyDNSSettingsV1),
+		strings.TrimSpace(legacyGeneralSettingsV2 + legacyDNSSettingsV1):
+		return true
 	}
-	return text
+	return false
 }
 
-const baseDNSSettings = `dns:
+func effectiveBaseConfig(stored string) string {
+	if usesDefaultBaseConfig(stored) {
+		return DefaultBaseConfig
+	}
+	return strings.TrimSpace(strings.ReplaceAll(stored, "\r\n", "\n"))
+}
+
+const legacyDNSSettingsV1 = `dns:
   enable: true
   ipv6: true
   listen: 0.0.0.0:1053
@@ -118,13 +150,67 @@ const baseDNSSettings = `dns:
     - https://doh.pub/dns-query
 `
 
+const baseDNSSettings = `dns:
+  enable: true
+  ipv6: true
+  listen: 127.0.0.1:1053
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  respect-rules: false
+  fake-ip-filter:
+    - "*"
+    - "+.localhost"
+    - "+.lan"
+    - "+.local"
+    - "+.home.arpa"
+    - "+.internal"
+    - "geosite:private"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+    - "localhost.ptlogin2.qq.com"
+    - "+.stun.*.*"
+    - "+.stun.*.*.*"
+    - "time.*.com"
+    - "ntp.*.com"
+    - "+.pool.ntp.org"
+  default-nameserver:
+    - https://223.5.5.5/dns-query
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - "https://223.5.5.5/dns-query#DIRECT"
+    - "https://doh.pub/dns-query#DIRECT"
+  nameserver:
+    - "https://1.1.1.1/dns-query#` + groupOverseasDNS + `"
+    - "https://8.8.8.8/dns-query#` + groupOverseasDNS + `"
+  # 私有域名默认返回 NXDOMAIN。这也会影响 Plex、Tailscale、NAS 和公司内网。
+  # 需要内网解析时，在拦截规则之前将实际使用的后缀指向可信内网 DNS。
+  nameserver-policy:
+    "localhost.ptlogin2.qq.com,+.msftconnecttest.com,+.msftncsi.com,time.*.com,ntp.*.com,+.pool.ntp.org":
+      - "https://223.5.5.5/dns-query#DIRECT"
+      - "https://doh.pub/dns-query#DIRECT"
+    "*,+.localhost,+.lan,+.local,+.home.arpa,+.internal": "rcode://name_error"
+    "geosite:private": "rcode://name_error"
+    "+.cn":
+      - "https://223.5.5.5/dns-query#DIRECT"
+      - "https://doh.pub/dns-query#DIRECT"
+    "geosite:category-ai-!cn,youtube,netflix,disney,spotify,telegram,github,google":
+      - "https://1.1.1.1/dns-query#` + groupOverseasDNS + `"
+      - "https://8.8.8.8/dns-query#` + groupOverseasDNS + `"
+    "geosite:cn,apple-cn,apple@cn,microsoft@cn":
+      - "https://223.5.5.5/dns-query#DIRECT"
+      - "https://doh.pub/dns-query#DIRECT"
+`
+
 const (
-	groupSelect   = "🚀 节点选择"
-	groupAuto     = "⚡ 自动选择"
-	groupFallback = "🔯 故障转移"
-	groupFinal    = "🐟 漏网之鱼"
-	groupDirect   = "🎯 全球直连"
-	groupAI       = "🤖 AI 服务"
+	groupSelect      = "🚀 节点选择"
+	groupAuto        = "⚡ 自动选择"
+	groupFallback    = "🔯 故障转移"
+	groupFinal       = "🐟 漏网之鱼"
+	groupDirect      = "🎯 全球直连"
+	groupAI          = "🤖 AI 服务"
+	groupMedia       = "🎥 流媒体"
+	groupRFCEmby     = "RFC-EMBY"
+	groupOverseasDNS = "海外 DNS"
 )
 
 // legacyStandardRules is the exact rule list saved by the pre-2.2.5 editor.
@@ -170,34 +256,123 @@ var claudeRulesV2 = []string{
 	"IP-CIDR6,2607:6bc0::/48," + groupAI + ",no-resolve",
 }
 
-func standardRules() []string {
-	return slices.Concat(claudeRulesV2, []string{"IP-ASN,399358," + groupAI + ",no-resolve"}, legacyStandardRules)
+const claudeASNRule = "IP-ASN,399358," + groupAI + ",no-resolve"
+
+var legacyStandardRulesV3 = slices.Concat(claudeRulesV2, []string{claudeASNRule}, legacyStandardRules)
+
+var privateDirectRules = []string{
+	"DOMAIN-SUFFIX,lan,DIRECT",
+	"DOMAIN-SUFFIX,local,DIRECT",
+	"DOMAIN-SUFFIX,home.arpa,DIRECT",
+	"DOMAIN-SUFFIX,internal,DIRECT",
+	"GEOSITE,private,DIRECT",
+	"GEOIP,private,DIRECT,no-resolve",
 }
 
-// UpgradeLegacyTemplateRules updates the stored rules of an older subscription
-// that still uses the default standard rule list and its AI group.
+func claudeUDPRejectRule(rules []string) string {
+	matchers := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		// Logical subrules retain no-resolve and omit the standalone target.
+		parts := slices.Delete(splitRule(rule), 2, 3)
+		matchers = append(matchers, "("+strings.Join(parts, ",")+")")
+	}
+	return "AND,((NETWORK,UDP),(OR,(" + strings.Join(matchers, ",") + "))),REJECT"
+}
+
+func standardRules() []string {
+	claudeRules := slices.Concat(claudeRulesV2, []string{claudeASNRule})
+	return slices.Concat(claudeRules, []string{
+		claudeUDPRejectRule(claudeRules),
+		"GEOSITE,category-ads-all,🛑 广告拦截",
+	}, privateDirectRules, []string{
+		"GEOSITE,category-ai-!cn," + groupAI,
+		"AND,((NETWORK,UDP),(GEOSITE,category-ai-!cn)),REJECT",
+		"GEOSITE,youtube,📹 YouTube",
+		"GEOSITE,netflix," + groupMedia,
+		"GEOSITE,disney," + groupMedia,
+		"GEOSITE,spotify," + groupMedia,
+		"DOMAIN-SUFFIX,rfc.uhdnow.com," + groupRFCEmby,
+		"GEOSITE,telegram,📲 Telegram",
+		"GEOIP,telegram,📲 Telegram,no-resolve",
+		"GEOSITE,github,🐱 GitHub",
+		"GEOSITE,google,🔍 Google",
+		"GEOSITE,microsoft,Ⓜ️ 微软服务",
+		"GEOSITE,apple,🍎 苹果服务",
+		"GEOSITE,geolocation-!cn," + groupSelect,
+		"GEOSITE,cn," + groupDirect,
+		"GEOIP,cn," + groupDirect,
+		"MATCH," + groupFinal,
+	})
+}
+
+// UpgradeLegacyTemplateRules retains the legacy entry point for callers.
 func (cfg *GeneratorConfig) UpgradeLegacyTemplateRules(version int) {
-	if cfg.Template != "" && cfg.Template != "standard" {
+	cfg.UpgradeLegacyTemplateConfig(version)
+}
+
+// UpgradeLegacyTemplateConfig migrates stored defaults without replacing customized settings.
+func (cfg *GeneratorConfig) UpgradeLegacyTemplateConfig(version int) {
+	if version >= 4 {
 		return
 	}
+	if usesDefaultBaseConfig(cfg.BaseConfig) {
+		cfg.BaseConfig = ""
+	}
+	if cfg.Template == "" || cfg.Template == "standard" {
+		cfg.upgradeLegacyStandard(version)
+	}
+	if len(cfg.Groups) > 0 && cfg.BaseConfig == "" && groupIndex(cfg.Groups, groupOverseasDNS) < 0 {
+		cfg.Groups = append(cfg.Groups, overseasDNSGroup())
+	}
+}
+
+func (cfg *GeneratorConfig) upgradeLegacyStandard(version int) {
+	ai := groupIndex(cfg.Groups, groupAI)
+	if ai >= 0 && matchesAIGroup(cfg.Groups[ai], []string{groupSelect, groupAuto}) {
+		cfg.Groups[ai].Proxies = nil
+	}
+
 	var previousRules []string
 	switch version {
 	case 0:
 		previousRules = legacyStandardRules
 	case 2:
 		previousRules = slices.Concat(claudeRulesV2, legacyStandardRules)
+	case 3:
+		previousRules = legacyStandardRulesV3
 	default:
 		return
 	}
-	if !slices.Equal(cfg.Rules, previousRules) {
-		return
-	}
-	if len(cfg.Groups) > 0 && !slices.ContainsFunc(cfg.Groups, func(group ProxyGroupSpec) bool {
-		return strings.TrimSpace(group.Name) == groupAI
-	}) {
+	if !slices.Equal(cfg.Rules, previousRules) || (len(cfg.Groups) > 0 && ai < 0) {
 		return
 	}
 	cfg.Rules = standardRules()
+	if len(cfg.Groups) == 0 || groupIndex(cfg.Groups, groupRFCEmby) >= 0 {
+		return
+	}
+	members := make([]string, 0, 3)
+	for _, name := range []string{groupSelect, groupAuto} {
+		if groupIndex(cfg.Groups, name) >= 0 {
+			members = append(members, name)
+		}
+	}
+	members = append(members, "DIRECT")
+	position := len(cfg.Groups)
+	if media := groupIndex(cfg.Groups, groupMedia); media >= 0 {
+		position = media + 1
+	}
+	cfg.Groups = slices.Insert(cfg.Groups, position, selectGroup(groupRFCEmby, members, true))
+}
+
+func groupIndex(groups []ProxyGroupSpec, name string) int {
+	return slices.IndexFunc(groups, func(group ProxyGroupSpec) bool {
+		return strings.TrimSpace(group.Name) == name
+	})
+}
+
+func matchesAIGroup(group ProxyGroupSpec, members []string) bool {
+	return strings.TrimSpace(group.Name) == groupAI && group.Type == "select" && group.IncludeAllNodes &&
+		strings.TrimSpace(group.Filter) == "" && slices.Equal(group.Proxies, members)
 }
 
 func autoGroup(name, typ string) ProxyGroupSpec {
@@ -206,6 +381,13 @@ func autoGroup(name, typ string) ProxyGroupSpec {
 
 func selectGroup(name string, members []string, includeNodes bool) ProxyGroupSpec {
 	return ProxyGroupSpec{Name: name, Type: "select", Proxies: members, IncludeAllNodes: includeNodes}
+}
+
+func overseasDNSGroup() ProxyGroupSpec {
+	group := autoGroup(groupOverseasDNS, "fallback")
+	group.Lazy = true
+	group.Hidden = true
+	return group
 }
 
 // Templates returns the built-in generator templates.
@@ -220,27 +402,27 @@ func Templates() []Template {
 				selectGroup(groupSelect, []string{groupAuto, "DIRECT"}, true),
 				autoGroup(groupAuto, "url-test"),
 				selectGroup(groupFinal, []string{groupSelect, "DIRECT"}, false),
+				overseasDNSGroup(),
 			},
-			Rules: []string{
-				"GEOSITE,private,DIRECT",
-				"GEOIP,private,DIRECT,no-resolve",
+			Rules: slices.Concat(privateDirectRules, []string{
 				"GEOSITE,cn,DIRECT",
 				"GEOIP,cn,DIRECT",
 				"MATCH," + groupFinal,
-			},
+			}),
 		},
 		{
 			ID:          "standard",
 			Name:        "常用分流",
-			Description: "AI（含 Claude Code）、YouTube、流媒体、Telegram、Google、GitHub、微软、苹果分流，广告拦截",
+			Description: "AI（含 Claude Code）、YouTube、流媒体、RFC-EMBY、Telegram、Google、GitHub、微软、苹果分流，广告拦截",
 			BaseConfig:  DefaultBaseConfig,
 			Groups: []ProxyGroupSpec{
 				selectGroup(groupSelect, []string{groupAuto, groupFallback, "DIRECT"}, true),
 				autoGroup(groupAuto, "url-test"),
 				autoGroup(groupFallback, "fallback"),
-				selectGroup(groupAI, []string{groupSelect, groupAuto}, true),
+				selectGroup(groupAI, nil, true),
 				selectGroup("📹 YouTube", []string{groupSelect, groupAuto}, true),
-				selectGroup("🎥 流媒体", []string{groupSelect, groupAuto}, true),
+				selectGroup(groupMedia, []string{groupSelect, groupAuto}, true),
+				selectGroup(groupRFCEmby, []string{groupSelect, groupAuto, "DIRECT"}, true),
 				selectGroup("📲 Telegram", []string{groupSelect, groupAuto}, true),
 				selectGroup("🔍 Google", []string{groupSelect, groupAuto, "DIRECT"}, true),
 				selectGroup("🐱 GitHub", []string{groupSelect, "DIRECT"}, true),
@@ -249,6 +431,7 @@ func Templates() []Template {
 				selectGroup(groupDirect, []string{"DIRECT", groupSelect}, false),
 				selectGroup("🛑 广告拦截", []string{"REJECT", "DIRECT"}, false),
 				selectGroup(groupFinal, []string{groupSelect, groupAuto, "DIRECT"}, false),
+				overseasDNSGroup(),
 			},
 			Rules: standardRules(),
 		},
@@ -260,12 +443,11 @@ func Templates() []Template {
 			Groups: []ProxyGroupSpec{
 				selectGroup(groupSelect, []string{groupAuto, "DIRECT"}, true),
 				autoGroup(groupAuto, "url-test"),
+				overseasDNSGroup(),
 			},
-			Rules: []string{
-				"GEOSITE,private,DIRECT",
-				"GEOIP,private,DIRECT,no-resolve",
+			Rules: slices.Concat(privateDirectRules, []string{
 				"MATCH," + groupSelect,
-			},
+			}),
 		},
 	}
 }

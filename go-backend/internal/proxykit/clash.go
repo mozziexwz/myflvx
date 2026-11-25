@@ -39,6 +39,7 @@ type GeneratorConfig struct {
 	Rules         []string         `json:"rules"`
 	BaseConfig    string           `json:"baseConfig,omitempty"`
 	RuleProviders string           `json:"ruleProviders,omitempty"`
+	IPv4Only      bool             `json:"ipv4Only,omitempty"`
 }
 
 // Built-in policy names that rules and groups may reference.
@@ -89,8 +90,11 @@ func Render(cfg GeneratorConfig, nodes []Proxy) (RenderResult, error) {
 	result := RenderResult{}
 	proxies := UniqueNames(nodes)
 	nodeNames := make([]string, 0, len(proxies))
+	allNodeNames := make(map[string]bool, len(proxies))
 	for _, p := range proxies {
-		nodeNames = append(nodeNames, Name(p))
+		name := Name(p)
+		nodeNames = append(nodeNames, name)
+		allNodeNames[name] = true
 	}
 
 	groups := cfg.Groups
@@ -102,7 +106,21 @@ func Render(cfg GeneratorConfig, nodes []Proxy) (RenderResult, error) {
 			rules = tpl.Rules
 		}
 	}
-	baseConfig := effectiveBaseConfig(cfg.BaseConfig)
+	usingDefaultBase := usesDefaultBaseConfig(cfg.BaseConfig)
+	doc, err := parseMapping(effectiveBaseConfig(cfg.BaseConfig))
+	if err != nil {
+		return result, fmt.Errorf("基础配置不是有效的 YAML 映射: %w", err)
+	}
+	dns := mappingValue(doc, "dns")
+	if dns != nil && dns.Kind == yaml.AliasNode {
+		dns = dns.Alias
+	}
+	if cfg.IPv4Only {
+		setMappingKey(doc, "ipv6", boolScalar(false))
+		if dns != nil && dns.Kind == yaml.MappingNode {
+			setMappingKey(dns, "ipv6", boolScalar(false))
+		}
+	}
 
 	groupNames := map[string]bool{}
 	for _, g := range groups {
@@ -115,23 +133,57 @@ func Render(cfg GeneratorConfig, nodes []Proxy) (RenderResult, error) {
 		}
 		groupNames[name] = true
 	}
+	refs := dnsProxyReferences(dns)
+	builtinDNSName := ""
+	if usingDefaultBase {
+		var warning string
+		groups, builtinDNSName, warning = appendBuiltinDNSGroup(groups, groupNames, allNodeNames, refs)
+		if warning != "" {
+			result.Warnings = append(result.Warnings, warning)
+		}
+	}
+
 	nodeSet := map[string]bool{}
-	for _, n := range nodeNames {
-		if groupNames[n] {
-			result.Warnings = append(result.Warnings, fmt.Sprintf("节点名「%s」与代理组同名，已跳过该节点", n))
+	realProxyNames := make([]string, 0, len(proxies))
+	directNodes := map[string]bool{}
+	for _, p := range proxies {
+		name := Name(p)
+		if groupNames[name] {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("节点名「%s」与代理组同名，已跳过该节点", name))
 			continue
 		}
-		nodeSet[n] = true
+		nodeSet[name] = true
+		if isRealProxyNode(p) {
+			realProxyNames = append(realProxyNames, name)
+		}
+		if typ := Type(p); typ == "direct" || typ == "compatible" {
+			directNodes[name] = true
+		}
 	}
 
 	groupNodes := make([]*yaml.Node, 0, len(groups))
+	resolvedMembers := make(map[string][]string, len(groups))
 	for _, g := range groups {
-		node, warnings, err := buildGroupNode(g, nodeNames, nodeSet, groupNames)
+		name := strings.TrimSpace(g.Name)
+		eligibleNodes := nodeNames
+		emptyPolicy := "DIRECT"
+		if name == builtinDNSName || isBuiltinOverseasDNSGroup(g) || matchesAIGroup(g, nil) {
+			eligibleNodes = realProxyNames
+			emptyPolicy = "REJECT"
+		} else if name == groupAI {
+			emptyPolicy = "REJECT"
+		}
+		node, members, warnings, err := buildGroupNode(g, eligibleNodes, nodeSet, groupNames, emptyPolicy)
 		if err != nil {
 			return result, err
 		}
 		result.Warnings = append(result.Warnings, warnings...)
 		groupNodes = append(groupNodes, node)
+		resolvedMembers[name] = members
+	}
+	result.Warnings = append(result.Warnings, dnsProxyWarnings(refs, groupNames, nodeSet, resolvedMembers, directNodes)...)
+	if targetMayReachDirect(groupAI, resolvedMembers, directNodes) && groupNames[groupAI] {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("代理组「%s」可走直连，请检查节点和子组", groupAI))
 	}
 
 	fallback := "DIRECT"
@@ -140,11 +192,6 @@ func Render(cfg GeneratorConfig, nodes []Proxy) (RenderResult, error) {
 	}
 	finalRules, ruleWarnings := normalizeRules(rules, groupNames, nodeSet, fallback)
 	result.Warnings = append(result.Warnings, ruleWarnings...)
-
-	doc, err := parseMapping(baseConfig)
-	if err != nil {
-		return result, fmt.Errorf("基础配置不是有效的 YAML 映射: %w", err)
-	}
 
 	proxyList := &yaml.Node{Kind: yaml.SequenceNode}
 	for _, p := range proxies {
@@ -188,7 +235,7 @@ func Render(cfg GeneratorConfig, nodes []Proxy) (RenderResult, error) {
 	return result, nil
 }
 
-func buildGroupNode(g ProxyGroupSpec, nodeNames []string, nodeSet, groupNames map[string]bool) (*yaml.Node, []string, error) {
+func buildGroupNode(g ProxyGroupSpec, nodeNames []string, nodeSet, groupNames map[string]bool, emptyPolicy string) (*yaml.Node, []string, []string, error) {
 	warnings := []string{}
 	name := strings.TrimSpace(g.Name)
 	typ := strings.TrimSpace(g.Type)
@@ -196,7 +243,7 @@ func buildGroupNode(g ProxyGroupSpec, nodeNames []string, nodeSet, groupNames ma
 		typ = "select"
 	}
 	if !validGroupTypes[typ] {
-		return nil, nil, fmt.Errorf("代理组「%s」的类型无效: %s", name, typ)
+		return nil, nil, nil, fmt.Errorf("代理组「%s」的类型无效: %s", name, typ)
 	}
 
 	members := []string{}
@@ -223,7 +270,7 @@ func buildGroupNode(g ProxyGroupSpec, nodeNames []string, nodeSet, groupNames ma
 		if f := strings.TrimSpace(g.Filter); f != "" {
 			compiled, err := regexp.Compile(f)
 			if err != nil {
-				return nil, nil, fmt.Errorf("代理组「%s」的节点筛选正则无效: %v", name, err)
+				return nil, nil, nil, fmt.Errorf("代理组「%s」的节点筛选正则无效: %v", name, err)
 			}
 			re = compiled
 		}
@@ -238,8 +285,8 @@ func buildGroupNode(g ProxyGroupSpec, nodeNames []string, nodeSet, groupNames ma
 		}
 	}
 	if len(members) == 0 {
-		members = append(members, "DIRECT")
-		warnings = append(warnings, fmt.Sprintf("代理组「%s」没有可用节点，已填入 DIRECT", name))
+		members = append(members, emptyPolicy)
+		warnings = append(warnings, fmt.Sprintf("代理组「%s」没有可用节点，已填入 %s", name, emptyPolicy))
 	}
 
 	node := &yaml.Node{Kind: yaml.MappingNode}
@@ -281,7 +328,7 @@ func buildGroupNode(g ProxyGroupSpec, nodeNames []string, nodeSet, groupNames ma
 		list.Content = append(list.Content, scalar(m))
 	}
 	appendKV(node, "proxies", list)
-	return node, warnings, nil
+	return node, members, warnings, nil
 }
 
 // normalizeRules makes sure every rule targets an existing policy and that

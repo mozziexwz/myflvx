@@ -83,6 +83,7 @@ export default function SubGeneratorPage() {
   const [rulesText, setRulesText] = useState("");
   const [baseConfig, setBaseConfig] = useState("");
   const [ruleProviders, setRuleProviders] = useState("");
+  const [ipv4Only, setIPv4Only] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -165,11 +166,14 @@ export default function SubGeneratorPage() {
             );
             setBaseConfig(cfg.baseConfig || "");
             setRuleProviders(cfg.ruleProviders || "");
-            if (cfg.baseConfig || cfg.ruleProviders) setShowAdvanced(true);
+            setIPv4Only(Boolean(cfg.ipv4Only));
+            if (cfg.baseConfig || cfg.ruleProviders || cfg.ipv4Only)
+              setShowAdvanced(true);
           }
         } else {
           const tpl = tplList.find((t) => t.id === "standard") || tplList[0];
 
+          setIPv4Only(false);
           if (tpl) {
             setTemplateId(tpl.id);
             setGroups(cloneGroups(tpl.groups));
@@ -345,6 +349,7 @@ export default function SubGeneratorPage() {
       .filter(Boolean),
     baseConfig: baseConfig.trim(),
     ruleProviders: ruleProviders.trim(),
+    ipv4Only,
   });
 
   const validate = () => {
@@ -854,6 +859,12 @@ export default function SubGeneratorPage() {
         </CardHeader>
         {showAdvanced && (
           <CardBody className="space-y-4">
+            <LabeledSwitch
+              description="关闭导出配置中的 IPv6 与 DNS AAAA。使用 IPv6 节点或需要 TUN 接管 IPv6 时请保持关闭。"
+              isSelected={ipv4Only}
+              label="仅 IPv4"
+              onValueChange={setIPv4Only}
+            />
             <Textarea
               className="font-mono"
               description="端口、DNS、嗅探等全局配置（YAML）。留空使用内置默认配置；proxies / proxy-groups / rules 会被自动覆盖"

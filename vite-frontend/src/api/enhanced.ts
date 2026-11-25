@@ -168,6 +168,7 @@ export interface GeneratorConfig {
   rules: string[];
   baseConfig?: string;
   ruleProviders?: string;
+  ipv4Only?: boolean;
 }
 
 export interface SubscriptionTemplate {

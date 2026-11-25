@@ -238,8 +238,15 @@ func TestMyflvxSubscriptionsArePerUser(t *testing.T) {
 	if strings.Contains(file.Content, "Admin-Only") {
 		t.Fatalf("generated subscription must only use the owner's nodes:\n%s", file.Content)
 	}
-	if strings.Contains(file.Content, "sniffer") || strings.Contains(file.Content, "global-client-fingerprint") {
-		t.Fatalf("default base config must not enable sniffer / client fingerprint:\n%s", file.Content)
+	for _, expected := range []string{"sniffer:", "override-destination: false", "skip-dst-address:", "fc00::/7", "doh.pub/dns-query", "#海外 DNS", "ipv6: true"} {
+		if !strings.Contains(file.Content, expected) {
+			t.Errorf("missing default setting %q", expected)
+		}
+	}
+	for _, forbidden := range []string{"global-client-fingerprint:", "tcp-concurrent:", "direct-nameserver:"} {
+		if strings.Contains(file.Content, forbidden) {
+			t.Errorf("unexpected default setting %q", forbidden)
+		}
 	}
 	mustAPI(t, router, user, "/api/v1/subscription/my/download", map[string]interface{}{"id": created.ID, "format": "base64"}, &file)
 	decoded, err := base64.StdEncoding.DecodeString(file.Content)
@@ -251,13 +258,32 @@ func TestMyflvxSubscriptionsArePerUser(t *testing.T) {
 	disabled := false
 	mustAPI(t, router, user, "/api/v1/subscription/update", map[string]interface{}{
 		"id": created.ID, "name": "家庭订阅", "enabled": disabled,
-		"genConfig": map[string]interface{}{"allNodes": true, "template": "minimal"},
+		"genConfig": map[string]interface{}{"allNodes": true, "template": "minimal", "ipv4Only": true},
 	}, nil)
 	mustAPI(t, router, user, "/api/v1/subscription/my/list", map[string]interface{}{}, &mine)
 	if len(mine) != 0 {
 		t.Fatalf("disabled subscription should not be listed in 订阅下载: %+v", mine)
 	}
 	mustAPI(t, router, user, "/api/v1/subscription/my/download", map[string]interface{}{"id": created.ID}, &file)
+	var ipv4Doc struct {
+		IPv6 *bool `yaml:"ipv6"`
+		DNS  struct {
+			IPv6 *bool `yaml:"ipv6"`
+		} `yaml:"dns"`
+	}
+	if err := yaml.Unmarshal([]byte(file.Content), &ipv4Doc); err != nil {
+		t.Fatal(err)
+	}
+	if ipv4Doc.IPv6 == nil || *ipv4Doc.IPv6 || ipv4Doc.DNS.IPv6 == nil || *ipv4Doc.DNS.IPv6 {
+		t.Fatal("saved IPv4-only mode must disable both IPv6 settings on download")
+	}
+	var ipv4Editable struct {
+		GenConfig proxykit.GeneratorConfig `json:"genConfig"`
+	}
+	mustAPI(t, router, user, "/api/v1/subscription/get", map[string]any{"id": created.ID}, &ipv4Editable)
+	if !ipv4Editable.GenConfig.IPv4Only {
+		t.Fatal("IPv4-only mode must be returned to the editor")
+	}
 
 	// Upload type keeps the uploaded YAML verbatim.
 	upload := "mixed-port: 7890\nproxies:\n  - {name: up, type: socks5, server: 1.1.1.1, port: 1080}\nproxy-groups: []\nrules:\n  - MATCH,DIRECT\n"
@@ -295,13 +321,23 @@ MATCH,🐟 漏网之鱼`, "\n")
 
 	standard := proxykit.TemplateByID("standard")
 	adsIndex := slices.Index(standard.Rules, legacyRules[0])
-	if adsIndex < 0 || !slices.Equal(standard.Rules[adsIndex:], legacyRules) {
-		t.Fatalf("the standard template must retain the original ordered rules: %q", standard.Rules)
-	}
 	const lastCIDR = "IP-CIDR6,2607:6bc0::/48,🤖 AI 服务,no-resolve"
 	asnIndex := slices.Index(standard.Rules, "IP-ASN,399358,🤖 AI 服务,no-resolve")
-	if asnIndex < 1 || asnIndex != adsIndex-1 || standard.Rules[asnIndex-1] != lastCIDR {
+	if asnIndex < 1 || adsIndex != asnIndex+2 || standard.Rules[asnIndex-1] != lastCIDR {
 		t.Fatalf("Anthropic ASN must follow the inbound CIDRs and precede the general rules: %q", standard.Rules)
+	}
+	claudeGuard := standard.Rules[asnIndex+1]
+	if !strings.HasPrefix(claudeGuard, "AND,((NETWORK,UDP),(OR,") || !strings.HasSuffix(claudeGuard, ",REJECT") ||
+		!strings.Contains(claudeGuard, "(IP-ASN,399358,no-resolve)") {
+		t.Fatalf("incorrect Claude UDP guard: %q", claudeGuard)
+	}
+	const rfcRule = "DOMAIN-SUFFIX,rfc.uhdnow.com,RFC-EMBY"
+	const cnRule = "GEOIP,cn,🎯 全球直连"
+	rfcIndex, cnIndex := slices.Index(standard.Rules, rfcRule), slices.Index(standard.Rules, cnRule)
+	if rfcIndex <= adsIndex || cnIndex <= rfcIndex ||
+		!slices.Contains(standard.Rules, "AND,((NETWORK,UDP),(GEOSITE,category-ai-!cn)),REJECT") ||
+		!slices.Contains(standard.Rules, "GEOIP,private,DIRECT,no-resolve") {
+		t.Fatalf("incorrect service or private routing order: %q", standard.Rules)
 	}
 	for _, rule := range []string{
 		"DOMAIN-SUFFIX,claude.com,🤖 AI 服务",
@@ -331,50 +367,110 @@ MATCH,🐟 漏网之鱼`, "\n")
 		}
 		return sub.ID
 	}
-	checkDownload := func(id int64, want []string) {
+	type downloadedConfig struct {
+		Rules  []string                  `yaml:"rules"`
+		Groups []proxykit.ProxyGroupSpec `yaml:"proxy-groups"`
+		DNS    struct {
+			Nameserver []string `yaml:"nameserver"`
+		} `yaml:"dns"`
+	}
+	checkDownload := func(id int64, want []string) downloadedConfig {
 		t.Helper()
 		var file struct {
 			Content string `json:"content"`
 		}
 		mustAPI(t, router, admin, "/api/v1/subscription/my/download", map[string]any{"id": id, "format": "clash"}, &file)
-		var doc struct {
-			Rules []string `yaml:"rules"`
-		}
+		var doc downloadedConfig
 		if err := yaml.Unmarshal([]byte(file.Content), &doc); err != nil {
 			t.Fatal(err)
 		}
 		if !slices.Equal(doc.Rules, want) {
 			t.Fatalf("subscription %d: expected rules %q, got %q", id, want, doc.Rules)
 		}
+		return doc
 	}
 
-	cfg := proxykit.GeneratorConfig{AllNodes: true, Template: "standard", Groups: standard.Groups, Rules: legacyRules}
-	id := seedLegacy(cfg, 0)
-	checkDownload(id, standard.Rules)
+	const aiGroup, overseasGroup, rfcGroup = "🤖 AI 服务", "海外 DNS", "RFC-EMBY"
+	groupIndex := func(groups []proxykit.ProxyGroupSpec, name string) int {
+		return slices.IndexFunc(groups, func(group proxykit.ProxyGroupSpec) bool { return group.Name == name })
+	}
+	legacyGroups := slices.DeleteFunc(slices.Clone(standard.Groups), func(group proxykit.ProxyGroupSpec) bool {
+		return group.Name == overseasGroup || group.Name == rfcGroup
+	})
+	ai := groupIndex(legacyGroups, aiGroup)
+	if ai < 0 {
+		t.Fatal("missing default AI group")
+	}
+	legacyGroups[ai].Proxies = []string{"🚀 节点选择", "⚡ 自动选择"}
+	v2Rules := slices.Concat(standard.Rules[:asnIndex], legacyRules)
+	v3Rules := slices.Concat(standard.Rules[:asnIndex+1], legacyRules)
+	cfg := proxykit.GeneratorConfig{AllNodes: true, Template: "standard", Groups: legacyGroups}
+	loadEditor := func(id int64) proxykit.GeneratorConfig {
+		t.Helper()
+		var editable struct {
+			GenConfig proxykit.GeneratorConfig `json:"genConfig"`
+		}
+		mustAPI(t, router, admin, "/api/v1/subscription/get", map[string]any{"id": id}, &editable)
+		return editable.GenConfig
+	}
+	checkSafeDownload := func(id int64, dnsGroup string) {
+		t.Helper()
+		doc := checkDownload(id, standard.Rules)
+		for _, group := range []string{aiGroup, dnsGroup} {
+			i := groupIndex(doc.Groups, group)
+			if i < 0 || !slices.Contains(doc.Groups[i].Proxies, "Trojan-01") ||
+				slices.Contains(doc.Groups[i].Proxies, "DIRECT") || slices.Contains(doc.Groups[i].Proxies, "🚀 节点选择") {
+				t.Fatalf("subscription %d has an unsafe group %q: %+v", id, group, doc.Groups)
+			}
+		}
+		if len(doc.DNS.Nameserver) != 2 || !strings.HasSuffix(doc.DNS.Nameserver[0], "#"+dnsGroup) ||
+			!strings.HasSuffix(doc.DNS.Nameserver[1], "#"+dnsGroup) || groupIndex(doc.Groups, rfcGroup) < 0 {
+			t.Fatalf("subscription %d has incorrect DNS or RFC-EMBY groups", id)
+		}
+	}
+	for _, old := range []struct {
+		version int
+		rules   []string
+	}{{0, legacyRules}, {2, v2Rules}, {3, v3Rules}} {
+		cfg.Rules = old.rules
+		id := seedLegacy(cfg, old.version)
+		checkSafeDownload(id, overseasGroup)
+		editable := loadEditor(id)
+		if !slices.Equal(editable.Rules, standard.Rules) || groupIndex(editable.Groups, overseasGroup) < 0 ||
+			groupIndex(editable.Groups, rfcGroup) < 0 || groupIndex(editable.Groups, aiGroup) < 0 ||
+			len(editable.Groups[groupIndex(editable.Groups, aiGroup)].Proxies) != 0 {
+			t.Fatalf("version %d did not migrate in the editor: %+v", old.version, editable)
+		}
+		mustAPI(t, router, admin, "/api/v1/subscription/update", map[string]any{"id": id, "genConfig": editable}, nil)
+		checkSafeDownload(id, overseasGroup)
+	}
 
-	var editable struct {
-		GenConfig proxykit.GeneratorConfig `json:"genConfig"`
-	}
-	mustAPI(t, router, admin, "/api/v1/subscription/get", map[string]any{"id": id}, &editable)
-	if !slices.Equal(editable.GenConfig.Rules, standard.Rules) {
-		t.Fatal("the editor should load the upgraded rules")
-	}
+	collision := cfg
+	collision.Groups = slices.Concat(legacyGroups, []proxykit.ProxyGroupSpec{
+		{Name: overseasGroup, Type: "select", Proxies: []string{"empty child"}},
+		{Name: "empty child", Type: "select", IncludeAllNodes: true, Filter: "^missing$"},
+	})
+	id := seedLegacy(collision, 3)
+	const builtInDNS = "海外 DNS (内置)"
+	checkSafeDownload(id, builtInDNS)
+	editable := loadEditor(id)
+	editable.BaseConfig = standard.BaseConfig // Simulate the editor's fill-default action.
+	mustAPI(t, router, admin, "/api/v1/subscription/update", map[string]any{"id": id, "genConfig": editable}, nil)
+	checkSafeDownload(id, builtInDNS)
 
 	// Users can explicitly save even the previous default as their own rules.
+	cfg.Rules = legacyRules
 	mustAPI(t, router, admin, "/api/v1/subscription/update", map[string]any{"id": id, "genConfig": cfg}, nil)
 	checkDownload(id, legacyRules)
+	if g := loadEditor(id).Groups[ai]; !slices.Equal(g.Proxies, legacyGroups[ai].Proxies) {
+		t.Fatalf("explicitly saved AI group was migrated: %+v", g)
+	}
 	checkDownload(seedLegacy(cfg, 2), legacyRules)
 
 	cfg.Rules = append([]string{"DOMAIN,claude.ai,DIRECT"}, legacyRules...)
 	checkDownload(seedLegacy(cfg, 0), cfg.Rules)
 
-	cfg.Rules = slices.Delete(slices.Clone(standard.Rules), asnIndex, asnIndex+1)
-	id = seedLegacy(cfg, 2)
-	checkDownload(id, standard.Rules)
-	mustAPI(t, router, admin, "/api/v1/subscription/update", map[string]any{"id": id, "genConfig": cfg}, nil)
-	checkDownload(id, cfg.Rules)
-
-	cfg.Rules = append([]string{"DOMAIN,claude.ai,DIRECT"}, cfg.Rules...)
+	cfg.Rules = append([]string{"DOMAIN,claude.ai,DIRECT"}, v2Rules...)
 	checkDownload(seedLegacy(cfg, 2), cfg.Rules)
 }
 
