@@ -44,6 +44,7 @@ type subFileView struct {
 	CreatedTime  int64                      `json:"createdTime"`
 	UpdatedTime  int64                      `json:"updatedTime"`
 	NodeCount    int                        `json:"nodeCount"`
+	IPv4Only     bool                       `json:"ipv4Only,omitempty"`
 	GenConfig    *proxykit.GeneratorConfig  `json:"genConfig,omitempty"`
 	Content      string                     `json:"content,omitempty"`
 }
@@ -57,6 +58,7 @@ func subFileToView(s model.SubFile, withContent bool) subFileView {
 	}
 	if s.Type == subTypeGenerate {
 		if cfg, err := decodeGenConfig(s.GenConfig); err == nil {
+			v.IPv4Only = cfg.IPv4Only
 			if withContent {
 				v.GenConfig = &cfg
 			}

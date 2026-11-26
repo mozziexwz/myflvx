@@ -203,6 +203,7 @@ export interface Subscription {
   createdTime: number;
   updatedTime: number;
   nodeCount: number;
+  ipv4Only?: boolean;
   genConfig?: GeneratorConfig;
   content?: string;
 }

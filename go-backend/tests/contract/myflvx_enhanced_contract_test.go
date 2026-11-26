@@ -294,6 +294,35 @@ func TestMyflvxSubscriptionsArePerUser(t *testing.T) {
 	}
 }
 
+func TestMyflvxSubscriptionListSummarizesIPv4Only(t *testing.T) {
+	const secret = "myflvx-sub-summary-secret"
+	router, _ := setupContractRouter(t, secret)
+	admin := tokenFor(t, 1, "admin_user", 0, secret)
+
+	mustAPI(t, router, admin, "/api/v1/proxy-node/import", map[string]any{"content": testShareLinks}, nil)
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	mustAPI(t, router, admin, "/api/v1/subscription/create", map[string]any{
+		"name": "IPv4-only", "type": "generate",
+		"genConfig": map[string]any{"allNodes": true, "template": "minimal", "ipv4Only": true},
+	}, &created)
+
+	var summaries []struct {
+		ID        int64           `json:"id"`
+		IPv4Only  bool            `json:"ipv4Only"`
+		GenConfig json.RawMessage `json:"genConfig"`
+		Content   json.RawMessage `json:"content"`
+	}
+	mustAPI(t, router, admin, "/api/v1/subscription/list", nil, &summaries)
+	if len(summaries) != 1 || summaries[0].ID != created.ID || !summaries[0].IPv4Only {
+		t.Fatalf("want an IPv4-only summary for subscription %d, got %+v", created.ID, summaries)
+	}
+	if summaries[0].GenConfig != nil || summaries[0].Content != nil {
+		t.Fatal("subscription summary must omit genConfig and content")
+	}
+}
+
 func TestMyflvxClaudeRouting(t *testing.T) {
 	secret := "myflvx-claude-secret"
 	router, r := setupContractRouter(t, secret)

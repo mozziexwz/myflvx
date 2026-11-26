@@ -109,7 +109,7 @@ function SubscriptionBadges({ item }: { item: Subscription }) {
       >
         {typeLabel(item.type)}
       </Chip>
-      {item.genConfig?.ipv4Only && (
+      {(item.ipv4Only || item.genConfig?.ipv4Only) && (
         <Chip
           className="bg-default-100 text-default-600"
           size="sm"
@@ -934,7 +934,7 @@ export default function SubscriptionPage() {
                     }
                   />
                   <LabeledSwitch
-                    description="停用后不在「订阅下载」页显示"
+                    description="停用后不可下载"
                     isSelected={form.enabled}
                     label="启用"
                     onValueChange={(v) =>

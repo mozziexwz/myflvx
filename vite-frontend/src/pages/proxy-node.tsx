@@ -9,7 +9,7 @@ import {
   SortableContext,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
-import { ArrowRight, Ellipsis, Search } from "lucide-react";
+import { ArrowRight, CornerDownRight, Ellipsis, Search } from "lucide-react";
 
 import { AnimatedPage } from "@/components/animated-page";
 import {
@@ -72,6 +72,7 @@ import {
   type RelayCandidate,
 } from "@/api/enhanced";
 import { useLocalStorageState } from "@/hooks/use-local-storage-state";
+import { cn } from "@/lib/utils";
 import { isAdmin } from "@/utils/auth";
 import {
   copyText,
@@ -232,39 +233,55 @@ export default function ProxyNodePage() {
     });
   }, [nodes, keyword, tagFilter, sourceFilter, tunnelFilter]);
 
-  const { displayNodes, rootIds, relaysByParent, relayParents } =
-    useMemo(() => {
-      const visibleSourceIds = new Set(
-        filteredNodes
-          .filter((node) => node.source !== "relay")
-          .map((node) => node.id),
-      );
-      const roots: ProxyNode[] = [];
-      const relaysByParent = new Map<number, ProxyNode[]>();
-      const relayParents = new Map<number, number>();
+  const {
+    displayNodes,
+    rootIds,
+    relaysByParent,
+    relayParents,
+    lastRelayIds,
+    relayCounts,
+  } = useMemo(() => {
+    const visibleSourceIds = new Set(
+      filteredNodes
+        .filter((node) => node.source !== "relay")
+        .map((node) => node.id),
+    );
+    const roots: ProxyNode[] = [];
+    const relaysByParent = new Map<number, ProxyNode[]>();
+    const relayParents = new Map<number, number>();
 
-      for (const node of filteredNodes) {
-        if (node.source === "relay" && visibleSourceIds.has(node.parentId)) {
-          const relays = relaysByParent.get(node.parentId) ?? [];
+    for (const node of filteredNodes) {
+      if (node.source === "relay" && visibleSourceIds.has(node.parentId)) {
+        const relays = relaysByParent.get(node.parentId) ?? [];
 
-          relays.push(node);
-          relaysByParent.set(node.parentId, relays);
-          relayParents.set(node.id, node.parentId);
-        } else {
-          roots.push(node);
-        }
+        relays.push(node);
+        relaysByParent.set(node.parentId, relays);
+        relayParents.set(node.id, node.parentId);
+      } else {
+        roots.push(node);
       }
+    }
 
-      return {
-        displayNodes: roots.flatMap((node) => [
-          node,
-          ...(relaysByParent.get(node.id) ?? []),
-        ]),
-        rootIds: roots.map((node) => node.id),
-        relaysByParent,
-        relayParents,
-      };
-    }, [filteredNodes]);
+    const lastRelayIds = new Set<number>();
+    const relayCounts = new Map<number, number>();
+
+    for (const [parentId, relays] of relaysByParent) {
+      lastRelayIds.add(relays[relays.length - 1].id);
+      relayCounts.set(parentId, relays.length);
+    }
+
+    return {
+      displayNodes: roots.flatMap((node) => [
+        node,
+        ...(relaysByParent.get(node.id) ?? []),
+      ]),
+      rootIds: roots.map((node) => node.id),
+      relaysByParent,
+      relayParents,
+      lastRelayIds,
+      relayCounts,
+    };
+  }, [filteredNodes]);
 
   const allFilteredSelected =
     filteredNodes.length > 0 && filteredNodes.every((n) => selected.has(n.id));
@@ -869,6 +886,8 @@ export default function ProxyNodePage() {
                 <TableBody items={displayNodes}>
                   {(node: ProxyNode) => {
                     const nested = relayParents.has(node.id);
+                    const isLastRelay = lastRelayIds.has(node.id);
+                    const relayCount = relayCounts.get(node.id) ?? 0;
                     const address = hostPort(node.server, node.port);
                     const connection = (
                       <span
@@ -905,10 +924,29 @@ export default function ProxyNodePage() {
                     );
 
                     return (
-                      <SortableTableRow id={node.id}>
+                      <SortableTableRow
+                        className={cn(
+                          nested &&
+                            "bg-default-50/85 hover:bg-default-100/70 dark:bg-default-100/25 dark:hover:bg-default-100/40",
+                          isLastRelay && "border-b-divider",
+                          ((nested && !isLastRelay) || relayCount > 0) &&
+                            "border-b-divider/40",
+                        )}
+                        id={node.id}
+                      >
                         {(handle) => (
                           <>
-                            <TableCell className="px-1">
+                            <TableCell
+                              className={cn(
+                                "px-1",
+                                nested &&
+                                  "relative before:pointer-events-none before:absolute before:top-0 before:left-0 before:w-[3px] before:bg-primary/65 dark:before:bg-primary/75",
+                                nested &&
+                                  (isLastRelay
+                                    ? "before:bottom-0"
+                                    : "before:-bottom-px"),
+                              )}
+                            >
                               <div className="flex items-center gap-0.5 sm:gap-1">
                                 <Checkbox
                                   aria-label={`选择${node.name}`}
@@ -924,13 +962,15 @@ export default function ProxyNodePage() {
                             <TableCell>
                               <div
                                 className={
-                                  nested ? "relative pl-3 sm:pl-4" : undefined
+                                  nested ? "relative pl-5 sm:pl-6" : undefined
                                 }
                               >
                                 {nested && (
-                                  <span
+                                  <CornerDownRight
                                     aria-hidden="true"
-                                    className="absolute left-0 top-0 h-3 w-2 rounded-bl-sm border-b border-l border-divider"
+                                    className="absolute left-0 top-0.5 text-primary-500 dark:text-primary-400"
+                                    size={15}
+                                    strokeWidth={2.25}
                                   />
                                 )}
                                 <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
@@ -941,18 +981,35 @@ export default function ProxyNodePage() {
                                     {node.name}
                                   </span>
                                   <Chip
-                                    className="h-5 bg-default-100 text-[10px] text-default-600"
+                                    className={cn(
+                                      "h-5 text-[10px]",
+                                      node.source === "relay"
+                                        ? "bg-primary-50 text-primary-700 dark:bg-primary-500/15 dark:text-primary-300"
+                                        : "bg-default-100 text-default-600",
+                                    )}
                                     size="sm"
                                     variant="flat"
                                   >
                                     {sourceLabel(node.source)}
                                   </Chip>
+                                  {!nested && relayCount > 0 && (
+                                    <span className="whitespace-nowrap text-[11px] font-medium text-primary-600 dark:text-primary-400">
+                                      {relayCount} 条中转
+                                    </span>
+                                  )}
                                 </div>
                                 {node.source === "relay" && (
                                   <div className="mt-0.5 break-words text-xs text-default-500">
-                                    {!nested &&
-                                      `源节点：${node.parentName || "-"} · `}
-                                    隧道：{node.tunnelName || "-"}
+                                    {nested ? (
+                                      <>
+                                        经由隧道：
+                                        <span className="font-medium text-default-700">
+                                          {node.tunnelName || "-"}
+                                        </span>
+                                      </>
+                                    ) : (
+                                      `源节点：${node.parentName || "-"} · 隧道：${node.tunnelName || "-"}`
+                                    )}
                                     {node.relayStatus === "forward_missing" && (
                                       <span className="ml-1 text-danger">
                                         （转发已删除）
