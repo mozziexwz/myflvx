@@ -18,7 +18,6 @@ import { SettingsPage } from "@/pages/settings";
 import ProxyNodePage from "@/pages/proxy-node";
 import SubscriptionPage from "@/pages/subscription";
 import SubGeneratorPage from "@/pages/sub-generator";
-import SubDownloadPage from "@/pages/sub-download";
 import DeployPage from "@/pages/deploy";
 import AdminLayout from "@/layouts/admin";
 import H5Layout from "@/layouts/h5";
@@ -247,11 +246,7 @@ function App() {
         path="/sub-generator"
       />
       <Route
-        element={
-          <ProtectedRoute>
-            <SubDownloadPage />
-          </ProtectedRoute>
-        }
+        element={<Navigate replace to="/subscription" />}
         path="/sub-download"
       />
       <Route element={<SettingsPage />} path="/settings" />

@@ -6,6 +6,7 @@ import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom";
 import { DndContext, closestCenter } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
+import { Ellipsis } from "lucide-react";
 
 import { AnimatedPage } from "@/components/animated-page";
 import {
@@ -21,8 +22,15 @@ import { PageLoadingState } from "@/components/page-state";
 import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
 import { SelectableCard } from "@/components/selectable-card";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Card, CardBody, CardHeader } from "@/shadcn-bridge/heroui/card";
 import { Button } from "@/shadcn-bridge/heroui/button";
+import {
+  Dropdown,
+  DropdownMenu,
+  DropdownMenuSeparator,
+  DropdownTrigger,
+} from "@/shadcn-bridge/heroui/dropdown";
 import { Input } from "@/shadcn-bridge/heroui/input";
 import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
 import { Checkbox } from "@/shadcn-bridge/heroui/checkbox";
@@ -704,22 +712,7 @@ export default function DeployPage() {
     <AnimatedPage className="px-3 lg:px-6 py-8 space-y-4">
       <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
         <PageIntro
-          className=""
-          description={
-            <>
-              选择一台或多台 FLVX 节点，由面板通过节点端执行{" "}
-              <a
-                className="text-primary"
-                href="https://github.com/mozziexwz/mihomo_script"
-                rel="noreferrer"
-                target="_blank"
-              >
-                mihomo_script
-              </a>
-              ，一键部署 Shadowsocks 2022 / mieru /
-              Sudoku，不需要登录服务器。部署完成后自动在「代理节点」生成节点；部署参数可以复制到其他节点。仅管理员可用。
-            </>
-          }
+          description="在 FLVX 节点上一键部署 SS 2022、mieru 或 Sudoku，并自动生成代理节点。"
           title="部署节点"
         />
         <div className="flex shrink-0 flex-wrap gap-2">
@@ -816,16 +809,29 @@ export default function DeployPage() {
                                 {item.host || "-"}
                               </span>
                             </InfoRow>
-                            {item.protocols.map((proto) => (
-                              <InfoRow
-                                key={proto}
-                                label={PROTOCOL_NAMES[proto] || proto}
-                              >
-                                <span className="font-mono">
-                                  {protocolPort(item.params, proto) || "-"}
-                                </span>
-                              </InfoRow>
-                            ))}
+                            <InfoRow label="协议">
+                              <span className="flex flex-wrap justify-end gap-1">
+                                {item.protocols.map((proto) => {
+                                  const name = PROTOCOL_NAMES[proto] || proto;
+                                  const port =
+                                    protocolPort(item.params, proto) || "-";
+
+                                  return (
+                                    <Chip
+                                      key={proto}
+                                      className="grid justify-items-center rounded-md bg-default-100 px-1 py-0.5 text-[10px] leading-tight text-default-700"
+                                      size="sm"
+                                      title={`${name}:${port}`}
+                                      variant="flat"
+                                    >
+                                      <span>{name}</span>
+                                      <span className="font-mono">{port}</span>
+                                    </Chip>
+                                  );
+                                })}
+                                {item.protocols.length === 0 && "-"}
+                              </span>
+                            </InfoRow>
                             <InfoRow label="代理节点">
                               {item.proxyNodes} 个
                             </InfoRow>
@@ -845,116 +851,94 @@ export default function DeployPage() {
                               </div>
                             )}
                           </div>
-                          <div className="mt-auto space-y-1.5">
-                            <div className="grid grid-cols-3 gap-1.5">
-                              <Button
-                                className="min-h-8"
-                                color="success"
-                                isDisabled={running || noNode}
-                                isLoading={busy}
-                                size="sm"
-                                variant="flat"
-                                onPress={() => runOp(item, "install")}
-                              >
-                                {item.status === "pending"
-                                  ? "部署"
-                                  : "重新部署"}
-                              </Button>
-                              <Button
-                                className="min-h-8"
-                                color="warning"
-                                isDisabled={running || busy || noNode}
-                                size="sm"
-                                title="读取服务器上的部署状态并更新代理节点"
-                                variant="flat"
-                                onPress={() => runOp(item, "info")}
-                              >
-                                刷新
-                              </Button>
-                              <Button
-                                className="min-h-8"
-                                color="secondary"
-                                size="sm"
-                                variant="flat"
-                                onPress={() => {
-                                  setLogItem(item);
-                                  setLogId(item.id);
-                                }}
-                              >
-                                日志
-                              </Button>
-                            </div>
-                            <div className="grid grid-cols-3 gap-1.5">
-                              <Button
-                                className="min-h-8"
-                                color="primary"
-                                isDisabled={running}
-                                size="sm"
-                                title="编辑部署参数"
-                                variant="flat"
-                                onPress={() => openEdit(item)}
-                              >
-                                编辑
-                              </Button>
-                              <Button
-                                className="min-h-8"
-                                color="primary"
-                                isDisabled={running}
-                                size="sm"
-                                title="把部署参数复制到其他节点"
-                                variant="flat"
-                                onPress={() => openCopy(item)}
-                              >
-                                复制
-                              </Button>
-                              <Button
-                                className="min-h-8"
-                                color="warning"
-                                isDisabled={
-                                  running ||
-                                  noNode ||
-                                  item.status === "uninstalled"
-                                }
-                                size="sm"
-                                variant="flat"
-                                onPress={() => setUninstallItem(item)}
-                              >
-                                卸载
-                              </Button>
-                            </div>
-                            <div className="grid grid-cols-3 gap-1.5">
-                              <Button
-                                className="min-h-8"
-                                size="sm"
-                                title="按部署参数重新生成代理节点"
-                                variant="flat"
-                                onPress={() => generateNodes(item)}
-                              >
-                                生成节点
-                              </Button>
-                              <Button
-                                className="min-h-8"
-                                size="sm"
-                                title="复制手动安装命令（用于未接入面板的服务器）"
-                                variant="flat"
-                                onPress={() => openCommand(item)}
-                              >
-                                安装命令
-                              </Button>
-                              <Button
-                                className="min-h-8"
-                                color="danger"
-                                isDisabled={running}
-                                size="sm"
-                                variant="flat"
-                                onPress={() => {
-                                  setDeleteNodes(true);
-                                  setDeleteItem(item);
-                                }}
-                              >
-                                删除
-                              </Button>
-                            </div>
+                          <div className="mt-auto flex gap-1.5">
+                            <Button
+                              className="h-8 min-w-0 flex-1 px-2"
+                              color="success"
+                              isDisabled={running || noNode}
+                              isLoading={busy}
+                              size="sm"
+                              variant="flat"
+                              onPress={() => runOp(item, "install")}
+                            >
+                              {item.status === "pending" ? "部署" : "重新部署"}
+                            </Button>
+                            <Button
+                              className="h-8 px-2"
+                              size="sm"
+                              variant="flat"
+                              onPress={() => {
+                                setLogItem(item);
+                                setLogId(item.id);
+                              }}
+                            >
+                              日志
+                            </Button>
+                            <Dropdown placement="bottom-end">
+                              <DropdownTrigger>
+                                <Button
+                                  isIconOnly
+                                  aria-label={`${item.name}的更多操作`}
+                                  className="size-8"
+                                  title="更多操作"
+                                  variant="flat"
+                                >
+                                  <Ellipsis size={16} />
+                                </Button>
+                              </DropdownTrigger>
+                              <DropdownMenu>
+                                <DropdownMenuItem
+                                  disabled={running}
+                                  onSelect={() => openEdit(item)}
+                                >
+                                  编辑参数
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  disabled={running || busy || noNode}
+                                  onSelect={() => runOp(item, "info")}
+                                >
+                                  刷新状态
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  disabled={running}
+                                  onSelect={() => openCopy(item)}
+                                >
+                                  复制到其他节点
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onSelect={() => generateNodes(item)}
+                                >
+                                  重新生成节点
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onSelect={() => openCommand(item)}
+                                >
+                                  复制手动安装命令
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  className="text-warning focus:text-warning"
+                                  disabled={
+                                    running ||
+                                    noNode ||
+                                    item.status === "uninstalled"
+                                  }
+                                  onSelect={() => setUninstallItem(item)}
+                                >
+                                  卸载服务
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  className="text-danger focus:text-danger"
+                                  disabled={running}
+                                  onSelect={() => {
+                                    setDeleteNodes(true);
+                                    setDeleteItem(item);
+                                  }}
+                                >
+                                  删除记录
+                                </DropdownMenuItem>
+                              </DropdownMenu>
+                            </Dropdown>
                           </div>
                         </CardBody>
                       </Card>

@@ -32,7 +32,7 @@ interface MenuItem {
   icon: React.ReactNode;
   color: string;
   description: string;
-  // myflvx: shown to every user (代理节点 / 订阅管理 / 生成订阅)
+  // 代理节点和订阅管理向所有用户开放
   allUsers?: boolean;
 }
 
@@ -96,18 +96,6 @@ export default function ProfilePage() {
       color:
         "bg-amber-100 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400",
       description: "上传、导入与管理订阅",
-      allUsers: true,
-    },
-    {
-      path: "/sub-generator",
-      label: "生成订阅",
-      icon: (
-        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-          <path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z" />
-        </svg>
-      ),
-      color: "bg-lime-100 dark:bg-lime-500/20 text-lime-600 dark:text-lime-400",
-      description: "从节点生成订阅",
       allUsers: true,
     },
     {
@@ -300,7 +288,7 @@ export default function ProfilePage() {
         <Card className="border border-gray-200 dark:border-default-200 shadow-md hover:shadow-lg transition-shadow">
           <CardBody className="p-4">
             <div className="grid grid-cols-3 gap-3">
-              {/* 管理员功能；代理节点 / 订阅管理 / 生成订阅所有用户可用 */}
+              {/* 按权限显示功能 */}
               {adminMenuItems
                 .filter((item) => isAdmin || item.allUsers)
                 .map((item) => (
@@ -319,29 +307,6 @@ export default function ProfilePage() {
                     </span>
                   </button>
                 ))}
-
-              {/* 订阅下载（所有用户） */}
-              <button
-                className="flex flex-col items-center p-3 rounded-2xl bg-gray-50 dark:bg-default-100 hover:bg-gray-100 dark:hover:bg-default-200 transition-colors duration-200"
-                onClick={() => navigate("/sub-download")}
-              >
-                <div className="w-10 h-10 bg-emerald-100 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 rounded-full flex items-center justify-center mb-2">
-                  <svg
-                    className="w-5 h-5"
-                    fill="currentColor"
-                    viewBox="0 0 20 20"
-                  >
-                    <path
-                      clipRule="evenodd"
-                      d="M6 2a2 2 0 00-2 2v12a2 2 0 002 2h8a2 2 0 002-2V7.414A2 2 0 0015.414 6L12 2.586A2 2 0 0010.586 2H6zm5 6a1 1 0 10-2 0v3.586l-1.293-1.293a1 1 0 10-1.414 1.414l3 3a1 1 0 001.414 0l3-3a1 1 0 00-1.414-1.414L11 11.586V8z"
-                      fillRule="evenodd"
-                    />
-                  </svg>
-                </div>
-                <span className="text-xs text-foreground text-center">
-                  订阅下载
-                </span>
-              </button>
 
               {/* 修改密码 */}
               <button

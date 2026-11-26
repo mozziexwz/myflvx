@@ -1,7 +1,7 @@
 import type { UserTunnelApiItem } from "@/api/types";
 import type { DragEndEvent } from "@dnd-kit/core";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import toast from "react-hot-toast";
 import { useNavigate } from "react-router-dom";
 import { DndContext, closestCenter } from "@dnd-kit/core";
@@ -9,6 +9,7 @@ import {
   SortableContext,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
+import { ArrowRight, Ellipsis, Search } from "lucide-react";
 
 import { AnimatedPage } from "@/components/animated-page";
 import {
@@ -20,12 +21,17 @@ import {
   reorderIds,
   useSortSensors,
 } from "@/components/sortable";
-import { SearchBar } from "@/components/search-bar";
 import { PageLoadingState } from "@/components/page-state";
 import { PageIntro } from "@/components/page-intro";
 import { LabeledSwitch } from "@/components/labeled-switch";
+import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { Card, CardBody } from "@/shadcn-bridge/heroui/card";
 import { Button } from "@/shadcn-bridge/heroui/button";
+import {
+  Dropdown,
+  DropdownMenu,
+  DropdownTrigger,
+} from "@/shadcn-bridge/heroui/dropdown";
 import { Input, Textarea } from "@/shadcn-bridge/heroui/input";
 import { Select, SelectItem } from "@/shadcn-bridge/heroui/select";
 import { Switch } from "@/shadcn-bridge/heroui/switch";
@@ -87,19 +93,6 @@ const modalClassNames = {
   base: "!w-[calc(100%-32px)] !mx-auto sm:!w-full rounded-2xl overflow-hidden",
 };
 
-const sourceColor = (source: string) => {
-  switch (source) {
-    case "deploy":
-      return "success" as const;
-    case "relay":
-      return "secondary" as const;
-    case "import":
-      return "primary" as const;
-    default:
-      return "default" as const;
-  }
-};
-
 interface EditForm {
   id?: number;
   name: string;
@@ -130,7 +123,6 @@ export default function ProxyNodePage() {
   const [allTags, setAllTags] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [keyword, setKeyword] = useLocalStorageState("proxy-node-keyword", "");
-  const [searchVisible, setSearchVisible] = useState(false);
   const [tagFilter, setTagFilter] = useLocalStorageState("proxy-node-tag", "");
   const [sourceFilter, setSourceFilter] = useLocalStorageState(
     "proxy-node-source",
@@ -239,6 +231,40 @@ export default function ProxyNodePage() {
       );
     });
   }, [nodes, keyword, tagFilter, sourceFilter, tunnelFilter]);
+
+  const { displayNodes, rootIds, relaysByParent, relayParents } =
+    useMemo(() => {
+      const visibleSourceIds = new Set(
+        filteredNodes
+          .filter((node) => node.source !== "relay")
+          .map((node) => node.id),
+      );
+      const roots: ProxyNode[] = [];
+      const relaysByParent = new Map<number, ProxyNode[]>();
+      const relayParents = new Map<number, number>();
+
+      for (const node of filteredNodes) {
+        if (node.source === "relay" && visibleSourceIds.has(node.parentId)) {
+          const relays = relaysByParent.get(node.parentId) ?? [];
+
+          relays.push(node);
+          relaysByParent.set(node.parentId, relays);
+          relayParents.set(node.id, node.parentId);
+        } else {
+          roots.push(node);
+        }
+      }
+
+      return {
+        displayNodes: roots.flatMap((node) => [
+          node,
+          ...(relaysByParent.get(node.id) ?? []),
+        ]),
+        rootIds: roots.map((node) => node.id),
+        relaysByParent,
+        relayParents,
+      };
+    }, [filteredNodes]);
 
   const allFilteredSelected =
     filteredNodes.length > 0 && filteredNodes.every((n) => selected.has(n.id));
@@ -414,27 +440,49 @@ export default function ProxyNodePage() {
   // ─── 拖拽排序 ─────────────────────────────────────────────
 
   const sortSensors = useSortSensors();
+  const sorting = useRef(false);
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const ids = draggedIds(event);
 
-    if (!ids) return;
+    if (!ids || sorting.current) return;
+    const [activeId, overId] = ids;
+    const activeParent = relayParents.get(activeId);
+    const overParent = relayParents.get(overId);
+    // 源节点按组移动，组内的中转节点可单独调整顺序。
+    const sortableIds =
+      activeParent === undefined
+        ? rootIds
+        : (relaysByParent.get(activeParent) ?? []).map((node) => node.id);
+    const previousOrder = nodes.map((node) => node.id);
     const order = reorderIds(
-      nodes.map((n) => n.id),
-      filteredNodes.map((n) => n.id),
-      ids[0],
-      ids[1],
+      previousOrder,
+      sortableIds,
+      activeId,
+      activeParent === undefined ? (overParent ?? overId) : overId,
     );
 
     if (!order) return;
-    const previous = nodes;
-
+    sorting.current = true;
     setNodes(applyOrder(nodes, order));
-    const res = await updateProxyNodeOrder(orderItems(order));
+    try {
+      const res = await updateProxyNodeOrder(orderItems(order));
 
-    if (res.code !== 0) {
-      toast.error(res.msg || "保存排序失败");
-      setNodes(previous);
+      if (res.code !== 0) {
+        toast.error(res.msg || "保存排序失败");
+        const previousIds = new Set(previousOrder);
+
+        setNodes((current) =>
+          applyOrder(current, [
+            ...previousOrder,
+            ...current
+              .filter((node) => !previousIds.has(node.id))
+              .map((node) => node.id),
+          ]),
+        );
+      }
+    } finally {
+      sorting.current = false;
     }
   };
 
@@ -616,28 +664,25 @@ export default function ProxyNodePage() {
   return (
     <AnimatedPage className="px-3 lg:px-6 py-8">
       <PageIntro
-        description={
-          <>
-            管理你自己的代理节点：粘贴分享链接新增、从机场订阅导入，或在节点上点「隧道中转」，
-            面板会通过隧道自动创建转发并生成中转节点。节点只有你自己能看到，可在「生成订阅」中使用。
-            {admin && "「部署节点」生成的节点也会出现在这里。"}
-          </>
-        }
+        description="中转节点按源节点归组。勾选节点可直接生成订阅。"
         title="代理节点"
       />
       <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between mb-4 gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <SearchBar
-            isVisible={searchVisible}
+          <Input
+            aria-label="搜索代理节点"
+            classNames={{ base: "w-full sm:w-56", inputWrapper: "bg-card" }}
             placeholder="搜索名称 / 地址 / 协议"
+            size="sm"
+            startContent={<Search aria-hidden="true" size={14} />}
+            type="search"
             value={keyword}
-            onChange={setKeyword}
-            onClose={() => setSearchVisible(false)}
-            onOpen={() => setSearchVisible(true)}
+            variant="bordered"
+            onChange={(event) => setKeyword(event.target.value)}
           />
-          <div className="w-36">
+          <div className="w-28 [&_label]:sr-only">
             <Select
-              aria-label="标签筛选"
+              label="标签筛选"
               placeholder="全部标签"
               selectedKeys={tagFilter ? [tagFilter] : []}
               size="sm"
@@ -648,9 +693,9 @@ export default function ProxyNodePage() {
               ))}
             </Select>
           </div>
-          <div className="w-32">
+          <div className="w-28 [&_label]:sr-only">
             <Select
-              aria-label="来源筛选"
+              label="来源筛选"
               placeholder="全部来源"
               selectedKeys={sourceFilter ? [sourceFilter] : []}
               size="sm"
@@ -661,9 +706,9 @@ export default function ProxyNodePage() {
               ))}
             </Select>
           </div>
-          <div className="w-36">
+          <div className="w-28 [&_label]:sr-only">
             <Select
-              aria-label="隧道筛选"
+              label="隧道筛选"
               placeholder="全部隧道"
               selectedKeys={tunnelFilter ? [tunnelFilter] : []}
               size="sm"
@@ -674,6 +719,20 @@ export default function ProxyNodePage() {
               ))}
             </Select>
           </div>
+          {hasFilter && (
+            <Button
+              size="sm"
+              variant="light"
+              onPress={() => {
+                setKeyword("");
+                setTagFilter("");
+                setSourceFilter("");
+                setTunnelFilter("");
+              }}
+            >
+              清除筛选
+            </Button>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {admin && (
@@ -696,10 +755,20 @@ export default function ProxyNodePage() {
 
       {selected.size > 0 && (
         <div className="mb-4 flex flex-col gap-2 rounded-xl border border-primary-200 bg-primary-50/60 px-4 py-2.5 sm:flex-row sm:items-center sm:justify-between dark:border-primary-800 dark:bg-primary-900/20">
-          <span className="text-sm font-medium text-foreground">
+          <span className="shrink-0 text-sm font-medium text-foreground">
             已选择 {selected.size} 个节点
           </span>
           <div className="flex flex-wrap items-center gap-2">
+            <Button
+              color="primary"
+              endContent={<ArrowRight aria-hidden="true" size={14} />}
+              size="sm"
+              onPress={() =>
+                navigate(`/sub-generator?nodes=${selectedIds.join(",")}`)
+              }
+            >
+              用所选生成订阅
+            </Button>
             <Button size="sm" variant="flat" onPress={() => batchToggle(true)}>
               启用
             </Button>
@@ -742,7 +811,7 @@ export default function ProxyNodePage() {
         </div>
       )}
 
-      {filteredNodes.length === 0 ? (
+      {displayNodes.length === 0 ? (
         <Card className="shadow-sm border border-gray-200 dark:border-gray-700 bg-default-50/50">
           <CardBody className="text-center py-20 flex flex-col items-center justify-center min-h-[240px]">
             <h3 className="text-xl font-medium text-foreground tracking-tight mb-2">
@@ -750,7 +819,7 @@ export default function ProxyNodePage() {
             </h3>
             <p className="text-default-500 text-sm max-w-md mx-auto leading-relaxed">
               {hasFilter
-                ? "换个关键词，或把标签 / 来源 / 隧道筛选改回「全部」。"
+                ? "换个关键词或清除筛选。"
                 : admin
                   ? "可以粘贴分享链接新增节点、从订阅导入机场节点，或在「部署节点」一键部署 Shadowsocks 2022 / mieru / Sudoku。"
                   : "可以粘贴分享链接新增节点，或从订阅导入机场节点。"}
@@ -758,158 +827,225 @@ export default function ProxyNodePage() {
           </CardBody>
         </Card>
       ) : (
-        <Card>
+        <Card className="border border-divider shadow-sm">
           <DndContext
             collisionDetection={closestCenter}
             sensors={sortSensors}
             onDragEnd={handleDragEnd}
           >
             <SortableContext
-              items={filteredNodes.map((n) => n.id)}
+              items={displayNodes.map((node) => node.id)}
               strategy={verticalListSortingStrategy}
             >
               <Table
                 aria-label="节点列表"
-                className="overflow-x-auto min-w-full"
+                className="table-fixed"
                 classNames={{
-                  th: "bg-default-100/50 text-default-600 font-semibold text-sm border-b border-divider py-3 whitespace-nowrap",
-                  td: "py-3 border-b border-divider/50 group-data-[last=true]:border-b-0",
-                  tr: "hover:bg-default-50/50 transition-colors",
+                  th: "border-b border-divider bg-default-100/50 px-1.5 py-2.5 text-xs font-semibold sm:px-2",
+                  td: "px-1.5 py-2.5 sm:px-2",
+                  tr: "border-divider/60 hover:bg-default-50/60 transition-colors",
                 }}
               >
                 <TableHeader>
-                  <TableColumn className="w-10">
+                  <TableColumn className="w-12 px-1 sm:w-16">
                     <Checkbox
+                      aria-label="选择所有筛选结果"
                       isSelected={allFilteredSelected}
                       onValueChange={toggleSelectAll}
                     />
                   </TableColumn>
-                  <TableColumn className="w-12">排序</TableColumn>
-                  <TableColumn>节点</TableColumn>
-                  <TableColumn>协议</TableColumn>
-                  <TableColumn>地址</TableColumn>
-                  <TableColumn>来源</TableColumn>
-                  <TableColumn>标签</TableColumn>
-                  <TableColumn>启用</TableColumn>
-                  <TableColumn>操作</TableColumn>
+                  <TableColumn>节点 / 中转链路</TableColumn>
+                  <TableColumn className="hidden w-[24%] lg:table-cell">
+                    协议与标签
+                  </TableColumn>
+                  <TableColumn className="hidden w-[22%] lg:table-cell">
+                    连接地址
+                  </TableColumn>
+                  <TableColumn className="w-12 px-1 sm:w-14">启用</TableColumn>
+                  <TableColumn className="w-28 px-1 text-right sm:w-36">
+                    操作
+                  </TableColumn>
                 </TableHeader>
-                <TableBody items={filteredNodes}>
-                  {(node: ProxyNode) => (
-                    <SortableTableRow id={node.id}>
-                      {(handle) => (
-                        <>
-                          <TableCell>
-                            <Checkbox
-                              isSelected={selected.has(node.id)}
-                              onValueChange={() => toggleSelect(node.id)}
-                            />
-                          </TableCell>
-                          <TableCell>
-                            <DragHandle handle={handle} />
-                          </TableCell>
-                          <TableCell>
-                            <div className="min-w-[160px]">
-                              <div className="font-medium text-sm text-foreground">
-                                {node.name}
-                              </div>
-                              {node.source === "relay" && (
-                                <div className="text-xs text-default-500 mt-0.5">
-                                  源节点：{node.parentName || "-"} · 隧道：
-                                  {node.tunnelName || "-"}
-                                  {node.relayStatus === "forward_missing" && (
-                                    <span className="text-danger ml-1">
-                                      （转发已删除）
-                                    </span>
-                                  )}
-                                </div>
-                              )}
-                              {node.remark && (
-                                <div className="text-xs text-default-400 mt-0.5">
-                                  {node.remark}
-                                </div>
-                              )}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <Chip size="sm" variant="flat">
-                              {protocolLabel(node.protocol)}
-                            </Chip>
-                          </TableCell>
-                          <TableCell>
-                            <span className="font-mono text-xs text-default-600 whitespace-nowrap">
-                              {hostPort(node.server, node.port)}
+                <TableBody items={displayNodes}>
+                  {(node: ProxyNode) => {
+                    const nested = relayParents.has(node.id);
+                    const address = hostPort(node.server, node.port);
+                    const connection = (
+                      <span
+                        className="block truncate font-mono text-xs text-default-600"
+                        title={address}
+                      >
+                        {address}
+                      </span>
+                    );
+                    const protocolAndTags = (
+                      <div className="flex flex-wrap gap-1">
+                        <Chip
+                          className="h-5 max-w-full border-divider font-mono text-[11px] text-default-700"
+                          size="sm"
+                          variant="bordered"
+                        >
+                          <span className="block truncate">
+                            {protocolLabel(node.protocol)}
+                          </span>
+                        </Chip>
+                        {node.tags.map((tag) => (
+                          <Chip
+                            key={tag}
+                            className="h-5 max-w-full bg-default-100 text-[11px] text-default-600"
+                            size="sm"
+                            variant="flat"
+                          >
+                            <span className="block truncate" title={tag}>
+                              {tag}
                             </span>
-                          </TableCell>
-                          <TableCell>
-                            <Chip
-                              color={sourceColor(node.source)}
-                              size="sm"
-                              variant="flat"
-                            >
-                              {sourceLabel(node.source)}
-                            </Chip>
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex flex-wrap gap-1 max-w-[180px]">
-                              {node.tags.map((t) => (
-                                <Chip key={t} size="sm" variant="flat">
-                                  {t}
-                                </Chip>
-                              ))}
-                            </div>
-                          </TableCell>
-                          <TableCell>
-                            <Switch
-                              isSelected={node.enabled}
-                              size="sm"
-                              onValueChange={(v) => toggleOne(node, v)}
-                            />
-                          </TableCell>
-                          <TableCell>
-                            <div className="flex flex-wrap items-center gap-1.5 min-w-max">
-                              <Button
-                                className="h-6 px-2 min-w-0 text-xs"
-                                isDisabled={!node.shareLink}
-                                size="sm"
-                                variant="flat"
-                                onPress={() =>
-                                  copyText(node.shareLink, "分享链接")
+                          </Chip>
+                        ))}
+                      </div>
+                    );
+
+                    return (
+                      <SortableTableRow id={node.id}>
+                        {(handle) => (
+                          <>
+                            <TableCell className="px-1">
+                              <div className="flex items-center gap-0.5 sm:gap-1">
+                                <Checkbox
+                                  aria-label={`选择${node.name}`}
+                                  isSelected={selected.has(node.id)}
+                                  onValueChange={() => toggleSelect(node.id)}
+                                />
+                                <DragHandle
+                                  className="shrink-0 p-0.5 sm:p-1"
+                                  handle={handle}
+                                />
+                              </div>
+                            </TableCell>
+                            <TableCell>
+                              <div
+                                className={
+                                  nested ? "relative pl-3 sm:pl-4" : undefined
                                 }
                               >
-                                复制链接
-                              </Button>
-                              {node.source !== "relay" && (
+                                {nested && (
+                                  <span
+                                    aria-hidden="true"
+                                    className="absolute left-0 top-0 h-3 w-2 rounded-bl-sm border-b border-l border-divider"
+                                  />
+                                )}
+                                <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
+                                  <span
+                                    className="truncate text-sm font-medium text-foreground"
+                                    title={node.name}
+                                  >
+                                    {node.name}
+                                  </span>
+                                  <Chip
+                                    className="h-5 bg-default-100 text-[10px] text-default-600"
+                                    size="sm"
+                                    variant="flat"
+                                  >
+                                    {sourceLabel(node.source)}
+                                  </Chip>
+                                </div>
+                                {node.source === "relay" && (
+                                  <div className="mt-0.5 break-words text-xs text-default-500">
+                                    {!nested &&
+                                      `源节点：${node.parentName || "-"} · `}
+                                    隧道：{node.tunnelName || "-"}
+                                    {node.relayStatus === "forward_missing" && (
+                                      <span className="ml-1 text-danger">
+                                        （转发已删除）
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                                {node.remark && (
+                                  <div
+                                    className="mt-0.5 truncate text-xs text-default-500"
+                                    title={node.remark}
+                                  >
+                                    {node.remark}
+                                  </div>
+                                )}
+                                <div className="mt-1 space-y-1 lg:hidden">
+                                  {connection}
+                                  {protocolAndTags}
+                                </div>
+                              </div>
+                            </TableCell>
+                            <TableCell className="hidden lg:table-cell">
+                              {protocolAndTags}
+                            </TableCell>
+                            <TableCell className="hidden lg:table-cell">
+                              {connection}
+                            </TableCell>
+                            <TableCell className="px-1">
+                              <Switch
+                                aria-label={`启用${node.name}`}
+                                isSelected={node.enabled}
+                                size="sm"
+                                onValueChange={(value) =>
+                                  toggleOne(node, value)
+                                }
+                              />
+                            </TableCell>
+                            <TableCell className="px-1">
+                              <div className="flex flex-wrap items-center justify-end gap-1">
+                                {node.source !== "relay" && (
+                                  <Button
+                                    className="h-7 px-1 text-xs sm:px-2"
+                                    size="sm"
+                                    variant="flat"
+                                    onPress={() => openRelay(node)}
+                                  >
+                                    中转
+                                  </Button>
+                                )}
                                 <Button
-                                  className="h-6 px-2 min-w-0 text-xs bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/30 dark:text-emerald-400"
+                                  className="h-7 px-1 text-xs sm:px-2"
+                                  isDisabled={!node.shareLink}
                                   size="sm"
+                                  title="复制分享链接"
                                   variant="flat"
-                                  onPress={() => openRelay(node)}
+                                  onPress={() =>
+                                    copyText(node.shareLink, "分享链接")
+                                  }
                                 >
-                                  隧道中转
+                                  链接
                                 </Button>
-                              )}
-                              <Button
-                                className="h-6 px-2 min-w-0 text-xs bg-indigo-50 text-indigo-600 hover:bg-indigo-100 dark:bg-indigo-950/30 dark:text-indigo-400"
-                                size="sm"
-                                variant="flat"
-                                onPress={() => openEdit(node)}
-                              >
-                                编辑
-                              </Button>
-                              <Button
-                                className="h-6 px-2 min-w-0 text-xs bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-950/30 dark:text-rose-400"
-                                size="sm"
-                                variant="flat"
-                                onPress={() => openDelete([node.id])}
-                              >
-                                删除
-                              </Button>
-                            </div>
-                          </TableCell>
-                        </>
-                      )}
-                    </SortableTableRow>
-                  )}
+                                <Dropdown placement="bottom-end">
+                                  <DropdownTrigger>
+                                    <Button
+                                      isIconOnly
+                                      aria-label={`${node.name}的更多操作`}
+                                      className="size-7"
+                                      variant="flat"
+                                    >
+                                      <Ellipsis size={16} />
+                                    </Button>
+                                  </DropdownTrigger>
+                                  <DropdownMenu>
+                                    <DropdownMenuItem
+                                      onSelect={() => openEdit(node)}
+                                    >
+                                      编辑
+                                    </DropdownMenuItem>
+                                    <DropdownMenuItem
+                                      className="text-danger focus:text-danger"
+                                      onSelect={() => openDelete([node.id])}
+                                    >
+                                      删除
+                                    </DropdownMenuItem>
+                                  </DropdownMenu>
+                                </Dropdown>
+                              </div>
+                            </TableCell>
+                          </>
+                        )}
+                      </SortableTableRow>
+                    );
+                  }}
                 </TableBody>
               </Table>
             </SortableContext>

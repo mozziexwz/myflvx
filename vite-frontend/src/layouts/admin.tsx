@@ -155,28 +155,6 @@ export default function AdminLayout({
       ),
     },
     {
-      path: "/sub-generator",
-      label: "生成订阅",
-      icon: (
-        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-          <path d="M5 4a1 1 0 00-2 0v7.268a2 2 0 000 3.464V16a1 1 0 102 0v-1.268a2 2 0 000-3.464V4zM11 4a1 1 0 10-2 0v1.268a2 2 0 000 3.464V16a1 1 0 102 0V8.732a2 2 0 000-3.464V4zM16 3a1 1 0 011 1v7.268a2 2 0 010 3.464V16a1 1 0 11-2 0v-1.268a2 2 0 010-3.464V4a1 1 0 011-1z" />
-        </svg>
-      ),
-    },
-    {
-      path: "/sub-download",
-      label: "订阅下载",
-      icon: (
-        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-          <path
-            clipRule="evenodd"
-            d="M6 2a2 2 0 00-2 2v12a2 2 0 002 2h8a2 2 0 002-2V7.414A2 2 0 0015.414 6L12 2.586A2 2 0 0010.586 2H6zm5 6a1 1 0 10-2 0v3.586l-1.293-1.293a1 1 0 10-1.414 1.414l3 3a1 1 0 001.414 0l3-3a1 1 0 00-1.414-1.414L11 11.586V8z"
-            fillRule="evenodd"
-          />
-        </svg>
-      ),
-    },
-    {
       path: "/monitor",
       label: "监控",
       icon: (
@@ -469,12 +447,30 @@ export default function AdminLayout({
         <nav className="flex-1 px-3 py-6 overflow-y-auto overflow-x-hidden">
           <ul className="space-y-1">
             {filteredMenuItems.map((item) => {
-              const isActive = location.pathname === item.path;
+              const isActive =
+                location.pathname === item.path ||
+                (item.path === "/subscription" &&
+                  ["/sub-generator", "/sub-download"].includes(
+                    location.pathname,
+                  ));
               const isMonitor = item.path === "/monitor";
               const isMonitorBlocked = isMonitor && monitorAllowed !== true;
 
               return (
                 <li key={item.path}>
+                  {item.path === "/proxy-node" && (
+                    <>
+                      <div
+                        aria-hidden="true"
+                        className="mx-2 my-2 border-t border-divider"
+                      />
+                      {!isCollapsed && (
+                        <div className="px-4 pb-1 text-xs text-default-500">
+                          代理与订阅
+                        </div>
+                      )}
+                    </>
+                  )}
                   <motion.button
                     className={`
                        w-full flex items-center p-2 rounded-lg text-left
@@ -528,6 +524,12 @@ export default function AdminLayout({
                       </span>
                     </div>
                   </motion.button>
+                  {item.path === "/subscription" && (
+                    <div
+                      aria-hidden="true"
+                      className="mx-2 my-2 border-t border-divider"
+                    />
+                  )}
                 </li>
               );
             })}
